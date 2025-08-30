@@ -1497,73 +1497,6 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 
-# -------------------------------------------------------------------
-# --- Code copied from yarGen.py to avoid direct import ---
-# -------------------------------------------------------------------
-
-def is_ascii_string(string, padding_allowed=False):
-    for b in [i.to_bytes(1, sys.byteorder) for i in string]:
-        if padding_allowed:
-            if not ((ord(b) < 127 and ord(b) > 31) or ord(b) == 0):
-                return 0
-        else:
-            if not (ord(b) < 127 and ord(b) > 31):
-                return 0
-    return 1
-
-def extract_hex_strings(s):
-    strings = []
-    hex_strings = re.findall(b"([a-fA-F0-9]{10,})", s)
-    for string in list(hex_strings):
-        hex_strings += string.split(b'0000')
-        hex_strings += string.split(b'0d0a')
-        hex_strings += re.findall(b'((?:0000|002[a-f0-9]|00[3-9a-f][0-9a-f]){6,})', string, re.IGNORECASE)
-    hex_strings = list(set(hex_strings))
-    for string in hex_strings:
-        for x in string.split(b'00'):
-            if len(x) > 10:
-                strings.append(x)
-    for string in hex_strings:
-        try:
-            if len(string) % 2 != 0 or len(string) < 8:
-                continue
-            if b'0000' in string:
-                continue
-            dec = string.replace(b'00', b'')
-            if is_ascii_string(dec, padding_allowed=False):
-                strings.append(string)
-        except Exception:
-            pass
-    return strings
-
-def extract_strings(fileData) -> list[str]:
-    cleaned_strings = []
-    try:
-        strings_full = re.findall(b"[\x1f-\x7e]{6,}", fileData)
-        strings_limited = re.findall(b"[\x1f-\x7e]{6,256}", fileData) # Using a fixed limit
-        strings_hex = extract_hex_strings(fileData)
-        strings = list(set(strings_full) | set(strings_limited) | set(strings_hex))
-        wide_strings = [ws for ws in re.findall(b"(?:[\x1f-\x7e][\x00]){6,}", fileData)]
-
-        for ws in wide_strings:
-            wide_string = ("UTF16LE:%s" % ws.decode('utf-16')).encode('utf-8')
-            if wide_string not in strings:
-                strings.append(wide_string)
-        for string in strings:
-            if len(string) > 0:
-                string = string.replace(b'\\', b'\\\\')
-                string = string.replace(b'"', b'\\"')
-            try:
-                if isinstance(string, str):
-                    cleaned_strings.append(string)
-                else:
-                    cleaned_strings.append(string.decode('utf-8'))
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return cleaned_strings
-
 class StringExtractor:
     """A helper class to extract strings from a file."""
     def __init__(self, file_path):
@@ -1587,10 +1520,6 @@ class StringExtractor:
             if keyword in s_lower:
                 return True
         return False
-
-# -------------------------------------------------------------------
-# --- End of code copied from yarGen.py ---
-# -------------------------------------------------------------------
 
 # -----------------------
 # WinVerifyTrust / Authenticode constants
