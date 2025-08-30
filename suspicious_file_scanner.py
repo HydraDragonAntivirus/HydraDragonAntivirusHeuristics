@@ -1,22 +1,17 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-__version__ = "0.24.0"
 
 import glob
-import gzip
-import json
 import logging
 import math
 import os
 import re
-import shutil
 import sys
 import time
 import traceback
-import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Dict, List, Set
+from typing import Any, Dict, List, Set, Optional
 
 import ctypes
 import binascii
@@ -48,62 +43,69 @@ try:
     except Exception:
         pass
     from nltk.corpus import words  # type: ignore
+    nltk_words = set(words.words())
 except Exception:
     nltk = None
     words = None  # type: ignore
-
-# Load NLTK word corpus
-nltk_words = set(words.words())
+    nltk_words = set()
 
 # Basic configuration
 SCAN_FOLDER = "D:\\datas2\\data2"
 SUSPICIOUS_THRESHOLD = 11
 
+REPO_URLS = {
+    'good-opcodes-part1.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part1.db',
+    'good-opcodes-part2.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part2.db',
+    'good-opcodes-part3.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part3.db',
+    'good-opcodes-part4.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part4.db',
+    'good-opcodes-part5.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part5.db',
+    'good-opcodes-part6.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part6.db',
+    'good-opcodes-part7.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part7.db',
+    'good-opcodes-part8.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part8.db',
+    'good-opcodes-part9.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part9.db',
+
+    'good-strings-part1.db': 'https://www.bsk-consulting.de/yargen/good-strings-part1.db',
+    'good-strings-part2.db': 'https://www.bsk-consulting.de/yargen/good-strings-part2.db',
+    'good-strings-part3.db': 'https://www.bsk-consulting.de/yargen/good-strings-part3.db',
+    'good-strings-part4.db': 'https://www.bsk-consulting.de/yargen/good-strings-part4.db',
+    'good-strings-part5.db': 'https://www.bsk-consulting.de/yargen/good-strings-part5.db',
+    'good-strings-part6.db': 'https://www.bsk-consulting.de/yargen/good-strings-part6.db',
+    'good-strings-part7.db': 'https://www.bsk-consulting.de/yargen/good-strings-part7.db',
+    'good-strings-part8.db': 'https://www.bsk-consulting.de/yargen/good-strings-part8.db',
+    'good-strings-part9.db': 'https://www.bsk-consulting.de/yargen/good-strings-part9.db',
+
+    'good-exports-part1.db': 'https://www.bsk-consulting.de/yargen/good-exports-part1.db',
+    'good-exports-part2.db': 'https://www.bsk-consulting.de/yargen/good-exports-part2.db',
+    'good-exports-part3.db': 'https://www.bsk-consulting.de/yargen/good-exports-part3.db',
+    'good-exports-part4.db': 'https://www.bsk-consulting.de/yargen/good-exports-part4.db',
+    'good-exports-part5.db': 'https://www.bsk-consulting.de/yargen/good-exports-part5.db',
+    'good-exports-part6.db': 'https://www.bsk-consulting.de/yargen/good-exports-part6.db',
+    'good-exports-part7.db': 'https://www.bsk-consulting.de/yargen/good-exports-part7.db',
+    'good-exports-part8.db': 'https://www.bsk-consulting.de/yargen/good-exports-part8.db',
+    'good-exports-part9.db': 'https://www.bsk-consulting.de/yargen/good-exports-part9.db',
+
+    'good-imphashes-part1.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part1.db',
+    'good-imphashes-part2.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part2.db',
+    'good-imphashes-part3.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part3.db',
+    'good-imphashes-part4.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part4.db',
+    'good-imphashes-part5.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part5.db',
+    'good-imphashes-part6.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part6.db',
+    'good-imphashes-part7.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part7.db',
+    'good-imphashes-part8.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part8.db',
+    'good-imphashes-part9.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part9.db',
+}
+
 # ===============================
-# Regexes for string extraction (yarGen style)
+# Regexes for string extraction (yarGen style) - now actually used
 # ===============================
-ASCII_RE     = re.compile(rb"[\x1f-\x7e]{6,}")                  # ASCII strings length >=6
-WIDE_RE      = re.compile(rb"(?:[\x1f-\x7e][\x00]){6,}")        # UTF-16LE wide strings length >=6
-HEX_CAND_RE  = re.compile(rb"([A-Fa-f0-9]{10,})")               # Hex-like substrings length >=10
+ASCII_RE = re.compile(rb"[\x1f-\x7e]{6,}")  # ASCII strings length >=6
+WIDE_RE = re.compile(rb"(?:[\x1f-\x7e][\x00]){6,}")  # UTF-16LE wide strings length >=6
+HEX_CAND_RE = re.compile(rb"([A-Fa-f0-9]{10,})")  # Hex-like substrings length >=10
 
 # DB repo urls (same as original)
 REPO_URLS = {
     "good-opcodes-part1.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part1.db",
-    "good-opcodes-part2.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part2.db",
-    "good-opcodes-part3.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part3.db",
-    "good-opcodes-part4.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part4.db",
-    "good-opcodes-part5.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part5.db",
-    "good-opcodes-part6.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part6.db",
-    "good-opcodes-part7.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part7.db",
-    "good-opcodes-part8.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part8.db",
-    "good-opcodes-part9.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part9.db",
-    "good-strings-part1.db": "https://www.bsk-consulting.de/yargen/good-strings-part1.db",
-    "good-strings-part2.db": "https://www.bsk-consulting.de/yargen/good-strings-part2.db",
-    "good-strings-part3.db": "https://www.bsk-consulting.de/yargen/good-strings-part3.db",
-    "good-strings-part4.db": "https://www.bsk-consulting.de/yargen/good-strings-part4.db",
-    "good-strings-part5.db": "https://www.bsk-consulting.de/yargen/good-strings-part5.db",
-    "good-strings-part6.db": "https://www.bsk-consulting.de/yargen/good-strings-part6.db",
-    "good-strings-part7.db": "https://www.bsk-consulting.de/yargen/good-strings-part7.db",
-    "good-strings-part8.db": "https://www.bsk-consulting.de/yargen/good-strings-part8.db",
-    "good-strings-part9.db": "https://www.bsk-consulting.de/yargen/good-strings-part9.db",
-    "good-exports-part1.db": "https://www.bsk-consulting.de/yargen/good-exports-part1.db",
-    "good-exports-part2.db": "https://www.bsk-consulting.de/yargen/good-exports-part2.db",
-    "good-exports-part3.db": "https://www.bsk-consulting.de/yargen/good-exports-part3.db",
-    "good-exports-part4.db": "https://www.bsk-consulting.de/yargen/good-exports-part4.db",
-    "good-exports-part5.db": "https://www.bsk-consulting.de/yargen/good-exports-part5.db",
-    "good-exports-part6.db": "https://www.bsk-consulting.de/yargen/good-exports-part6.db",
-    "good-exports-part7.db": "https://www.bsk-consulting.de/yargen/good-exports-part7.db",
-    "good-exports-part8.db": "https://www.bsk-consulting.de/yargen/good-exports-part8.db",
-    "good-exports-part9.db": "https://www.bsk-consulting.de/yargen/good-exports-part9.db",
-    "good-imphashes-part1.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part1.db",
-    "good-imphashes-part2.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part2.db",
-    "good-imphashes-part3.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part3.db",
-    "good-imphashes-part4.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part4.db",
-    "good-imphashes-part5.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part5.db",
-    "good-imphashes-part6.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part6.db",
-    "good-imphashes-part7.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part7.db",
-    "good-imphashes-part8.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part8.db",
-    "good-imphashes-part9.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part9.db",
+    # ... (truncated for brevity in this header) ...
 }
 
 PE_STRINGS_FILE = "./3rdparty/strings.xml"
@@ -169,7 +171,10 @@ def extract_hex_strings(s: bytes):
     for string in hex_strings:
         for x in string.split(b"00"):
             if len(x) > 10:
-                strings.append(x)
+                try:
+                    strings.append(x.decode('utf-8', errors='ignore'))
+                except Exception:
+                    strings.append(str(x))
     # WIDE Encoded Strings
     for string in hex_strings:
         try:
@@ -179,7 +184,10 @@ def extract_hex_strings(s: bytes):
                 continue
             dec = string.replace(b"00", b"")
             if is_ascii_string(dec, padding_allowed=False):
-                strings.append(string)
+                try:
+                    strings.append(dec.decode('utf-8', errors='ignore'))
+                except Exception:
+                    strings.append(str(dec))
         except Exception:
             traceback.print_exc()
     return strings
@@ -218,42 +226,56 @@ def is_hex_encoded(s: str, check_length: bool = True) -> bool:
     return False
 
 
-def extract_strings(file_data: bytes) -> list:
-    cleaned_strings = []
+def extract_strings(file_data: bytes) -> List[str]:
+    """Faster string extraction using precompiled regexes (ASCII, wide, hex candidates).
+
+    This replaces the older multi-pass approach and aims to reduce duplicate
+    decoding/reads. It returns a de-duplicated list of strings (order preserved).
+    """
+    results: List[str] = []
+    seen = set()
     try:
-        strings_full = re.findall(b"[\x1f-\x7e]{6,}", file_data)
-        s_limit = 200
-        strings_limited = re.findall(b"[\x1f-\x7e]{6,%d}" % s_limit, file_data)
-        strings_hex = extract_hex_strings(file_data)
-        strings_all = list(set(strings_full) | set(strings_limited) | set(strings_hex))
-        wide_strings = [
-            ws for ws in re.findall(b"(?:[\x1f-\x7e][\x00]){6,}", file_data)
-        ]
-
-        for ws in wide_strings:
+        # ASCII matches
+        for m in ASCII_RE.findall(file_data):
             try:
-                wide_string = ("UTF16LE:%s" % ws.decode("utf-16")).encode("utf-8")
+                s = m.decode('utf-8', errors='ignore')
             except Exception:
-                wide_string = (
-                    "UTF16LE:%s" % ws.decode("utf-16", errors="ignore")
-                ).encode("utf-8")
-            if wide_string not in strings_all:
-                strings_all.append(wide_string)
+                s = str(m)
+            if s and s not in seen:
+                seen.add(s)
+                results.append(s)
 
-        for string in strings_all:
-            if len(string) > 0:
-                string = string.replace(b"\\", b"\\\\")
-                string = string.replace(b'"', b'\\"')
+        # UTF-16LE wide matches
+        for m in WIDE_RE.findall(file_data):
             try:
-                if isinstance(string, str):
-                    cleaned_strings.append(string)
+                s = m.decode('utf-16le', errors='ignore')
+            except Exception:
+                try:
+                    s = m.decode('utf-8', errors='ignore')
+                except Exception:
+                    s = str(m)
+            if s and s not in seen:
+                seen.add(s)
+                results.append(s)
+
+        # Hex candidate matches -> try to extract readable sequences
+        for m in HEX_CAND_RE.findall(file_data):
+            try:
+                if isinstance(m, bytes):
+                    hex_bytes = m
                 else:
-                    cleaned_strings.append(string.decode("utf-8", errors="ignore"))
-            except AttributeError:
-                logging.debug("Attribute error decoding string", exc_info=True)
+                    hex_bytes = m.encode()
+                hex_strings = extract_hex_strings(hex_bytes)
+                for hs in hex_strings:
+                    if hs and hs not in seen:
+                        seen.add(hs)
+                        results.append(hs)
+            except Exception:
+                continue
+
     except Exception:
-        logging.debug("Error extracting strings", exc_info=True)
-    return cleaned_strings
+        logging.debug("Error extracting strings (regex path)", exc_info=True)
+    return results
 
 
 def extract_opcodes(file_data: bytes) -> list:
@@ -426,7 +448,6 @@ def load_good_dbs(dbs_dir: str = "./dbs"):
                     reversedStrings.add(ln)
         elif "imphash" in bn or "imphashes" in bn:
             for ln in lines:
-                # KNOWN_IMPHASHES is a dict; make ln.lower() the key and store filename as value
                 KNOWN_IMPHASHES[ln.lower()] = bn
 
     logging.info(
@@ -438,19 +459,24 @@ def load_good_dbs(dbs_dir: str = "./dbs"):
         len(KNOWN_IMPHASHES),
     )
 
+
 def is_likely_word(s: str) -> bool:
     """Return True if string is at least 3 chars and exists in NLTK words."""
     return len(s) >= 3 and s.lower() in nltk_words
 
-def check_against_good_dbs_percentage(path: str) -> float:
+
+def check_against_good_dbs_percentage(path: str, file_data: Optional[bytes] = None, precomputed_strings: Optional[List[str]] = None) -> float:
     """
-    Returns the percentage (0-100) of known-good markers
-    that the file at `path` matches, using only strings
-    that are likely words.
+    Returns the percentage (0-100) of known-good markers that the file at `path` matches.
+
+    This function now accepts `file_data` and/or `precomputed_strings` to avoid
+    re-reading / re-extracting strings when that work has already been done by
+    the caller (avoid double scanning).
     """
     try:
-        with open(path, "rb") as fh:
-            file_data = fh.read()
+        if file_data is None:
+            with open(path, "rb") as fh:
+                file_data = fh.read()
     except Exception:
         logging.debug("Failed to open for good-db check: %s", path, exc_info=True)
         return 0.0
@@ -490,10 +516,14 @@ def check_against_good_dbs_percentage(path: str) -> float:
             string_dbs.append(reversedStrings)
 
         if string_dbs:
-            strings = extract_strings(file_data)
-            # Only keep strings that are likely words
+            if precomputed_strings is None:
+                strings = extract_strings(file_data)
+            else:
+                strings = precomputed_strings
+
+            # Only keep strings that are likely words when possible
             strings = [s for s in strings if is_likely_word(s)]
-            
+
             for db in string_dbs:
                 total_markers += len(db)
                 for s in strings:
@@ -507,6 +537,7 @@ def check_against_good_dbs_percentage(path: str) -> float:
         return 0.0
 
     return (matches / total_markers) * 100
+
 
 def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
     analysis = {
@@ -676,6 +707,7 @@ TRUST_E_PROVIDER_UNKNOWN = 0x800B0001
 CERT_E_UNTRUSTEDROOT = 0x800B0109
 NO_SIGNATURE_CODES = {TRUST_E_NOSIGNATURE, TRUST_E_SUBJECT_FORM_UNKNOWN, TRUST_E_PROVIDER_UNKNOWN}
 
+
 def _build_wtd_for(file_path: str) -> WINTRUST_DATA:
     """Internal helper to populate a WINTRUST_DATA for the given file."""
     file_info = WINTRUST_FILE_INFO(
@@ -745,7 +777,9 @@ def is_running_pe(path: str) -> bool:
     return False
 
 
-def analyze_yargen_strings(path: str) -> Dict[str, Any]:
+def analyze_yargen_strings_from_list(strings: List[str]) -> Dict[str, Any]:
+    """Analyze a pre-extracted list of strings (no file I/O).
+    """
     analysis = {
         "yargen_strings": [],
         "yargen_suspicious_percentage": 0.0,
@@ -753,13 +787,28 @@ def analyze_yargen_strings(path: str) -> Dict[str, Any]:
         "status": "Not Analyzed",
     }
     try:
-        extractor = StringExtractor(path)
-        all_strings = extractor.extract()
+        all_strings = strings
         total_strings = len(all_strings)
         analysis["total_strings"] = total_strings
 
         if total_strings > 0:
-            suspicious_strings = [s for s in all_strings if extractor.is_suspicious(s)]
+            # Define suspicious keywords locally (bytes -> str)
+            suspicious_keywords = [
+                "shell",
+                "invoke",
+                "powershell",
+                "download",
+                "execute",
+                "payload",
+            ]
+            suspicious_strings = []
+            for s in all_strings:
+                s_l = s.lower()
+                for kw in suspicious_keywords:
+                    if kw in s_l:
+                        suspicious_strings.append(s)
+                        break
+
             analysis["yargen_strings"] = suspicious_strings[:50]
             suspicious_percentage = (len(suspicious_strings) / total_strings) * 100
             analysis["yargen_suspicious_percentage"] = suspicious_percentage
@@ -773,13 +822,17 @@ def analyze_yargen_strings(path: str) -> Dict[str, Any]:
         else:
             analysis["status"] = "No strings found"
     except Exception as exc:
-        logging.error("yarGen string extraction failed for %s: %s", path, exc)
+        logging.error("yarGen string extraction failed: %s", exc)
         analysis["status"] = f"Error during string analysis: {exc}"
     return analysis
 
 
 def analyze_single_file(path: str) -> Dict[str, Any]:
-    """Analyze a single file with Capstone disassembly and basic checks."""
+    """Analyze a single file with Capstone disassembly and basic checks.
+
+    Key change: extract strings once and reuse them for both "good db" checks
+    and yara-like string analysis. This avoids doing two full string scans per file.
+    """
     features = {
         "path": path,
         "entropy": 0.0,
@@ -794,7 +847,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         "extension": "",
         "suspicious_score": 0,
         "suspicious": False,
-        "known_good_percent": 0.0,  # <- updated field
+        "known_good_percent": 0.0,
     }
 
     try:
@@ -808,7 +861,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         ext = os.path.splitext(filename_lc)[1].lstrip(".")
         features["extension"] = ext
 
-        # Read file bytes for certain checks
+        # Read file bytes once for all binary checks
         file_bytes = b""
         try:
             with open(path, "rb") as fh:
@@ -816,9 +869,12 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         except Exception:
             logging.debug("Failed to read file bytes for %s", path, exc_info=True)
 
-        # Check known-good DBs as percentage
+        # Extract strings once and reuse
+        strings = extract_strings(file_bytes) if file_bytes else []
+
+        # Check known-good DBs as percentage (reuse strings and file_bytes to avoid re-reads)
         try:
-            features["known_good_percent"] = check_against_good_dbs_percentage(path)
+            features["known_good_percent"] = check_against_good_dbs_percentage(path, file_data=file_bytes, precomputed_strings=strings)
         except Exception:
             logging.debug("known_good_percent check failed for %s", path, exc_info=True)
 
@@ -850,6 +906,13 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
                 logging.debug("Signature check failed for %s", path, exc_info=True)
             features["is_running"] = is_running_pe(path)
 
+        # Run yara-like string analysis from pre-extracted list
+        try:
+            yargen_analysis = analyze_yargen_strings_from_list(strings)
+            features["yargen_summary"] = yargen_analysis
+        except Exception:
+            logging.debug("YarGen-like analysis failed for %s", path, exc_info=True)
+
         # Score heuristics (conservative)
         score = 0
         if features.get("capstone_analysis") and features["capstone_analysis"].get(
@@ -876,9 +939,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
             score += 2
 
         # Adjust score based on known-good percentage
-        # More matched markers → reduce suspiciousness
         if features.get("known_good_percent", 0) > 0:
-            # Reduce score proportionally (up to 50% of score)
             reduction = score * min(features["known_good_percent"] / 100, 0.5)
             score = max(score - reduction, 0)
 
@@ -889,6 +950,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         features["error"] = str(exc)
 
     return features
+
 
 def scan_directory_parallel(directory: str) -> List[Dict[str, Any]]:
     """Scan a directory in parallel with tqdm progress and realtime logging."""
@@ -905,7 +967,6 @@ def scan_directory_parallel(directory: str) -> List[Dict[str, Any]]:
         total_files,
     )
 
-    # ThreadPoolExecutor without max_workers -> uses default thread count
     with ThreadPoolExecutor() as executor:
         futures = {executor.submit(analyze_single_file, f): f for f in files}
         for future in tqdm(as_completed(futures),
@@ -914,127 +975,17 @@ def scan_directory_parallel(directory: str) -> List[Dict[str, Any]]:
                            unit="file"):
             try:
                 result = future.result()
-                # log results as they come in
                 if result.get("suspicious"):
                     logging.warning(
                         "Suspicious file detected: %s (score=%d)",
                         result["path"],
                         result.get("suspicious_score", -1),
                     )
-                elif result.get("is_known_good"):
-                    logging.debug("Known good: %s", result["path"])
-
                 suspicious_results.append(result)
             except Exception as e:
                 logging.error("Error during analysis: %s", e)
 
     return suspicious_results
-
-class StringExtractor:
-    """A helper class to extract strings from a file."""
-
-    def __init__(self, file_path: str) -> None:
-        self.file_path = file_path
-        self.suspicious_keywords = [
-            b"shell",
-            b"invoke",
-            b"powershell",
-            b"download",
-            b"execute",
-            b"payload",
-        ]
-
-    def extract(self) -> list:
-        try:
-            with open(self.file_path, "rb") as f:
-                file_data = f.read()
-            return extract_strings(file_data)
-        except IOError as exc:
-            logging.debug("Error reading file %s: %s", self.file_path, exc)
-            return []
-
-    def is_suspicious(self, s) -> bool:
-        try:
-            s_lower = s.lower().encode("utf-8", "ignore")
-        except Exception:
-            s_lower = str(s).lower().encode("utf-8", "ignore")
-        for keyword in self.suspicious_keywords:
-            if keyword in s_lower:
-                return True
-        return False
-
-
-def save(obj: Any, filename: str) -> None:
-    with gzip.GzipFile(filename, "wb") as file:
-        file.write(bytes(json.dumps(obj), "utf-8"))
-
-
-def load(filename: str) -> Any:
-    with gzip.GzipFile(filename, "rb") as file:
-        obj = json.loads(file.read())
-    return obj
-
-
-def update_databases():
-    try:
-        db_dir = "./dbs/"
-        if not os.path.exists(db_dir):
-            os.makedirs(db_dir)
-    except Exception:
-        logging.exception("Error creating db dir")
-        sys.exit(1)
-
-    try:
-        for filename, repo_url in REPO_URLS.items():
-            logging.info("Downloading %s from %s ...", filename, repo_url)
-            with urllib.request.urlopen(repo_url) as response, open(
-                "./dbs/%s" % filename, "wb"
-            ) as out_file:
-                shutil.copyfileobj(response, out_file)
-    except Exception:
-        logging.exception("Error downloading database files")
-        sys.exit(1)
-
-
-def getReference(ref: str) -> str:
-    if os.path.exists(ref):
-        reference = getFileContent(ref)
-        logging.info("Read reference from file %s > %s", ref, reference)
-        return reference
-    return ref
-
-
-def getIdentifier(id_str: str, path: str) -> str:
-    if id_str == "not set" or not os.path.exists(id_str):
-        return os.path.basename(path.rstrip("/"))
-    identifier = getFileContent(id_str)
-    logging.info("Read identifier from file %s > %s", id_str, identifier)
-    return identifier
-
-
-def getPrefix(prefix: str, identifier: str) -> str:
-    if prefix == "Auto-generated rule":
-        return identifier
-    return prefix
-
-
-def getFileContent(file_path: str) -> str:
-    try:
-        with open(file_path) as f:
-            return f.read(1024)
-    except Exception:
-        return "not found"
-
-
-def emptyFolder(dir_path: str) -> None:
-    for file in os.listdir(dir_path):
-        file_path = os.path.join(dir_path, file)
-        try:
-            if os.path.isfile(file_path):
-                logging.info("Removing %s ...", file_path)
-                os.unlink(file_path)
-        except Exception as exc:
-            logging.error("Error removing %s: %s", file_path, exc)
 
 
 def generate_general_condition(file_info: dict):
@@ -1165,7 +1116,7 @@ def get_uint_string(magic):
 def get_file_range(size):
     size_string = ""
     try:
-        max_size_b = size * 1  # fm multiplier not provided, default 1
+        max_size_b = size * 1
         if max_size_b < 1024:
             max_size_b = 1024
         max_size = int(max_size_b / 1024)
@@ -1197,27 +1148,24 @@ def get_file_range(size):
 if __name__ == "__main__":
     logging.info("Starting file scan with Capstone analysis (parallel)...")
 
-    # Attempt to download DBs and load them; keep optional (errors
-    # will be logged, script still runs)
     try:
-        # If you want to force an update, uncomment the next line.
-        # update_databases()
         load_good_dbs("./dbs")
     except Exception:
         logging.exception("Failed to update/load good DBs")
 
-    default_workers = min(32, (os.cpu_count() or 1) * 4)
     try:
         results = scan_directory_parallel(SCAN_FOLDER)
     except Exception as exc:
         logging.error("Top-level parallel scan failed: %s", exc)
+        results = []
 
     suspicious_count = 0
     top_offenders = []
-    for path, res in results:
+    # results is a list of feature dicts
+    for res in results:
         if res.get("suspicious", False):
             suspicious_count += 1
-            top_offenders.append((res.get("suspicious_score", 0), path))
+            top_offenders.append((res.get("suspicious_score", 0), res.get("path")))
 
     top_offenders.sort(reverse=True)
     logging.info(
@@ -1229,7 +1177,7 @@ if __name__ == "__main__":
     if top_offenders:
         logging.info("--- Detailed Analysis of Top Suspicious Files ---")
         for score, path in top_offenders[:20]:
-            original_features = next((f for p, f in results if p == path), {})
+            original_features = next((f for f in results if f.get('path') == path), {})
             notes = []
             if original_features.get("capstone_analysis", {}).get(
                 "overall_analysis", {}
@@ -1239,21 +1187,20 @@ if __name__ == "__main__":
                 notes.append("High entropy detected")
             if not original_features.get("signature_valid"):
                 notes.append(
-                    "Invalid or missing signature (Status: %s)"
-                    % original_features.get("signature_status", "N/A")
+                    "Invalid or missing signature (Status: %s)" % original_features.get("signature_status", "N/A")
                 )
 
             logging.info("Path: %s (Initial Score: %d)", path, score)
             for note in notes:
                 logging.info("  - Triage Note: %s", note)
 
-            logging.info("  - Running on-demand string analysis...")
-            yargen_analysis = analyze_yargen_strings(path)
-            logging.info("  - String Analysis Result: %s", yargen_analysis["status"])
+            logging.info("  - Running on-demand string analysis... (already precomputed)")
+            yargen_analysis = original_features.get("yargen_summary", {})
+            logging.info("  - String Analysis Result: %s", yargen_analysis.get("status", "N/A"))
             logging.info(
                 "    (Found %.1f%% suspicious strings out of %d total.)",
-                yargen_analysis["yargen_suspicious_percentage"],
-                yargen_analysis["total_strings"],
+                yargen_analysis.get("yargen_suspicious_percentage", 0.0),
+                yargen_analysis.get("total_strings", 0),
             )
     else:
         logging.info("No suspicious files found above the threshold.")
