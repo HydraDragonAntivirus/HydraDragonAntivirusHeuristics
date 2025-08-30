@@ -1,0 +1,5 @@
+lief
+lxml
+nltk
+capstone
+pefile
