@@ -934,7 +934,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         "suspicious_score": 0,
         "suspicious": False,
         "known_good_percent": 0.0,
-        "unknown": False,   # <── added default
+        "unknown": False,   # <-- added default
     }
 
     try:
@@ -1030,8 +1030,9 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
 
         # Mark unknownness (only if suspicious)
         if features["suspicious"]:
-            if features.get("known_good_percent", 0) == 0:
-                # no goodware overlap → treat as unknown suspicious
+            is_good = features.get("known_good_percent", 0) > 0
+            is_signed = features.get("signature_valid", False)
+            if not is_good and not is_signed:
                 features["unknown"] = True
             else:
                 features["unknown"] = False
@@ -1094,9 +1095,11 @@ def scan_directory_parallel(directory: str, max_workers: Optional[int] = None) -
                 result = future.result()
                 if result.get("suspicious"):
                     logging.warning(
-                        "Suspicious file detected: %s (score=%d)",
+                        "Suspicious file detected: %s (score=%d, unknown=%s, known_good_percent=%.1f%%)",
                         result["path"],
                         result.get("suspicious_score", -1),
+                        result.get("unknown", False),
+                        result.get("known_good_percent", 0.0),
                     )
                 suspicious_results.append(result)
             except Exception as e:
