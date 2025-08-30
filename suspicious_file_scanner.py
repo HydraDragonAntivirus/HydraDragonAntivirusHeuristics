@@ -59,6 +59,13 @@ nltk_words = set(words.words())
 SCAN_FOLDER = "D:\\datas2\\data2"
 SUSPICIOUS_THRESHOLD = 11
 
+# ===============================
+# Regexes for string extraction (yarGen style)
+# ===============================
+ASCII_RE     = re.compile(rb"[\x1f-\x7e]{6,}")                  # ASCII strings length >=6
+WIDE_RE      = re.compile(rb"(?:[\x1f-\x7e][\x00]){6,}")        # UTF-16LE wide strings length >=6
+HEX_CAND_RE  = re.compile(rb"([A-Fa-f0-9]{10,})")               # Hex-like substrings length >=10
+
 # DB repo urls (same as original)
 REPO_URLS = {
     "good-opcodes-part1.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part1.db",
