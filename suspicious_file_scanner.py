@@ -19,6 +19,9 @@ import psutil
 from ctypes import wintypes
 from tqdm import tqdm
 
+import gzip
+import json
+
 import argparse
 import shutil
 import urllib.request
@@ -405,15 +408,21 @@ def calculate_entropy(path: str) -> float:
         logging.debug("Entropy calc failed for %s", path, exc_info=True)
         return 0.0
 
+def load(filename):
+    file = gzip.GzipFile(filename, 'rb')
+    object = json.loads(file.read())
+    file.close()
+    return object
 
 def load_good_dbs(dbs_dir: str = "./dbs"):
-    """Load good-* DBs from a directory into memory sets, including exports.
-
-    - Expects newline-separated plaintext files in ./dbs/.
-    - For opcodes, normalizes by removing whitespace and lowercasing.
-    - For imphashes, adds to KNOWN_IMPHASHES dict as key -> filename (or empty).
+    """
+    Load good-* DBs from a directory into memory sets.
+    - Uses the provided gzip+json `load()` function first.
+    - Falls back to plaintext newline parsing if gzip/json fails.
+    - No timeouts; will attempt to read each file fully.
     """
     global good_opcodes_db, base64strings, hexEncStrings, reversedStrings, KNOWN_IMPHASHES, KNOWN_EXPORTS
+
     good_opcodes_db = set()
     base64strings = set()
     hexEncStrings = set()
@@ -425,42 +434,114 @@ def load_good_dbs(dbs_dir: str = "./dbs"):
         logging.info("DBs directory not found: %s", dbs_dir)
         return
 
-    for path in glob.glob(os.path.join(dbs_dir, "*")):
-        bn = os.path.basename(path).lower()
+    files = sorted(glob.glob(os.path.join(dbs_dir, "*")))
+    if not files:
+        logging.info("No DB files found in %s", dbs_dir)
+        return
+
+    loaded_files = 0
+    skipped = []
+
+    for p in files:
+        bn = os.path.basename(p).lower()
+        logging.info("Attempting to load DB file: %s (size=%d bytes)", p, os.path.getsize(p))
+        loaded_obj = None
+
+        # Try gzip+json using the exact loader you provided
         try:
-            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
-                lines = [ln.strip() for ln in fh if ln.strip()]
-        except Exception:
-            logging.exception("Failed reading DB file %s", path)
+            loaded_obj = load(p)
+            logging.info("Loaded gzip+json DB: %s", p)
+        except Exception as ex_gz:
+            logging.warning("gzip+json load failed for %s: %s - attempting plaintext fallback", p, ex_gz)
+            loaded_obj = None
+
+        # Plaintext fallback: newline-separated entries
+        if loaded_obj is None:
+            try:
+                lines = []
+                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                    for ln in fh:
+                        ln = ln.strip()
+                        if ln:
+                            lines.append(ln)
+                if lines:
+                    loaded_obj = {ln: 1 for ln in lines}
+                    logging.info("Loaded plaintext DB: %s (lines=%d)", p, len(lines))
+                else:
+                    logging.info("Plaintext DB %s had no entries", p)
+                    loaded_obj = None
+            except Exception as ex_plain:
+                logging.exception("Plaintext fallback failed for %s: %s", p, ex_plain)
+                loaded_obj = None
+
+        if not loaded_obj:
+            logging.warning("Skipping DB file (could not parse): %s", p)
+            skipped.append(p)
             continue
 
-        if "opcodes" in bn:
-            for ln in lines:
-                good_opcodes_db.add(ln.replace(" ", "").lower())
-        elif "strings" in bn:
-            for ln in lines:
-                if is_base_64(ln):
-                    base64strings.add(ln)
-                elif is_hex_encoded(ln, check_length=False):
-                    hexEncStrings.add(ln.lower())
-                else:
-                    reversedStrings.add(ln)
-        elif "imphash" in bn or "imphashes" in bn:
-            for ln in lines:
-                KNOWN_IMPHASHES[ln.lower()] = bn
-        elif "exports" in bn:
-            for ln in lines:
-                KNOWN_EXPORTS.add(ln.lower())
+        # Normalize loaded object into keys and dispatch to sets
+        try:
+            if isinstance(loaded_obj, list):
+                loaded_dict = {str(k): 1 for k in loaded_obj}
+            elif isinstance(loaded_obj, dict):
+                loaded_dict = {str(k): loaded_obj[k] for k in loaded_obj.keys()}
+            else:
+                # try to coerce iterables
+                try:
+                    loaded_dict = {str(k): 1 for k in loaded_obj}
+                except Exception:
+                    loaded_dict = {}
+
+            if "opcodes" in bn:
+                for key in loaded_dict.keys():
+                    k = str(key).replace(" ", "").lower()
+                    if k:
+                        good_opcodes_db.add(k)
+
+            elif "strings" in bn:
+                for key in loaded_dict.keys():
+                    s = str(key)
+                    s_l = s.lower()
+                    if is_base_64(s):
+                        base64strings.add(s); base64strings.add(s_l)
+                    elif is_hex_encoded(re.sub(r'[^0-9a-fA-F]', '', s), check_length=False):
+                        hexEncStrings.add(s); hexEncStrings.add(s_l)
+                    else:
+                        reversedStrings.add(s); reversedStrings.add(s_l)
+
+            elif "imphash" in bn or "imphashes" in bn:
+                for key in loaded_dict.keys():
+                    h = str(key).lower()
+                    if h:
+                        KNOWN_IMPHASHES[h] = bn
+
+            elif "exports" in bn:
+                for key in loaded_dict.keys():
+                    k = str(key).lower()
+                    if k:
+                        KNOWN_EXPORTS.add(k)
+
+            loaded_files += 1
+
+        except Exception:
+            logging.exception("Error processing DB contents from %s", p)
+            skipped.append(p)
+            continue
 
     logging.info(
-        "Loaded good DBs: opcodes=%d base64=%d hexEnc=%d reversed=%d imphashes=%d exports=%d",
+        "Loaded good DBs: opcodes=%d base64=%d hexEnc=%d strings=%d imphashes=%d exports=%d (files_loaded=%d skipped=%d)",
         len(good_opcodes_db),
         len(base64strings),
         len(hexEncStrings),
         len(reversedStrings),
         len(KNOWN_IMPHASHES),
         len(KNOWN_EXPORTS),
+        loaded_files,
+        len(skipped),
     )
+
+    if skipped:
+        logging.warning("Skipped DB files: %s", skipped)
 
 def is_likely_word(s: str) -> bool:
     """Return True if string is at least 3 chars and exists in NLTK words."""
@@ -469,8 +550,12 @@ def is_likely_word(s: str) -> bool:
 def check_against_good_dbs_percentage(path: str, file_data: Optional[bytes] = None, precomputed_strings: Optional[List[str]] = None) -> float:
     """
     Returns the percentage (0-100) of known-good markers the file matches.
-    Checks: imphash, exports, opcodes, strings.
-    Accepts file_data / precomputed_strings to avoid double extraction.
+    New approach (more like yarGen): compare *extracted items* from the file
+    (strings, opcodes, exports, imphash) against the loaded good-* DBs and compute:
+
+        percent = (matched_items / total_items_checked) * 100
+
+    This gives a readable ratio: e.g. if 10 extracted strings and 2 are known-good -> 20.0
     """
     try:
         if file_data is None:
@@ -496,7 +581,8 @@ def check_against_good_dbs_percentage(path: str, file_data: Optional[bytes] = No
     # --- EXPORTS ---
     try:
         if KNOWN_EXPORTS:
-            total_markers += len(KNOWN_EXPORTS)
+            # each export in the file is a potential match
+            total_markers += len(exports)
             for exp in exports:
                 exp_l = exp.lower().strip()
                 if exp_l in KNOWN_EXPORTS:
@@ -508,46 +594,54 @@ def check_against_good_dbs_percentage(path: str, file_data: Optional[bytes] = No
     try:
         if good_opcodes_db:
             opcodes = extract_opcodes(file_data)
-            total_markers += len(good_opcodes_db)
-            for op in opcodes:
-                op_l = op.replace(" ", "").lower()
-                if op_l in good_opcodes_db:
-                    matches += 1
+            # if we couldn't extract opcodes, don't add to denominator
+            if opcodes:
+                total_markers += len(opcodes)
+                for op in opcodes:
+                    op_l = op.replace(" ", "").lower()
+                    if op_l in good_opcodes_db:
+                        matches += 1
     except Exception:
         logging.debug("opcode check failed for %s", path, exc_info=True)
 
     # --- STRINGS ---
     try:
-        string_dbs = []
-        if base64strings:
-            string_dbs.append(base64strings)
-        if hexEncStrings:
-            string_dbs.append(hexEncStrings)
-        if reversedStrings:
-            string_dbs.append(reversedStrings)
-
-        if string_dbs:
+        string_dbs_present = bool(base64strings or hexEncStrings or reversedStrings)
+        if string_dbs_present:
             if precomputed_strings is None:
                 strings = extract_strings(file_data)
             else:
                 strings = precomputed_strings
 
-            # Keep likely words
-            strings = [s for s in strings if is_likely_word(s)]
+            # Only consider strings that look like words or are long enough; keep behavior similar to existing code
+            filtered_strings = [s for s in strings if len(s) >= 3]
 
-            for db in string_dbs:
-                total_markers += len(db)
-                for s in strings:
-                    s_l = s.lower()
-                    if s in db or s_l in db:
-                        matches += 1
+            total_markers += len(filtered_strings)
+            for s in filtered_strings:
+                s_l = s.lower()
+                # check against any string DB
+                if s in base64strings or s_l in base64strings:
+                    matches += 1
+                    continue
+                if s in hexEncStrings or s_l in hexEncStrings:
+                    matches += 1
+                    continue
+                if s in reversedStrings or s_l in reversedStrings:
+                    matches += 1
+                    continue
     except Exception:
         logging.debug("string DB check failed for %s", path, exc_info=True)
 
     if total_markers == 0:
         return 0.0
 
-    return (matches / total_markers) * 100
+    percent = (matches / total_markers) * 100.0
+    # bound and round for readability
+    if percent < 0:
+        percent = 0.0
+    if percent > 100:
+        percent = 100.0
+    return round(percent, 2)
 
 def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
     analysis = {
