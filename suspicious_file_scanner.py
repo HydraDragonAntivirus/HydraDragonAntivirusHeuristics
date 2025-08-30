@@ -912,7 +912,6 @@ def analyze_yargen_strings_from_list(strings: List[str]) -> Dict[str, Any]:
     """
     return _simple_yargen_scores(strings)
 
-
 def analyze_single_file(path: str) -> Dict[str, Any]:
     """Analyze a single file with Capstone disassembly and basic checks.
 
@@ -935,6 +934,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         "suspicious_score": 0,
         "suspicious": False,
         "known_good_percent": 0.0,
+        "unknown": False,   # <── added default
     }
 
     try:
@@ -959,9 +959,11 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         # Extract strings once and reuse
         strings = extract_strings(file_bytes) if file_bytes else []
 
-        # Check known-good DBs as percentage (reuse strings and file_bytes to avoid re-reads)
+        # Check known-good DBs as percentage
         try:
-            features["known_good_percent"] = check_against_good_dbs_percentage(path, file_data=file_bytes, precomputed_strings=strings)
+            features["known_good_percent"] = check_against_good_dbs_percentage(
+                path, file_data=file_bytes, precomputed_strings=strings
+            )
         except Exception:
             logging.debug("known_good_percent check failed for %s", path, exc_info=True)
 
@@ -1026,7 +1028,15 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         features["suspicious_score"] = score
         features["suspicious"] = score >= SUSPICIOUS_THRESHOLD
 
-        # IMPORTANT CHANGE: only run yarGen-like analysis if file is suspicious
+        # Mark unknownness (only if suspicious)
+        if features["suspicious"]:
+            if features.get("known_good_percent", 0) == 0:
+                # no goodware overlap → treat as unknown suspicious
+                features["unknown"] = True
+            else:
+                features["unknown"] = False
+
+        # Only run yarGen-like analysis if file is suspicious
         if features["suspicious"]:
             try:
                 yargen_analysis = analyze_yargen_strings_from_list(strings)
@@ -1034,14 +1044,12 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
                 # Optional: bump score if yarGen finds lots of suspicious strings
                 try:
                     if yargen_analysis.get("yargen_suspicious_percentage", 0) > 30:
-                        # Increase score slightly so these show up higher in triage
-                        features["suspicious_score"] = features["suspicious_score"] + 3
+                        features["suspicious_score"] += 3
                 except Exception:
                     pass
             except Exception:
                 logging.debug("YarGen-like analysis failed for %s", path, exc_info=True)
         else:
-            # Keep a minimal yargen_summary for later reference
             features["yargen_summary"] = {
                 "status": "Not analyzed (below suspicious threshold)",
                 "total_strings": len(strings),
@@ -1052,7 +1060,6 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         features["error"] = str(exc)
 
     return features
-
 
 def scan_directory_parallel(directory: str, max_workers: Optional[int] = None) -> List[Dict[str, Any]]:
     """
