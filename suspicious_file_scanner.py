@@ -1,11 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: iso-8859-1 -*-
 # -*- coding: utf-8 -*-
-#
-# yarGen
-# A Rule Generator for YARA Rules
-#
-# Florian Roth
 
 __version__ = "0.24.0"
 
@@ -69,11 +64,6 @@ nltk_words = set(words.words())
 RELEVANT_EXTENSIONS = [".asp", ".vbs", ".ps", ".ps1", ".tmp", ".bas", ".bat", ".cmd", ".com", ".cpl",
                        ".crt", ".dll", ".exe", ".msc", ".scr", ".sys", ".vb", ".vbe", ".vbs", ".wsc",
                        ".wsf", ".wsh", ".input", ".war", ".jsp", ".php", ".asp", ".aspx", ".psd1", ".psm1", ".py"]
-
-AI_COMMENT = """
-The provided rule is a YARA rule, encompassing a wide range of suspicious strings. Kindly review the list and pinpoint the twenty strings that are most distinctive or appear most suited for a YARA rule focused on malware detection. Arrange them in descending order based on their level of suspicion. Then, swap out the current list of strings in the YARA rule with your chosen set and supply the revised rule.
----
-"""
 
 REPO_URLS = {
     'good-opcodes-part1.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part1.db',
