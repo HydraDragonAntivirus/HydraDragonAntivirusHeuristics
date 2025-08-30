@@ -9,7 +9,7 @@ import re
 import sys
 import time
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Any, Dict, List, Set, Optional
 
 import ctypes
@@ -1054,8 +1054,11 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
     return features
 
 
-def scan_directory_parallel(directory: str) -> List[Dict[str, Any]]:
-    """Scan a directory in parallel with tqdm progress and realtime logging."""
+def scan_directory_parallel(directory: str, max_workers: Optional[int] = None) -> List[Dict[str, Any]]:
+    """
+    Scan a directory in parallel using ProcessPoolExecutor (one process per CPU by default).
+    Returns a list of feature dictionaries (same shape as before).
+    """
     suspicious_results = []
     files = []
     for root, _, filenames in os.walk(directory):
@@ -1064,13 +1067,18 @@ def scan_directory_parallel(directory: str) -> List[Dict[str, Any]]:
 
     total_files = len(files)
     logging.info(
-        "Scanning directory (parallel with Threads): %s, total files=%d",
+        "Scanning directory (parallel with Processes): %s, total files=%d",
         directory,
         total_files,
     )
 
-    with ThreadPoolExecutor() as executor:
+    # Default to CPU count if not provided
+    workers = max_workers or os.cpu_count() or 1
+
+    # Use ProcessPoolExecutor (each analyze_single_file runs in its own process)
+    with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(analyze_single_file, f): f for f in files}
+        # Use as_completed to iterate as jobs finish
         for future in tqdm(as_completed(futures),
                            total=total_files,
                            desc="Scanning",
@@ -1085,10 +1093,9 @@ def scan_directory_parallel(directory: str) -> List[Dict[str, Any]]:
                     )
                 suspicious_results.append(result)
             except Exception as e:
-                logging.error("Error during analysis: %s", e)
+                logging.error("Error during analysis of %s: %s", futures.get(future), e)
 
     return suspicious_results
-
 
 def generate_general_condition(file_info: dict):
     conditions = []
