@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 
-
 import glob
 import logging
 import math
@@ -19,6 +18,10 @@ import lief
 import psutil
 from ctypes import wintypes
 from tqdm import tqdm
+
+import argparse
+import shutil
+import urllib.request
 
 # Optional imports that some environments may not have
 try:
@@ -101,12 +104,6 @@ REPO_URLS = {
 ASCII_RE = re.compile(rb"[\x1f-\x7e]{6,}")  # ASCII strings length >=6
 WIDE_RE = re.compile(rb"(?:[\x1f-\x7e][\x00]){6,}")  # UTF-16LE wide strings length >=6
 HEX_CAND_RE = re.compile(rb"([A-Fa-f0-9]{10,})")  # Hex-like substrings length >=10
-
-# DB repo urls (same as original)
-REPO_URLS = {
-    "good-opcodes-part1.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part1.db",
-    # ... (truncated for brevity in this header) ...
-}
 
 PE_STRINGS_FILE = "./3rdparty/strings.xml"
 
@@ -777,61 +774,151 @@ def is_running_pe(path: str) -> bool:
     return False
 
 
-def analyze_yargen_strings_from_list(strings: List[str]) -> Dict[str, Any]:
-    """Analyze a pre-extracted list of strings (no file I/O).
+def _simple_yargen_scores(strings: List[str]) -> Dict[str, Any]:
+    """
+    A yarGen-inspired scoring function.
+    Returns:
+      {
+        "yargen_strings": [top suspicious strings...],
+        "yargen_suspicious_percentage": float,
+        "total_strings": int,
+        "status": "Likely Clean"|"Potentially Malicious"|...,
+        "scores": { string: score, ... }
+      }
+    This is intentionally conservative and fast.
     """
     analysis = {
         "yargen_strings": [],
         "yargen_suspicious_percentage": 0.0,
         "total_strings": 0,
         "status": "Not Analyzed",
+        "scores": {},
     }
     try:
-        all_strings = strings
-        total_strings = len(all_strings)
-        analysis["total_strings"] = total_strings
-
-        if total_strings > 0:
-            # Define suspicious keywords locally (bytes -> str)
-            suspicious_keywords = [
-                "shell",
-                "invoke",
-                "powershell",
-                "download",
-                "execute",
-                "payload",
-            ]
-            suspicious_strings = []
-            for s in all_strings:
-                s_l = s.lower()
-                for kw in suspicious_keywords:
-                    if kw in s_l:
-                        suspicious_strings.append(s)
-                        break
-
-            analysis["yargen_strings"] = suspicious_strings[:50]
-            suspicious_percentage = (len(suspicious_strings) / total_strings) * 100
-            analysis["yargen_suspicious_percentage"] = suspicious_percentage
-
-            if suspicious_percentage < 1 and total_strings > 100:
-                analysis["status"] = "Likely Clean (very low suspicious string ratio)"
-            elif suspicious_percentage > 30:
-                analysis["status"] = "Potentially Malicious (high ratio of suspicious strings)"
-            else:
-                analysis["status"] = "Unknown/Generic"
-        else:
+        total = len(strings)
+        analysis["total_strings"] = total
+        if total == 0:
             analysis["status"] = "No strings found"
+            return analysis
+
+        scores = {}
+        suspicious_count = 0
+
+        # Precompile few regexes used often
+        ip_re = re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b')
+        base64_re = re.compile(r'^(?:[A-Za-z0-9+/]{4}){10,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$')
+        hexhash_re = re.compile(r'\b([a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})\b')
+
+        for s in strings:
+            s_l = s.lower()
+            score = 0.0
+
+            # quick length filter
+            if len(s) < 6:
+                scores[s] = score
+                continue
+
+            # Penalize very common-looking noise
+            if re.search(r'^[\-\_\.0-9]+$', s) or len(set(s)) == 1:
+                score -= 5
+
+            # suspicious keywords (like yarGen)
+            if re.search(r'(shell|powershell|invoke|download|execute|payload|encrypt|inject|token|credential|creds|net use|schtasks|rundll32|cmd\.exe|whoami|bitsadmin|Invoke-Expression)', s, re.IGNORECASE):
+                score += 4
+
+            # suspicious phrases that often appear in malware
+            if re.search(r'(bypass|encodedcommand|frombase64string|memoryloadlibrary|downloadfile|wget|curl|base64decode|execv|system32|appdata|%appdata%)', s, re.IGNORECASE):
+                score += 3
+
+            # IP addresses / ports
+            if ip_re.search(s):
+                score += 5
+
+            # base64 blobs
+            if base64_re.match(s) or is_base_64(s):
+                score += 6
+
+            # Hex-encoded or big hex string
+            if is_hex_encoded(re.sub(r'[^0-9a-fA-F]', '', s), check_length=False):
+                score += 4
+
+            # common hash indicators
+            if hexhash_re.search(s):
+                score += 2
+
+            # file paths, registry, temp
+            if re.search(r'([A-Za-z]:\\|%appdata%|/tmp/|/var/)', s, re.IGNORECASE):
+                score += 3
+
+            # commands and script markers
+            if re.search(r'(\bwget\b|\bcurl\b|powershell -|invoke-expression|EncodedCommand|-nop\b|-w hidden\b|-command\b|iex\b)', s, re.IGNORECASE):
+                score += 4
+
+            # suspicious extensions or exe references
+            if re.search(r'\.(exe|dll|scr|bat|ps1)\b', s, re.IGNORECASE):
+                score += 2
+
+            # RAT / malware keywords
+            if re.search(r'(rat\b|meterpreter|metasploit|katz|katz|payload|reverse shell|bind shell|backdoor|implant)', s, re.IGNORECASE):
+                score += 5
+
+            # tokens, credentials, passwords
+            if re.search(r'(password|passwd|token|auth|cookie|credential|creds|username|user|pass)', s, re.IGNORECASE):
+                score += 3
+
+            # suspicious punctuation combos (e.g. arrows, ! marks used in logs)
+            if re.search(r'(-->|!!!|<<<|>>>)', s):
+                score += 2
+
+            # prefer strings that contain dictionary words (reduce false positives)
+            if is_likely_word(s) or any(w.isalpha() and len(w) >= 3 and w.lower() in nltk_words for w in re.split(r'\W+', s) if nltk_words):
+                score += 0.5
+
+            # small heuristic: extremely high entropy strings (no spaces, many chars) => likely encoded
+            # approximate by fraction of non-alnum characters
+            non_alnum = sum(1 for ch in s if not ch.isalnum())
+            if len(s) > 12 and (non_alnum / len(s)) < 0.05 and len(set(s)) > (len(s) // 4):
+                # likely an encoded/packed blob or long random string
+                score += 1.5
+
+            scores[s] = score
+            if score >= 4.0:
+                suspicious_count += 1
+
+        # sort top suspicious strings
+        sorted_by_score = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        top_strings = [t[0] for t in sorted_by_score if t[1] > 0][:50]
+
+        suspicious_percentage = (suspicious_count / total) * 100.0
+
+        analysis["yargen_strings"] = top_strings[:50]
+        analysis["yargen_suspicious_percentage"] = suspicious_percentage
+        analysis["scores"] = {k: v for k, v in sorted_by_score[:200]}
+        if suspicious_percentage < 1 and total > 100:
+            analysis["status"] = "Likely Clean (very low suspicious string ratio)"
+        elif suspicious_percentage > 30:
+            analysis["status"] = "Potentially Malicious (high ratio of suspicious strings)"
+        else:
+            analysis["status"] = "Unknown/Generic"
     except Exception as exc:
-        logging.error("yarGen string extraction failed: %s", exc)
+        logging.error("yarGen scoring failed: %s", exc)
         analysis["status"] = f"Error during string analysis: {exc}"
     return analysis
+
+
+def analyze_yargen_strings_from_list(strings: List[str]) -> Dict[str, Any]:
+    """
+    Wrapper to keep compatibility with original name. Uses the conservative yarGen-style scorer above.
+    """
+    return _simple_yargen_scores(strings)
 
 
 def analyze_single_file(path: str) -> Dict[str, Any]:
     """Analyze a single file with Capstone disassembly and basic checks.
 
     Key change: extract strings once and reuse them for both "good db" checks
-    and yara-like string analysis. This avoids doing two full string scans per file.
+    and yara-like string analysis. yarGen-like analysis is executed *only* if
+    the file's heuristic suspicious_score >= SUSPICIOUS_THRESHOLD.
     """
     features = {
         "path": path,
@@ -906,13 +993,6 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
                 logging.debug("Signature check failed for %s", path, exc_info=True)
             features["is_running"] = is_running_pe(path)
 
-        # Run yara-like string analysis from pre-extracted list
-        try:
-            yargen_analysis = analyze_yargen_strings_from_list(strings)
-            features["yargen_summary"] = yargen_analysis
-        except Exception:
-            logging.debug("YarGen-like analysis failed for %s", path, exc_info=True)
-
         # Score heuristics (conservative)
         score = 0
         if features.get("capstone_analysis") and features["capstone_analysis"].get(
@@ -938,13 +1018,35 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         if ext == "":
             score += 2
 
-        # Adjust score based on known-good percentage
+        # Adjust score based on known-good percentage (cap reduction)
         if features.get("known_good_percent", 0) > 0:
             reduction = score * min(features["known_good_percent"] / 100, 0.5)
             score = max(score - reduction, 0)
 
         features["suspicious_score"] = score
         features["suspicious"] = score >= SUSPICIOUS_THRESHOLD
+
+        # IMPORTANT CHANGE: only run yarGen-like analysis if file is suspicious
+        if features["suspicious"]:
+            try:
+                yargen_analysis = analyze_yargen_strings_from_list(strings)
+                features["yargen_summary"] = yargen_analysis
+                # Optional: bump score if yarGen finds lots of suspicious strings
+                try:
+                    if yargen_analysis.get("yargen_suspicious_percentage", 0) > 30:
+                        # Increase score slightly so these show up higher in triage
+                        features["suspicious_score"] = features["suspicious_score"] + 3
+                except Exception:
+                    pass
+            except Exception:
+                logging.debug("YarGen-like analysis failed for %s", path, exc_info=True)
+        else:
+            # Keep a minimal yargen_summary for later reference
+            features["yargen_summary"] = {
+                "status": "Not analyzed (below suspicious threshold)",
+                "total_strings": len(strings),
+            }
+
     except Exception as exc:
         logging.error("Failed to analyze %s: %s", path, exc)
         features["error"] = str(exc)
@@ -1143,16 +1245,63 @@ def get_file_range(size):
 
 
 # -----------------------
-# Main execution
+# Database update helper + Main execution
 # -----------------------
+
+def update_databases(force: bool = False, db_dir: str = "./dbs"):
+    """Download REPO_URLS into db_dir.
+
+    - If force is False, only download missing files (resume-safe).
+    - If force is True, re-download all files.
+    """
+    try:
+        if not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+    except Exception:
+        logging.exception("Error creating db dir %s", db_dir)
+        return
+
+    for filename, repo_url in REPO_URLS.items():
+        out_path = os.path.join(db_dir, filename)
+        if os.path.exists(out_path) and not force:
+            logging.info("DB already present, skipping: %s", out_path)
+            continue
+        try:
+            logging.info("Downloading %s from %s ...", filename, repo_url)
+            with urllib.request.urlopen(repo_url, timeout=30) as response, open(out_path, "wb") as out_file:
+                shutil.copyfileobj(response, out_file)
+            logging.info("Saved DB: %s", out_path)
+        except Exception:
+            logging.exception("Error downloading %s from %s", filename, repo_url)
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Parallel scanner (uses optional good-* DBs).")
+    parser.add_argument(
+        "--update-db",
+        action="store_true",
+        help="Download/update DB files from REPO_URLS into ./dbs before scanning (no other flags).",
+    )
+    args = parser.parse_args()
+
     logging.info("Starting file scan with Capstone analysis (parallel)...")
 
-    try:
-        load_good_dbs("./dbs")
-    except Exception:
-        logging.exception("Failed to update/load good DBs")
+    # DB update / load: only the single --update-db flag controls network activity.
+    if args.update_db:
+        try:
+            logging.info("Requested DB update: downloading into ./dbs (force not available).")
+            update_databases(force=False, db_dir="./dbs")
+            load_good_dbs("./dbs")
+        except Exception:
+            logging.exception("Failed to update/load good DBs")
+    else:
+        # Try to load DBs if present; do not attempt network activity.
+        try:
+            load_good_dbs("./dbs")
+        except Exception:
+            logging.exception("Failed to load good DBs")
 
+    # Run scan (always uses configured SCAN_FOLDER)
     try:
         results = scan_directory_parallel(SCAN_FOLDER)
     except Exception as exc:
@@ -1161,7 +1310,6 @@ if __name__ == "__main__":
 
     suspicious_count = 0
     top_offenders = []
-    # results is a list of feature dicts
     for res in results:
         if res.get("suspicious", False):
             suspicious_count += 1
@@ -1177,17 +1325,18 @@ if __name__ == "__main__":
     if top_offenders:
         logging.info("--- Detailed Analysis of Top Suspicious Files ---")
         for score, path in top_offenders[:20]:
-            original_features = next((f for f in results if f.get('path') == path), {})
+            original_features = next((f for f in results if f.get("path") == path), {})
             notes = []
-            if original_features.get("capstone_analysis", {}).get(
-                "overall_analysis", {}
-            ).get("is_likely_packed"):
+            if original_features.get("capstone_analysis", {}).get("overall_analysis", {}).get(
+                "is_likely_packed"
+            ):
                 notes.append("Capstone suggests file may be packed")
             if original_features.get("entropy", 0) > 7.5:
                 notes.append("High entropy detected")
             if not original_features.get("signature_valid"):
                 notes.append(
-                    "Invalid or missing signature (Status: %s)" % original_features.get("signature_status", "N/A")
+                    "Invalid or missing signature (Status: %s)"
+                    % original_features.get("signature_status", "N/A")
                 )
 
             logging.info("Path: %s (Initial Score: %d)", path, score)
