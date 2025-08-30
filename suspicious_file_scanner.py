@@ -1,762 +1,184 @@
 #!/usr/bin/env python
-# -*- coding: iso-8859-1 -*-
 # -*- coding: utf-8 -*-
 
 __version__ = "0.24.0"
 
-import os
-import sys
-import re
-import traceback
-
-import datetime
-import time
-import lief
-import json
+import glob
 import gzip
-import urllib.request
-import binascii
-import shutil
-from collections import Counter
-from hashlib import sha256
-from lxml import etree
-import nltk
-import math
-import ctypes
+import json
 import logging
-from ctypes import wintypes
-import psutil
-from tqdm import tqdm
-from typing import Dict, Any, Set, Optional
-from concurrent.futures import ThreadPoolExecutor
+import math
+import os
+import re
+import shutil
 import sys
-import pefile
-import capstone
+import time
+import traceback
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Dict, List, Set
 
-# Ensure that necessary NLTK resources are available
-nltk.download('punkt')
-nltk.download('punkt_tab')
-nltk.download('words')
+import ctypes
+import binascii
+import lief
+import psutil
+from ctypes import wintypes
+from tqdm import tqdm
 
-from nltk.corpus import words
-from nltk.tokenize import word_tokenize
+# Optional imports that some environments may not have
+try:
+    import pefile
+except Exception:
+    pefile = None
 
-# A simple filter function to consider only meaningful words (ignoring non-English or arbitrary symbols)
-def filter_meaningful_words(word_list):
-    # Only allow alphabetic, lowercase words
-    return [word for word in word_list if word.isalpha() and word.islower()]
+try:
+    import capstone
+except Exception:
+    capstone = None
+
+# NLTK usage is best-effort
+try:
+    import nltk
+    try:
+        nltk.download("punkt", quiet=True)
+    except Exception:
+        pass
+    try:
+        nltk.download("words", quiet=True)
+    except Exception:
+        pass
+    from nltk.corpus import words  # type: ignore
+except Exception:
+    nltk = None
+    words = None  # type: ignore
 
 # Load NLTK word corpus
 nltk_words = set(words.words())
 
-RELEVANT_EXTENSIONS = [".asp", ".vbs", ".ps", ".ps1", ".tmp", ".bas", ".bat", ".cmd", ".com", ".cpl",
-                       ".crt", ".dll", ".exe", ".msc", ".scr", ".sys", ".vb", ".vbe", ".vbs", ".wsc",
-                       ".wsf", ".wsh", ".input", ".war", ".jsp", ".php", ".asp", ".aspx", ".psd1", ".psm1", ".py"]
+# Basic configuration
+SCAN_FOLDER = "D:\\datas2\\data2"
+SUSPICIOUS_THRESHOLD = 11
 
+# DB repo urls (same as original)
 REPO_URLS = {
-    'good-opcodes-part1.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part1.db',
-    'good-opcodes-part2.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part2.db',
-    'good-opcodes-part3.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part3.db',
-    'good-opcodes-part4.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part4.db',
-    'good-opcodes-part5.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part5.db',
-    'good-opcodes-part6.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part6.db',
-    'good-opcodes-part7.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part7.db',
-    'good-opcodes-part8.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part8.db',
-    'good-opcodes-part9.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part9.db',
-
-    'good-strings-part1.db': 'https://www.bsk-consulting.de/yargen/good-strings-part1.db',
-    'good-strings-part2.db': 'https://www.bsk-consulting.de/yargen/good-strings-part2.db',
-    'good-strings-part3.db': 'https://www.bsk-consulting.de/yargen/good-strings-part3.db',
-    'good-strings-part4.db': 'https://www.bsk-consulting.de/yargen/good-strings-part4.db',
-    'good-strings-part5.db': 'https://www.bsk-consulting.de/yargen/good-strings-part5.db',
-    'good-strings-part6.db': 'https://www.bsk-consulting.de/yargen/good-strings-part6.db',
-    'good-strings-part7.db': 'https://www.bsk-consulting.de/yargen/good-strings-part7.db',
-    'good-strings-part8.db': 'https://www.bsk-consulting.de/yargen/good-strings-part8.db',
-    'good-strings-part9.db': 'https://www.bsk-consulting.de/yargen/good-strings-part9.db',
-
-    'good-exports-part1.db': 'https://www.bsk-consulting.de/yargen/good-exports-part1.db',
-    'good-exports-part2.db': 'https://www.bsk-consulting.de/yargen/good-exports-part2.db',
-    'good-exports-part3.db': 'https://www.bsk-consulting.de/yargen/good-exports-part3.db',
-    'good-exports-part4.db': 'https://www.bsk-consulting.de/yargen/good-exports-part4.db',
-    'good-exports-part5.db': 'https://www.bsk-consulting.de/yargen/good-exports-part5.db',
-    'good-exports-part6.db': 'https://www.bsk-consulting.de/yargen/good-exports-part6.db',
-    'good-exports-part7.db': 'https://www.bsk-consulting.de/yargen/good-exports-part7.db',
-    'good-exports-part8.db': 'https://www.bsk-consulting.de/yargen/good-exports-part8.db',
-    'good-exports-part9.db': 'https://www.bsk-consulting.de/yargen/good-exports-part9.db',
-
-    'good-imphashes-part1.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part1.db',
-    'good-imphashes-part2.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part2.db',
-    'good-imphashes-part3.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part3.db',
-    'good-imphashes-part4.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part4.db',
-    'good-imphashes-part5.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part5.db',
-    'good-imphashes-part6.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part6.db',
-    'good-imphashes-part7.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part7.db',
-    'good-imphashes-part8.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part8.db',
-    'good-imphashes-part9.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part9.db',
+    "good-opcodes-part1.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part1.db",
+    "good-opcodes-part2.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part2.db",
+    "good-opcodes-part3.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part3.db",
+    "good-opcodes-part4.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part4.db",
+    "good-opcodes-part5.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part5.db",
+    "good-opcodes-part6.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part6.db",
+    "good-opcodes-part7.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part7.db",
+    "good-opcodes-part8.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part8.db",
+    "good-opcodes-part9.db": "https://www.bsk-consulting.de/yargen/good-opcodes-part9.db",
+    "good-strings-part1.db": "https://www.bsk-consulting.de/yargen/good-strings-part1.db",
+    "good-strings-part2.db": "https://www.bsk-consulting.de/yargen/good-strings-part2.db",
+    "good-strings-part3.db": "https://www.bsk-consulting.de/yargen/good-strings-part3.db",
+    "good-strings-part4.db": "https://www.bsk-consulting.de/yargen/good-strings-part4.db",
+    "good-strings-part5.db": "https://www.bsk-consulting.de/yargen/good-strings-part5.db",
+    "good-strings-part6.db": "https://www.bsk-consulting.de/yargen/good-strings-part6.db",
+    "good-strings-part7.db": "https://www.bsk-consulting.de/yargen/good-strings-part7.db",
+    "good-strings-part8.db": "https://www.bsk-consulting.de/yargen/good-strings-part8.db",
+    "good-strings-part9.db": "https://www.bsk-consulting.de/yargen/good-strings-part9.db",
+    "good-exports-part1.db": "https://www.bsk-consulting.de/yargen/good-exports-part1.db",
+    "good-exports-part2.db": "https://www.bsk-consulting.de/yargen/good-exports-part2.db",
+    "good-exports-part3.db": "https://www.bsk-consulting.de/yargen/good-exports-part3.db",
+    "good-exports-part4.db": "https://www.bsk-consulting.de/yargen/good-exports-part4.db",
+    "good-exports-part5.db": "https://www.bsk-consulting.de/yargen/good-exports-part5.db",
+    "good-exports-part6.db": "https://www.bsk-consulting.de/yargen/good-exports-part6.db",
+    "good-exports-part7.db": "https://www.bsk-consulting.de/yargen/good-exports-part7.db",
+    "good-exports-part8.db": "https://www.bsk-consulting.de/yargen/good-exports-part8.db",
+    "good-exports-part9.db": "https://www.bsk-consulting.de/yargen/good-exports-part9.db",
+    "good-imphashes-part1.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part1.db",
+    "good-imphashes-part2.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part2.db",
+    "good-imphashes-part3.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part3.db",
+    "good-imphashes-part4.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part4.db",
+    "good-imphashes-part5.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part5.db",
+    "good-imphashes-part6.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part6.db",
+    "good-imphashes-part7.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part7.db",
+    "good-imphashes-part8.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part8.db",
+    "good-imphashes-part9.db": "https://www.bsk-consulting.de/yargen/good-imphashes-part9.db",
 }
 
 PE_STRINGS_FILE = "./3rdparty/strings.xml"
 
-KNOWN_IMPHASHES = {'a04dd9f5ee88d7774203e0a0cfa1b941': 'PsExec',
-                   '2b8c9d9ab6fefc247adaf927e83dcea6': 'RAR SFX variant'}
+KNOWN_IMPHASHES = {
+    "a04dd9f5ee88d7774203e0a0cfa1b941": "PsExec",
+    "2b8c9d9ab6fefc247adaf927e83dcea6": "RAR SFX variant",
+}
+
+RELEVANT_EXTENSIONS = [
+    ".asp", ".vbs", ".ps", ".ps1", ".tmp", ".bas", ".bat", ".cmd", ".com", ".cpl",
+    ".crt", ".dll", ".exe", ".msc", ".scr", ".sys", ".vb", ".vbe", ".vbs",
+    ".wsc", ".wsf", ".wsh", ".input", ".war", ".jsp", ".php", ".asp", ".aspx",
+    ".psd1", ".psm1", ".py",
+]
+
+# Small helper sets (populated by load_good_dbs)
+base64strings: Set[str] = set()
+hexEncStrings: Set[str] = set()
+reversedStrings: Set[str] = set()
+good_opcodes_db: Set[str] = set()
+
+# Logging setup
+logging.basicConfig(
+    filename="scanner.log",
+    filemode="a",
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
 
 
-def get_abs_path(filename):
+def get_abs_path(filename: str) -> str:
+    """Return absolute path relative to this file."""
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
 
 
-def get_files(folder, notRecursive):
-    # Not Recursive
-    if notRecursive:
+def get_files(folder: str, not_recursive: bool):
+    """Yield files from folder, optionally non-recursive."""
+    if not_recursive:
         for filename in os.listdir(folder):
-            filePath = os.path.join(folder, filename)
-            if os.path.isdir(filePath):
+            file_path = os.path.join(folder, filename)
+            if os.path.isdir(file_path):
                 continue
-            yield filePath
-    # Recursive
+            yield file_path
     else:
-        for root, dirs, files in os.walk(folder, topdown = False):
+        for root, _dirs, files in os.walk(folder, topdown=False):
             for name in files:
-                filePath = os.path.join(root, name)
-                yield filePath
+                file_path = os.path.join(root, name)
+                yield file_path
 
 
-def parse_sample_dir(dir, notRecursive=False, generateInfo=False, onlyRelevantExtensions=False):
-    # Prepare dictionary
-    string_stats = {}
-    opcode_stats = {}
-    file_info = {}
-    known_sha1sums = []
-
-    for filePath in get_files(dir, notRecursive):
+def extract_hex_strings(s: bytes):
+    strings = []
+    hex_strings = re.findall(b"([a-fA-F0-9]{10,})", s)
+    for string in list(hex_strings):
+        hex_strings += string.split(b"0000")
+        hex_strings += string.split(b"0d0a")
+        hex_strings += re.findall(
+            b"((?:0000|002[a-f0-9]|00[3-9a-f][0-9a-f]){6,})", string, re.IGNORECASE
+        )
+    hex_strings = list(set(hex_strings))
+    # ASCII Encoded Strings
+    for string in hex_strings:
+        for x in string.split(b"00"):
+            if len(x) > 10:
+                strings.append(x)
+    # WIDE Encoded Strings
+    for string in hex_strings:
         try:
-            print("[+] Processing %s ..." % filePath)
-
-            # Get Extension
-            extension = os.path.splitext(filePath)[1].lower()
-            if not extension in RELEVANT_EXTENSIONS and onlyRelevantExtensions:
-                if args.debug:
-                    print("[-] EXTENSION %s - Skipping file %s" % (extension, filePath))
+            if len(string) % 2 != 0 or len(string) < 8:
                 continue
-
-            # Info file check
-            if os.path.basename(filePath) == os.path.basename(args.b) or \
-                    os.path.basename(filePath) == os.path.basename(args.r):
+            if b"0000" in string:
                 continue
-
-            # Size Check
-            size = 0
-            try:
-                size = os.stat(filePath).st_size
-                if size > (args.fs * 1024 * 1024):
-                    if args.debug:
-                        print("[-] File is to big - Skipping file %s (use -fs to adjust this behaviour)" % (filePath))
-                    continue
-            except Exception as e:
-                pass
-
-            # Check and read file
-            try:
-                with open(filePath, 'rb') as f:
-                    fileData = f.read()
-            except Exception as e:
-                print("[-] Cannot read file - skipping %s" % filePath)
-
-            # Extract strings from file
-            strings = extract_strings(fileData)
-
-            # Extract opcodes from file
-            opcodes = []
-            if use_opcodes:
-                print("[-] Extracting OpCodes: %s" % filePath)
-                opcodes = extract_opcodes(fileData)
-
-            # Add sha256 value
-            if generateInfo:
-                sha256sum = sha256(fileData).hexdigest()
-                file_info[filePath] = {}
-                file_info[filePath]["hash"] = sha256sum
-                file_info[filePath]["imphash"], file_info[filePath]["exports"] = get_pe_info(fileData)
-
-            # Skip if hash already known - avoid duplicate files
-            if sha256sum in known_sha1sums:
-                # if args.debug:
-                print("[-] Skipping strings/opcodes from %s due to MD5 duplicate detection" % filePath)
-                continue
-            else:
-                known_sha1sums.append(sha256sum)
-
-            # Magic evaluation
-            if not args.nomagic:
-                file_info[filePath]["magic"] = binascii.hexlify(fileData[:2]).decode('ascii')
-            else:
-                file_info[filePath]["magic"] = ""
-
-            # File Size
-            file_info[filePath]["size"] = os.stat(filePath).st_size
-
-            # Add stats for basename (needed for inverse rule generation)
-            fileName = os.path.basename(filePath)
-            folderName = os.path.basename(os.path.dirname(filePath))
-            if fileName not in file_info:
-                file_info[fileName] = {}
-                file_info[fileName]["count"] = 0
-                file_info[fileName]["hashes"] = []
-                file_info[fileName]["folder_names"] = []
-            file_info[fileName]["count"] += 1
-            file_info[fileName]["hashes"].append(sha256sum)
-            if folderName not in file_info[fileName]["folder_names"]:
-                file_info[fileName]["folder_names"].append(folderName)
-
-            # Add strings to statistics
-            for string in strings:
-                # String is not already known
-                if string not in string_stats:
-                    string_stats[string] = {}
-                    string_stats[string]["count"] = 0
-                    string_stats[string]["files"] = []
-                    string_stats[string]["files_basename"] = {}
-                # String count
-                string_stats[string]["count"] += 1
-                # Add file information
-                if fileName not in string_stats[string]["files_basename"]:
-                    string_stats[string]["files_basename"][fileName] = 0
-                string_stats[string]["files_basename"][fileName] += 1
-                if filePath not in string_stats[string]["files"]:
-                    string_stats[string]["files"].append(filePath)
-
-            # Add opcodes to statistics
-            for opcode in opcodes:
-                # Opcode is not already known
-                if opcode not in opcode_stats:
-                    opcode_stats[opcode] = {}
-                    opcode_stats[opcode]["count"] = 0
-                    opcode_stats[opcode]["files"] = []
-                    opcode_stats[opcode]["files_basename"] = {}
-                # Opcode count
-                opcode_stats[opcode]["count"] += 1
-                # Add file information
-                if fileName not in opcode_stats[opcode]["files_basename"]:
-                    opcode_stats[opcode]["files_basename"][fileName] = 0
-                opcode_stats[opcode]["files_basename"][fileName] += 1
-                if filePath not in opcode_stats[opcode]["files"]:
-                    opcode_stats[opcode]["files"].append(filePath)
-
-            if args.debug:
-                print("[+] Processed " + filePath + " Size: " + str(size) + " Strings: " + str(len(string_stats)) + \
-                      " OpCodes: " + str(len(opcode_stats)) + " ... ")
-
-        except Exception as e:
+            dec = string.replace(b"00", b"")
+            if is_ascii_string(dec, padding_allowed=False):
+                strings.append(string)
+        except Exception:
             traceback.print_exc()
-            print("[E] ERROR reading file: %s" % filePath)
-
-    return string_stats, opcode_stats, file_info
-
-
-def parse_good_dir(dir, notRecursive=False, onlyRelevantExtensions=True):
-    # Prepare dictionary
-    all_strings = Counter()
-    all_opcodes = Counter()
-    all_imphashes = Counter()
-    all_exports = Counter()
-
-    for filePath in get_files(dir, notRecursive):
-        # Get Extension
-        extension = os.path.splitext(filePath)[1].lower()
-        if extension not in RELEVANT_EXTENSIONS and onlyRelevantExtensions:
-            if args.debug:
-                print("[-] EXTENSION %s - Skipping file %s" % (extension, filePath))
-            continue
-
-        # Size Check
-        size = 0
-        try:
-            size = os.stat(filePath).st_size
-            if size > (args.fs * 1024 * 1024):
-                continue
-        except Exception as e:
-            pass
-
-        # Check and read file
-        try:
-            with open(filePath, 'rb') as f:
-                fileData = f.read()
-        except Exception as e:
-            print("[-] Cannot read file - skipping %s" % filePath)
-
-        # Extract strings from file
-        strings = extract_strings(fileData)
-        # Append to all strings
-        all_strings.update(strings)
-
-        # Extract Opcodes from file
-        opcodes = []
-        if use_opcodes:
-            print("[-] Extracting OpCodes: %s" % filePath)
-            opcodes = extract_opcodes(fileData)
-            # Append to all opcodes
-            all_opcodes.update(opcodes)
-
-        # Imphash and Exports
-        (imphash, exports) = get_pe_info(fileData)
-        if imphash != "":
-            all_imphashes.update([imphash])
-        all_exports.update(exports)
-        if args.debug:
-            print("[+] Processed %s - %d strings %d opcodes %d exports and imphash %s" % (filePath, len(strings),
-                                                                                          len(opcodes), len(exports),
-                                                                                          imphash))
-
-    # return it as a set (unique strings)
-    return all_strings, all_opcodes, all_imphashes, all_exports
-
-
-def extract_strings(fileData) -> list[str]:
-    # String list
-    cleaned_strings = []
-    # Read file data
-    try:
-        # Read strings
-        strings_full = re.findall(b"[\x1f-\x7e]{6,}", fileData)
-        strings_limited = re.findall(b"[\x1f-\x7e]{6,%d}" % args.s, fileData)
-        strings_hex = extract_hex_strings(fileData)
-        strings = list(set(strings_full) | set(strings_limited) | set(strings_hex))
-        wide_strings = [ws for ws in re.findall(b"(?:[\x1f-\x7e][\x00]){6,}", fileData)]
-
-        # Post-process
-        # WIDE
-        for ws in wide_strings:
-            # Decode UTF16 and prepend a marker (facilitates handling)
-            wide_string = ("UTF16LE:%s" % ws.decode('utf-16')).encode('utf-8')
-            if wide_string not in strings:
-                strings.append(wide_string)
-        for string in strings:
-            # Escape strings
-            if len(string) > 0:
-                string = string.replace(b'\\', b'\\\\')
-                string = string.replace(b'"', b'\\"')
-            try:
-                if isinstance(string, str):
-                    cleaned_strings.append(string)
-                else:
-                    cleaned_strings.append(string.decode('utf-8'))
-            except AttributeError as e:
-                print(string)
-                traceback.print_exc()
-
-    except Exception as e:
-        if args.debug:
-            print(string)
-            traceback.print_exc()
-        pass
-
-    return cleaned_strings
-
-
-def extract_opcodes(fileData) -> list[str]:
-    # Opcode list
-    opcodes = []
-
-    try:
-        # Read file data
-        binary = lief.parse(fileData)
-        ep = binary.entrypoint
-
-        # Locate .text section
-        text = None
-        if isinstance(binary, lief.PE.Binary):
-            for sec in binary.sections:
-                if sec.virtual_address + binary.imagebase <= ep < sec.virtual_address + binary.imagebase + sec.virtual_size:
-                    if args.debug:
-                        print(f'EP is located at {sec.name} section')
-                    text = sec.content.tobytes()
-                    break
-        elif isinstance(binary, lief.ELF.Binary):
-            for sec in binary.sections:
-                if sec.virtual_address <= ep < sec.virtual_address + sec.size:
-                    if args.debug:
-                        print(f'EP is located at {sec.name} section')
-                    text = sec.content.tobytes()
-                    break
-        
-        if text is not None:
-            # Split text into subs
-            text_parts = re.split(b"[\x00]{3,}", text)
-            # Now truncate and encode opcodes
-            for text_part in text_parts:
-                if text_part == '' or len(text_part) < 8:
-                    continue
-                opcodes.append(binascii.hexlify(text_part[:16]).decode(encoding='ascii'))
-    except Exception as e:
-        if args.debug:
-            traceback.print_exc()
-        pass
-
-    return opcodes
-
-
-def get_pe_info(fileData: bytes) -> tuple[str, list[str]]:
-    """
-    Get different PE attributes and hashes by lief
-    :param fileData:
-    :return:
-    """
-    imphash = ""
-    exports = []
-    # Check for MZ header (speed improvement)
-    if fileData[:2] != b"MZ":
-        return imphash, exports
-    try:
-        if args.debug:
-            print("Extracting PE information")
-        binary: lief.PE.Binary = lief.parse(fileData)
-        # Imphash
-        imphash = lief.PE.get_imphash(binary, lief.PE.IMPHASH_MODE.PEFILE)
-        # Exports (names)
-        for exp in binary.get_export().entries:
-            exp: lief.PE.ExportEntry
-            exports.append(str(exp.name))
-    except Exception as e:
-        if args.debug:
-            traceback.print_exc()
-        pass
-
-    return imphash, exports
-
-
-def sample_string_evaluation(string_stats, opcode_stats, file_info):
-    # Generate Stats -----------------------------------------------------------
-    print("[+] Generating statistical data ...")
-    file_strings = {}
-    file_opcodes = {}
-    combinations = {}
-    inverse_stats = {}
-    max_combi_count = 0
-    super_rules = []
-
-    # OPCODE EVALUATION --------------------------------------------------------
-    for opcode in opcode_stats:
-        # If string occurs not too often in sample files
-        if opcode_stats[opcode]["count"] < 10:
-            # If string list in file dictionary not yet exists
-            for filePath in opcode_stats[opcode]["files"]:
-                if filePath in file_opcodes:
-                    # Append string
-                    file_opcodes[filePath].append(opcode)
-                else:
-                    # Create list and then add the first string to the file
-                    file_opcodes[filePath] = []
-                    file_opcodes[filePath].append(opcode)
-
-    # STRING EVALUATION -------------------------------------------------------
-
-    # Iterate through strings found in malware files
-    for string in string_stats:
-
-        # If string occurs not too often in (goodware) sample files
-        if string_stats[string]["count"] < 10:
-            # If string list in file dictionary not yet exists
-            for filePath in string_stats[string]["files"]:
-                if filePath in file_strings:
-                    # Append string
-                    file_strings[filePath].append(string)
-                else:
-                    # Create list and then add the first string to the file
-                    file_strings[filePath] = []
-                    file_strings[filePath].append(string)
-
-                # INVERSE RULE GENERATION -------------------------------------
-                if args.inverse:
-                    for fileName in string_stats[string]["files_basename"]:
-                        string_occurrance_count = string_stats[string]["files_basename"][fileName]
-                        total_count_basename = file_info[fileName]["count"]
-                        # print "string_occurance_count %s - total_count_basename %s" % ( string_occurance_count,
-                        # total_count_basename )
-                        if string_occurrance_count == total_count_basename:
-                            if fileName not in inverse_stats:
-                                inverse_stats[fileName] = []
-                            if args.trace:
-                                print("Appending %s to %s" % (string, fileName))
-                            inverse_stats[fileName].append(string)
-
-        # SUPER RULE GENERATION -----------------------------------------------
-        if not nosuper and not args.inverse:
-
-            # SUPER RULES GENERATOR	- preliminary work
-            # If a string occurs more than once in different files
-            # print sample_string_stats[string]["count"]
-            if string_stats[string]["count"] > 1:
-                if args.debug:
-                    print("OVERLAP Count: %s\nString: \"%s\"%s" % (string_stats[string]["count"], string,
-                                                                   "\nFILE: ".join(string_stats[string]["files"])))
-                # Create a combination string from the file set that matches to that string
-                combi = ":".join(sorted(string_stats[string]["files"]))
-                # print "STRING: " + string
-                if args.debug:
-                    print("COMBI: " + combi)
-                # If combination not yet known
-                if combi not in combinations:
-                    combinations[combi] = {}
-                    combinations[combi]["count"] = 1
-                    combinations[combi]["strings"] = []
-                    combinations[combi]["strings"].append(string)
-                    combinations[combi]["files"] = string_stats[string]["files"]
-                else:
-                    combinations[combi]["count"] += 1
-                    combinations[combi]["strings"].append(string)
-                # Set the maximum combination count
-                if combinations[combi]["count"] > max_combi_count:
-                    max_combi_count = combinations[combi]["count"]
-                    # print "Max Combi Count set to: %s" % max_combi_count
-
-    print("[+] Generating Super Rules ... (a lot of magic)")
-    for combi_count in range(max_combi_count, 1, -1):
-        for combi in combinations:
-            if combi_count == combinations[combi]["count"]:
-                # print "Count %s - Combi %s" % ( str(combinations[combi]["count"]), combi )
-                # Filter the string set
-                # print "BEFORE"
-                # print len(combinations[combi]["strings"])
-                # print combinations[combi]["strings"]
-                string_set = combinations[combi]["strings"]
-                combinations[combi]["strings"] = []
-                combinations[combi]["strings"] = filter_string_set(string_set)
-                # print combinations[combi]["strings"]
-                # print "AFTER"
-                # print len(combinations[combi]["strings"])
-                # Combi String count after filtering
-                # print "String count after filtering: %s" % str(len(combinations[combi]["strings"]))
-
-                # If the string set of the combination has a required size
-                if len(combinations[combi]["strings"]) >= int(args.w):
-                    # Remove the files in the combi rule from the simple set
-                    if args.nosimple:
-                        for file in combinations[combi]["files"]:
-                            if file in file_strings:
-                                del file_strings[file]
-                    # Add it as a super rule
-                    print("[-] Adding Super Rule with %s strings." % str(len(combinations[combi]["strings"])))
-                    # if args.debug:
-                    # print "Rule Combi: %s" % combi
-                    super_rules.append(combinations[combi])
-
-    # Return all data
-    return (file_strings, file_opcodes, combinations, super_rules, inverse_stats)
-
-
-def filter_opcode_set(opcode_set: list[str]) -> list[str]:
-    # Preferred Opcodes
-    pref_opcodes = [' 34 ', 'ff ff ff ']
-
-    # Useful set
-    useful_set = []
-    pref_set = []
-
-    for opcode in opcode_set:
-        opcode: str
-        # Exclude all opcodes found in goodware
-        if opcode in good_opcodes_db:
-            if args.debug:
-                print("skipping %s" % opcode)
-            continue
-
-        # Format the opcode
-        formatted_opcode = get_opcode_string(opcode)
-
-        # Preferred opcodes
-        set_in_pref = False
-        for pref in pref_opcodes:
-            if pref in formatted_opcode:
-                pref_set.append(formatted_opcode)
-                set_in_pref = True
-        if set_in_pref:
-            continue
-
-        # Else add to useful set
-        useful_set.append(get_opcode_string(opcode))
-
-    # Preferred opcodes first
-    useful_set = pref_set + useful_set
-
-    # Only return the number of opcodes defined with the "-n" parameter
-    return useful_set[:int(args.n)]
-
-def generate_general_condition(file_info):
-    """
-    Generates a general condition for a set of files
-    :param file_info:
-    :return:
-    """
-    conditions_string = ""
-    conditions = []
-    pe_module_neccessary = False
-
-    # Different Magic Headers and File Sizes
-    magic_headers = []
-    file_sizes = []
-    imphashes = []
-
-    try:
-        for filePath in file_info:
-            # Short file name info used for inverse generation has no magic/size fields
-            if "magic" not in file_info[filePath]:
-                continue
-            magic = file_info[filePath]["magic"]
-            size = file_info[filePath]["size"]
-            imphash = file_info[filePath]["imphash"]
-
-            # Add them to the lists
-            if magic not in magic_headers and magic != "":
-                magic_headers.append(magic)
-            if size not in file_sizes:
-                file_sizes.append(size)
-            if imphash not in imphashes and imphash != "":
-                imphashes.append(imphash)
-
-        # If different magic headers are less than 5
-        if len(magic_headers) <= 5:
-            magic_string = " or ".join(get_uint_string(h) for h in magic_headers)
-            if " or " in magic_string:
-                conditions.append("( {0} )".format(magic_string))
-            else:
-                conditions.append("{0}".format(magic_string))
-
-        # Biggest size multiplied with maxsize_multiplier
-        if not args.nofilesize and len(file_sizes) > 0:
-            conditions.append(get_file_range(max(file_sizes)))
-
-        # If different magic headers are less than 5
-        if len(imphashes) == 1:
-            conditions.append("pe.imphash() == \"{0}\"".format(imphashes[0]))
-            pe_module_neccessary = True
-
-        # If enough attributes were special
-        condition_string = " and ".join(conditions)
-
-    except Exception as e:
-        if args.debug:
-            traceback.print_exc()
-            exit(1)
-        print("[E] ERROR while generating general condition - check the global rule and remove it if it's faulty")
-
-    return condition_string, pe_module_neccessary
-
-def get_strings(string_elements):
-    """
-    Get a dictionary of all string types
-    :param string_elements:
-    :return:
-    """
-    strings = {
-        "ascii": [],
-        "wide": [],
-        "base64 encoded": [],
-        "hex encoded": [],
-        "reversed": []
-    }
-
-    # Adding the strings --------------------------------------
-    for i, string in enumerate(string_elements):
-
-        if string[:8] == "UTF16LE:":
-            string = string[8:]
-            strings["wide"].append(string)
-        elif string in base64strings:
-            strings["base64 encoded"].append(string)
-        elif string in hexEncStrings:
-            strings["hex encoded"].append(string)
-        elif string in reversedStrings:
-            strings["reversed"].append(string)
-        else:
-            strings["ascii"].append(string)
-
     return strings
 
-def initialize_pestudio_strings():
-    pestudio_strings = {}
 
-    tree = etree.parse(get_abs_path(PE_STRINGS_FILE))
-
-    pestudio_strings["strings"] = tree.findall(".//string")
-    pestudio_strings["av"] = tree.findall(".//av")
-    pestudio_strings["folder"] = tree.findall(".//folder")
-    pestudio_strings["os"] = tree.findall(".//os")
-    pestudio_strings["reg"] = tree.findall(".//reg")
-    pestudio_strings["guid"] = tree.findall(".//guid")
-    pestudio_strings["ssdl"] = tree.findall(".//ssdl")
-    pestudio_strings["ext"] = tree.findall(".//ext")
-    pestudio_strings["agent"] = tree.findall(".//agent")
-    pestudio_strings["oid"] = tree.findall(".//oid")
-    pestudio_strings["priv"] = tree.findall(".//priv")
-
-    # Obsolete
-    # for elem in string_elems:
-    #    strings.append(elem.text)
-
-    return pestudio_strings
-
-
-def get_pestudio_score(string):
-    for type in pestudio_strings:
-        for elem in pestudio_strings[type]:
-            # Full match
-            if elem.text.lower() == string.lower():
-                # Exclude the "extension" black list for now
-                if type != "ext":
-                    return 5, type
-    return 0, ""
-
-
-def get_opcode_string(opcode):
-    return ' '.join(opcode[i:i + 2] for i in range(0, len(opcode), 2))
-
-
-def get_uint_string(magic):
-    if len(magic) == 2:
-        return "uint8(0) == 0x{0}{1}".format(magic[0], magic[1])
-    if len(magic) == 4:
-        return "uint16(0) == 0x{2}{3}{0}{1}".format(magic[0], magic[1], magic[2], magic[3])
-    return ""
-
-
-def get_file_range(size):
-    size_string = ""
-    try:
-        # max sample size - args.fm times the original size
-        max_size_b = size * args.fm
-        # Minimum size
-        if max_size_b < 1024:
-            max_size_b = 1024
-        # in KB
-        max_size = int(max_size_b / 1024)
-        max_size_kb = max_size
-        # Round
-        if len(str(max_size)) == 2:
-            max_size = int(round(max_size, -1))
-        elif len(str(max_size)) == 3:
-            max_size = int(round(max_size, -2))
-        elif len(str(max_size)) == 4:
-            max_size = int(round(max_size, -3))
-        elif len(str(max_size)) >= 5:
-            max_size = int(round(max_size, -3))
-        size_string = "filesize < {0}KB".format(max_size)
-        if args.debug:
-            print("File Size Eval: SampleSize (b): {0} SizeWithMultiplier (b/Kb): {1} / {2} RoundedSize: {3}".format(
-                str(size), str(max_size_b), str(max_size_kb), str(max_size)))
-    except Exception as e:
-        traceback.print_exc()
-    finally:
-        return size_string
-
-
-def get_timestamp_basic(date_obj=None):
-    if not date_obj:
-        date_obj = datetime.datetime.now()
-    date_str = date_obj.strftime("%Y-%m-%d")
-    return date_str
-
-
-def is_ascii_char(b, padding_allowed=False):
+def is_ascii_char(b: bytes, padding_allowed: bool = False) -> int:
     if padding_allowed:
         if (ord(b) < 127 and ord(b) > 31) or ord(b) == 0:
             return 1
@@ -766,7 +188,7 @@ def is_ascii_char(b, padding_allowed=False):
     return 0
 
 
-def is_ascii_string(string, padding_allowed=False):
+def is_ascii_string(string: bytes, padding_allowed: bool = False) -> int:
     for b in [i.to_bytes(1, sys.byteorder) for i in string]:
         if padding_allowed:
             if not ((ord(b) < 127 and ord(b) > 31) or ord(b) == 0):
@@ -777,221 +199,400 @@ def is_ascii_string(string, padding_allowed=False):
     return 1
 
 
-def is_base_64(s):
-    return (len(s) % 4 == 0) and re.match('^[A-Za-z0-9+/]+[=]{0,2}$', s)
+def is_base_64(s: str) -> bool:
+    return (len(s) % 4 == 0) and re.match(r"^[A-Za-z0-9+/]+[=]{0,2}$", s) is not None
 
 
-def is_hex_encoded(s, check_length=True):
-    if re.match('^[A-Fa-f0-9]+$', s):
+def is_hex_encoded(s: str, check_length: bool = True) -> bool:
+    if re.match(r"^[A-Fa-f0-9]+$", s):
         if check_length:
-            if len(s) % 2 == 0:
-                return True
-        else:
-            return True
+            return len(s) % 2 == 0
+        return True
     return False
 
 
-# TODO: Still buggy after port to Python3
-def extract_hex_strings(s):
-    strings = []
-    hex_strings = re.findall(b"([a-fA-F0-9]{10,})", s)
-    for string in list(hex_strings):
-        hex_strings += string.split(b'0000')
-        hex_strings += string.split(b'0d0a')
-        hex_strings += re.findall(b'((?:0000|002[a-f0-9]|00[3-9a-f][0-9a-f]){6,})', string, re.IGNORECASE)
-    hex_strings = list(set(hex_strings))
-    # ASCII Encoded Strings
-    for string in hex_strings:
-        for x in string.split(b'00'):
-            if len(x) > 10:
-                strings.append(x)
-    # WIDE Encoded Strings
-    for string in hex_strings:
-        try:
-            if len(string) % 2 != 0 or len(string) < 8:
-                continue
-            # Skip
-            if b'0000' in string:
-                continue
-            dec = string.replace(b'00', b'')
-            if is_ascii_string(dec, padding_allowed=False):
-                strings.append(string)
-        except Exception as e:
-            traceback.print_exc()
-    return strings
-
-
-def removeNonAsciiDrop(string):
-    nonascii = "error"
+def extract_strings(file_data: bytes) -> list:
+    cleaned_strings = []
     try:
-        byte_list = [i.to_bytes(1, sys.byteorder) for i in string]
-        # Generate a new string without disturbing characters
-        nonascii = b"".join(i for i in byte_list if ord(i)<127 and ord(i)>31)
-    except Exception as e:
-        traceback.print_exc()
+        strings_full = re.findall(b"[\x1f-\x7e]{6,}", file_data)
+        s_limit = 200
+        strings_limited = re.findall(b"[\x1f-\x7e]{6,%d}" % s_limit, file_data)
+        strings_hex = extract_hex_strings(file_data)
+        strings_all = list(set(strings_full) | set(strings_limited) | set(strings_hex))
+        wide_strings = [
+            ws for ws in re.findall(b"(?:[\x1f-\x7e][\x00]){6,}", file_data)
+        ]
+
+        for ws in wide_strings:
+            try:
+                wide_string = ("UTF16LE:%s" % ws.decode("utf-16")).encode("utf-8")
+            except Exception:
+                wide_string = (
+                    "UTF16LE:%s" % ws.decode("utf-16", errors="ignore")
+                ).encode("utf-8")
+            if wide_string not in strings_all:
+                strings_all.append(wide_string)
+
+        for string in strings_all:
+            if len(string) > 0:
+                string = string.replace(b"\\", b"\\\\")
+                string = string.replace(b'"', b'\\"')
+            try:
+                if isinstance(string, str):
+                    cleaned_strings.append(string)
+                else:
+                    cleaned_strings.append(string.decode("utf-8", errors="ignore"))
+            except AttributeError:
+                logging.debug("Attribute error decoding string", exc_info=True)
+    except Exception:
+        logging.debug("Error extracting strings", exc_info=True)
+    return cleaned_strings
+
+
+def extract_opcodes(file_data: bytes) -> list:
+    opcodes = []
+    try:
+        binary = lief.parse(file_data)
+        ep = binary.entrypoint
+        text = None
+        if isinstance(binary, lief.PE.Binary):
+            for sec in binary.sections:
+                try:
+                    if (
+                        sec.virtual_address + binary.imagebase
+                        <= ep
+                        < sec.virtual_address + binary.imagebase + sec.virtual_size
+                    ):
+                        content = sec.content
+                        if isinstance(content, (bytes, bytearray)):
+                            text = bytes(content)
+                        else:
+                            text = bytes(content)
+                        break
+                except Exception:
+                    continue
+        elif isinstance(binary, lief.ELF.Binary):
+            for sec in binary.sections:
+                try:
+                    if sec.virtual_address <= ep < sec.virtual_address + sec.size:
+                        content = sec.content
+                        if isinstance(content, (bytes, bytearray)):
+                            text = bytes(content)
+                        else:
+                            text = bytes(content)
+                        break
+                except Exception:
+                    continue
+
+        if text is not None:
+            text_parts = re.split(b"[\x00]{3,}", text)
+            for text_part in text_parts:
+                if text_part == b"" or len(text_part) < 8:
+                    continue
+                opcodes.append(
+                    binascii.hexlify(text_part[:16]).decode(encoding="ascii")
+                )
+    except Exception:
+        logging.debug("Opcode extraction failed", exc_info=True)
+    return opcodes
+
+
+def get_pe_info(file_data: bytes) -> tuple:
+    imphash = ""
+    exports: list = []
+    try:
+        if not file_data or file_data[:2] != b"MZ":
+            return imphash, exports
+    except Exception:
+        return imphash, exports
+
+    binary = None
+    try:
+        binary = lief.parse(file_data)
+    except Exception:
+        try:
+            binary = lief.parse(list(file_data))
+        except Exception:
+            binary = None
+
+    if binary is None:
+        return imphash, exports
+
+    try:
+        try:
+            imphash = lief.PE.get_imphash(binary, lief.PE.IMPHASH_MODE.PEFILE)
+        except Exception:
+            try:
+                imphash = binary.imphash
+            except Exception:
+                imphash = ""
+        if imphash is None:
+            imphash = ""
+    except Exception:
+        imphash = ""
+
+    try:
+        expobj = None
+        try:
+            expobj = binary.get_export()
+        except Exception:
+            expobj = None
+
+        if expobj:
+            for entry in getattr(expobj, "entries", []) or []:
+                try:
+                    name = entry.name
+                    if name is None:
+                        continue
+                    if isinstance(name, (bytes, bytearray)):
+                        exports.append(name.decode("utf-8", errors="ignore"))
+                    else:
+                        exports.append(str(name))
+                except Exception:
+                    continue
+    except Exception:
         pass
-    return nonascii
+
+    return imphash, exports
 
 
-def save(object, filename):
-    file = gzip.GzipFile(filename, 'wb')
-    file.write(bytes(json.dumps(object), 'utf-8'))
-    file.close()
-
-
-def load(filename):
-    file = gzip.GzipFile(filename, 'rb')
-    object = json.loads(file.read())
-    file.close()
-    return object
-
-
-def update_databases():
-    # Preparations
+def calculate_entropy(path: str) -> float:
+    freq = [0] * 256
+    total = 0
     try:
-        dbDir = './dbs/'
-        if not os.path.exists(dbDir):
-            os.makedirs(dbDir)
-    except Exception as e:
-        if args.debug:
-            traceback.print_exc()
-        print("Error while creating the database directory ./dbs")
-        sys.exit(1)
+        with open(path, "rb") as fh:
+            while True:
+                chunk = fh.read(65536)
+                if not chunk:
+                    break
+                total += len(chunk)
+                for b in chunk:
+                    freq[b] += 1
+        entropy = 0.0
+        if total > 0:
+            for f in freq:
+                if f > 0:
+                    p = f / total
+                    entropy -= p * math.log2(p)
+        return entropy
+    except Exception:
+        logging.debug("Entropy calc failed for %s", path, exc_info=True)
+        return 0.0
 
-    # Downloading current repository
-    try:
-        for filename, repo_url in REPO_URLS.items():
-            print("Downloading %s from %s ..." % (filename, repo_url))
-            with urllib.request.urlopen(repo_url) as response, open("./dbs/%s" % filename, 'wb') as out_file:
-                shutil.copyfileobj(response, out_file)
-    except Exception as e:
-        if args.debug:
-            traceback.print_exc()
-        print("Error while downloading the database file - check your Internet connection "
-              "(try to run it with --debug to see the full error message)")
-        sys.exit(1)
 
-def emptyFolder(dir):
+def load_good_dbs(dbs_dir: str = "./dbs"):
+    """Load good-* DBs from a directory into memory sets.
+
+    - Expects newline-separated plaintext files in ./dbs/.
+    - For opcodes, normalizes by removing whitespace and lowercasing.
+    - For imphashes, adds to KNOWN_IMPHASHES dict as key -> filename (or empty).
     """
-    Removes all files from a given folder
-    :return:
-    """
-    for file in os.listdir(dir):
-        filePath = os.path.join(dir, file)
+    global good_opcodes_db, base64strings, hexEncStrings, reversedStrings, KNOWN_IMPHASHES
+    good_opcodes_db = set()
+    base64strings = set()
+    hexEncStrings = set()
+    reversedStrings = set()
+
+    if not os.path.isdir(dbs_dir):
+        logging.info("DBs directory not found: %s", dbs_dir)
+        return
+
+    for path in glob.glob(os.path.join(dbs_dir, "*")):
+        bn = os.path.basename(path).lower()
         try:
-            if os.path.isfile(filePath):
-                print("[!] Removing %s ..." % filePath)
-                os.unlink(filePath)
-        except Exception as e:
-            print(e)
+            with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+                lines = [ln.strip() for ln in fh if ln.strip()]
+        except Exception:
+            logging.exception("Failed reading DB file %s", path)
+            continue
 
+        if "opcodes" in bn:
+            for ln in lines:
+                good_opcodes_db.add(ln.replace(" ", "").lower())
+        elif "strings" in bn:
+            for ln in lines:
+                if is_base_64(ln):
+                    base64strings.add(ln)
+                elif is_hex_encoded(ln, check_length=False):
+                    hexEncStrings.add(ln.lower())
+                else:
+                    reversedStrings.add(ln)
+        elif "imphash" in bn or "imphashes" in bn:
+            for ln in lines:
+                # KNOWN_IMPHASHES is a dict; make ln.lower() the key and store filename as value
+                KNOWN_IMPHASHES[ln.lower()] = bn
 
-def getReference(ref):
+    logging.info(
+        "Loaded good DBs: opcodes=%d base64=%d hexEnc=%d reversed=%d imphashes=%d",
+        len(good_opcodes_db),
+        len(base64strings),
+        len(hexEncStrings),
+        len(reversedStrings),
+        len(KNOWN_IMPHASHES),
+    )
+
+def is_likely_word(s: str) -> bool:
+    """Return True if string is at least 3 chars and exists in NLTK words."""
+    return len(s) >= 3 and s.lower() in nltk_words
+
+def check_against_good_dbs_percentage(path: str) -> float:
     """
-    Get a reference string - if the provided string is the path to a text file, then read the contents and return it as
-    reference
-    :param ref:
-    :return:
-    """
-    if os.path.exists(ref):
-        reference = getFileContent(ref)
-        print("[+] Read reference from file %s > %s" % (ref, reference))
-        return reference
-    else:
-        return ref
-
-
-def getIdentifier(id, path):
-    """
-    Get a identifier string - if the provided string is the path to a text file, then read the contents and return it as
-    reference, otherwise use the last element of the full path
-    :param ref:
-    :return:
-    """
-    # Identifier
-    if id == "not set" or not os.path.exists(id):
-        # Identifier is the highest folder name
-        return os.path.basename(path.rstrip('/'))
-    else:
-        # Read identifier from file
-        identifier = getFileContent(id)
-        print("[+] Read identifier from file %s > %s" % (id, identifier))
-        return identifier
-
-
-def getPrefix(prefix, identifier):
-    """
-    Get a prefix string for the rule description based on the identifier
-    :param prefix:
-    :param identifier:
-    :return:
-    """
-    if prefix == "Auto-generated rule":
-        return identifier
-    else:
-        return prefix
-
-
-def getFileContent(file):
-    """
-    Gets the contents of a file (limited to 1024 characters)
-    :param file:
-    :return:
+    Returns the percentage (0-100) of known-good markers
+    that the file at `path` matches, using only strings
+    that are likely words.
     """
     try:
-        with open(file) as f:
-            return f.read(1024)
-    except Exception as e:
-        return "not found"
+        with open(path, "rb") as fh:
+            file_data = fh.read()
+    except Exception:
+        logging.debug("Failed to open for good-db check: %s", path, exc_info=True)
+        return 0.0
 
-# scanner_capstone_parallel.py
-# Parallelized version of scanner_capstone_only.py using ThreadPoolExecutor
+    total_markers = 0
+    matches = 0
 
-# -----------------------
-# Configuration & Constants
-# -----------------------
-SCAN_FOLDER = "D:\\datas2\\datamaliciousorder"                # folder to scan by default
-SUSPICIOUS_THRESHOLD = 11            # scoring threshold (adjust)
+    # --- IMPHASH ---
+    try:
+        imphash, _exports = get_pe_info(file_data)
+        if KNOWN_IMPHASHES:
+            total_markers += 1
+            if imphash and imphash.lower() in KNOWN_IMPHASHES:
+                matches += 1
+    except Exception:
+        logging.debug("imphash check failed for %s", path, exc_info=True)
 
-# -----------------------
-# Logging
-# -----------------------
-logging.basicConfig(
-    filename="scanner.log",
-    filemode="a",
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+    # --- OPCODES ---
+    try:
+        if good_opcodes_db:
+            opcodes = extract_opcodes(file_data)
+            total_markers += len(good_opcodes_db)
+            for op in opcodes:
+                if op.replace(" ", "").lower() in good_opcodes_db:
+                    matches += 1
+    except Exception:
+        logging.debug("opcode check failed for %s", path, exc_info=True)
 
-class StringExtractor:
-    """A helper class to extract strings from a file."""
-    def __init__(self, file_path):
-        self.file_path = file_path
-        self.suspicious_keywords = [b'shell', b'invoke', b'powershell', b'download', b'execute', b'payload']
+    # --- STRINGS ---
+    try:
+        string_dbs = []
+        if base64strings:
+            string_dbs.append(base64strings)
+        if hexEncStrings:
+            string_dbs.append(hexEncStrings)
+        if reversedStrings:
+            string_dbs.append(reversedStrings)
 
-    def extract(self):
-        """Extracts all strings from the file."""
-        try:
-            with open(self.file_path, 'rb') as f:
-                file_data = f.read()
-            return extract_strings(file_data)
-        except IOError as e:
-            print(f"Error reading file {self.file_path}: {e}")
-            return []
+        if string_dbs:
+            strings = extract_strings(file_data)
+            # Only keep strings that are likely words
+            strings = [s for s in strings if is_likely_word(s)]
+            
+            for db in string_dbs:
+                total_markers += len(db)
+                for s in strings:
+                    s_l = s.lower()
+                    if s in db or s_l in db:
+                        matches += 1
+    except Exception:
+        logging.debug("string DB check failed for %s", path, exc_info=True)
 
-    def is_suspicious(self, s):
-        """A simple check to see if a string is suspicious."""
-        s_lower = s.lower().encode('utf-8', 'ignore')
-        for keyword in self.suspicious_keywords:
-            if keyword in s_lower:
-                return True
-        return False
+    if total_markers == 0:
+        return 0.0
 
-# -----------------------
-# WinVerifyTrust / Authenticode constants
-# -----------------------
-crypt32 = ctypes.windll.crypt32
+    return (matches / total_markers) * 100
 
+def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
+    analysis = {
+        "overall_analysis": {
+            "total_instructions": 0,
+            "add_count": 0,
+            "mov_count": 0,
+            "is_likely_packed": None,
+        },
+        "sections": {},
+        "error": None,
+    }
+
+    try:
+        if not capstone_module:
+            analysis["error"] = "capstone module not available"
+            return analysis
+
+        if pe.FILE_HEADER.Machine == 0x014C:
+            md = capstone_module.Cs(
+                capstone_module.CS_ARCH_X86, capstone_module.CS_MODE_32
+            )
+        elif pe.FILE_HEADER.Machine == 0x8664:
+            md = capstone_module.Cs(
+                capstone_module.CS_ARCH_X86, capstone_module.CS_MODE_64
+            )
+        else:
+            analysis["error"] = "Unsupported architecture."
+            return analysis
+
+        total_add_count = 0
+        total_mov_count = 0
+        grand_total_instructions = 0
+
+        for section in pe.sections:
+            try:
+                section_name = section.Name.decode(errors="ignore").strip("\x00")
+            except Exception:
+                section_name = str(section.Name)
+            code = section.get_data()
+            base_address = pe.OPTIONAL_HEADER.ImageBase + section.VirtualAddress
+
+            instruction_counts = {}
+            total_instructions_in_section = 0
+
+            if not code:
+                analysis["sections"][section_name] = {
+                    "instruction_counts": {},
+                    "total_instructions": 0,
+                    "add_count": 0,
+                    "mov_count": 0,
+                    "is_likely_packed": False,
+                }
+                continue
+
+            instructions = md.disasm(code, base_address)
+            for i in instructions:
+                mnemonic = i.mnemonic
+                instruction_counts[mnemonic] = instruction_counts.get(mnemonic, 0) + 1
+                total_instructions_in_section += 1
+
+            add_count = instruction_counts.get("add", 0)
+            mov_count = instruction_counts.get("mov", 0)
+
+            total_add_count += add_count
+            total_mov_count += mov_count
+            grand_total_instructions += total_instructions_in_section
+
+            analysis["sections"][section_name] = {
+                "instruction_counts": instruction_counts,
+                "total_instructions": total_instructions_in_section,
+                "add_count": add_count,
+                "mov_count": mov_count,
+                "is_likely_packed": (
+                    add_count > mov_count if total_instructions_in_section > 0 else False
+                ),
+            }
+
+        analysis["overall_analysis"]["total_instructions"] = grand_total_instructions
+        analysis["overall_analysis"]["add_count"] = total_add_count
+        analysis["overall_analysis"]["mov_count"] = total_mov_count
+        analysis["overall_analysis"]["is_likely_packed"] = (
+            total_add_count > total_mov_count if grand_total_instructions > 0 else False
+        )
+
+    except Exception as exc:
+        logging.error("Capstone disassembly failed: %s", exc)
+        analysis["error"] = str(exc)
+
+    return analysis
+
+
+# WinVerifyTrust / Authenticode constants, types and setup
 class CERT_CONTEXT(ctypes.Structure):
     _fields_ = [
         ("dwCertEncodingType", wintypes.DWORD),
@@ -1001,7 +602,9 @@ class CERT_CONTEXT(ctypes.Structure):
         ("hCertStore", ctypes.c_void_p),
     ]
 
+
 PCCERT_CONTEXT = ctypes.POINTER(CERT_CONTEXT)
+
 
 class WinVerifyTrust_GUID(ctypes.Structure):
     _fields_ = [
@@ -1011,9 +614,12 @@ class WinVerifyTrust_GUID(ctypes.Structure):
         ("Data4", ctypes.c_ubyte * 8),
     ]
 
+
 WINTRUST_ACTION_GENERIC_VERIFY_V2 = WinVerifyTrust_GUID(
-    0x00AAC56B, 0xCD44, 0x11D0,
-    (ctypes.c_ubyte * 8)(0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE)
+    0x00AAC56B,
+    0xCD44,
+    0x11D0,
+    (ctypes.c_ubyte * 8)(0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE),
 )
 
 class WINTRUST_FILE_INFO(ctypes.Structure):
@@ -1023,6 +629,13 @@ class WINTRUST_FILE_INFO(ctypes.Structure):
         ("hFile", wintypes.HANDLE),
         ("pgKnownSubject", ctypes.POINTER(WinVerifyTrust_GUID)),
     ]
+
+# Windows type aliases for use in structures
+WORD   = ctypes.c_ushort     # 16-bit
+DWORD  = ctypes.c_uint32     # 32-bit unsigned
+BOOL   = ctypes.c_int        # 32-bit signed (BOOL in WinAPI)
+HANDLE = ctypes.c_void_p     # pointer-sized handle
+LPVOID = ctypes.c_void_p
 
 class WINTRUST_DATA(ctypes.Structure):
     _fields_ = [
@@ -1041,162 +654,26 @@ class WINTRUST_DATA(ctypes.Structure):
         ("pSignatureSettings", ctypes.c_void_p),
     ]
 
+# UI and revocation options
 WTD_UI_NONE = 2
 WTD_REVOKE_NONE = 0
 WTD_CHOICE_FILE = 1
 WTD_STATEACTION_IGNORE = 0x00000000
 
+# Load WinTrust DLL
 _wintrust = ctypes.windll.wintrust
 
 TRUST_E_NOSIGNATURE = 0x800B0100
 TRUST_E_SUBJECT_FORM_UNKNOWN = 0x800B0008
-TRUST_E_PROVIDER_UNKNOWN     = 0x800B0001
-CERT_E_UNTRUSTEDROOT         = 0x800B0109
+TRUST_E_PROVIDER_UNKNOWN = 0x800B0001
+CERT_E_UNTRUSTEDROOT = 0x800B0109
 NO_SIGNATURE_CODES = {TRUST_E_NOSIGNATURE, TRUST_E_SUBJECT_FORM_UNKNOWN, TRUST_E_PROVIDER_UNKNOWN}
 
-# -----------------------
-# Directories & lookup names
-# -----------------------
-STARTUP_DIRS = [
-    os.path.join(os.environ.get('APPDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup'),
-    os.path.join(os.environ.get('PROGRAMDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
-]
-
-# -----------------------
-# Helper functions for lookups
-# -----------------------
-def read_lines_set(path: str) -> Set[str]:
-    s = set()
-    try:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                line = line.strip('"').strip("'").lower()
-                s.add(line)
-    except Exception as e:
-        logging.error(f"Failed reading lookup file {path}: {e}")
-    return s
-
-# -----------------------
-# Utility: entropy calculation
-# -----------------------
-def calculate_entropy(path: str) -> float:
-    """Calculate Shannon entropy of file."""
-    freq = [0] * 256
-    total = 0
-    try:
-        with open(path, 'rb') as fh:
-            while True:
-                chunk = fh.read(65536)
-                if not chunk:
-                    break
-                total += len(chunk)
-                for b in chunk:
-                    freq[b] += 1
-        entropy = 0.0
-        if total > 0:
-            for f in freq:
-                if f > 0:
-                    p = f / total
-                    entropy -= p * math.log2(p)
-        return entropy
-    except Exception as e:
-        logging.error(f"Failed calculating entropy for {path}: {e}")
-        return 0.0
-
-# -----------------------
-# Capstone-only analysis
-# -----------------------
-def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
-    analysis = {
-        'overall_analysis': {
-            'total_instructions': 0,
-            'add_count': 0,
-            'mov_count': 0,
-            'is_likely_packed': None
-        },
-        'sections': {},
-        'error': None
-    }
-
-    try:
-        # Determine architecture for Capstone
-        # 0x014c is IMAGE_FILE_MACHINE_I386 (32-bit)
-        # 0x8664 is IMAGE_FILE_MACHINE_AMD64 (64-bit)
-        if pe.FILE_HEADER.Machine == 0x014c:
-            md = capstone_module.Cs(capstone_module.CS_ARCH_X86, capstone_module.CS_MODE_32)
-        elif pe.FILE_HEADER.Machine == 0x8664:
-            md = capstone_module.Cs(capstone_module.CS_ARCH_X86, capstone_module.CS_MODE_64)
-        else:
-            analysis['error'] = "Unsupported architecture."
-            return analysis
-
-        total_add_count = 0
-        total_mov_count = 0
-        grand_total_instructions = 0
-
-        # Disassemble each section individually
-        for section in pe.sections:
-            section_name = section.Name.decode(errors='ignore').strip('\x00')
-            code = section.get_data()
-            base_address = pe.OPTIONAL_HEADER.ImageBase + section.VirtualAddress
-
-            instruction_counts = {}
-            total_instructions_in_section = 0
-
-            if not code:
-                analysis['sections'][section_name] = {
-                    'instruction_counts': {},
-                    'total_instructions': 0,
-                    'add_count': 0,
-                    'mov_count': 0,
-                    'is_likely_packed': False
-                }
-                continue
-
-            instructions = md.disasm(code, base_address)
-
-            for i in instructions:
-                mnemonic = i.mnemonic
-                instruction_counts[mnemonic] = instruction_counts.get(mnemonic, 0) + 1
-                total_instructions_in_section += 1
-
-            add_count = instruction_counts.get('add', 0)
-            mov_count = instruction_counts.get('mov', 0)
-
-            # Aggregate counts for overall file analysis
-            total_add_count += add_count
-            total_mov_count += mov_count
-            grand_total_instructions += total_instructions_in_section
-
-            # Per-section packing analysis
-            analysis['sections'][section_name] = {
-                'instruction_counts': instruction_counts,
-                'total_instructions': total_instructions_in_section,
-                'add_count': add_count,
-                'mov_count': mov_count,
-                'is_likely_packed': add_count > mov_count if total_instructions_in_section > 0 else False
-            }
-
-        # Populate the overall, file-wide analysis
-        analysis['overall_analysis']['total_instructions'] = grand_total_instructions
-        analysis['overall_analysis']['add_count'] = total_add_count
-        analysis['overall_analysis']['mov_count'] = total_mov_count
-        analysis['overall_analysis']['is_likely_packed'] = total_add_count > total_mov_count if grand_total_instructions > 0 else False
-
-    except Exception as e:
-        logging.error(f"Capstone disassembly failed: {e}")
-        analysis['error'] = str(e)
-
-    return analysis
-
-# -----------------------
-# Authenticode wrapper
-# -----------------------
 def _build_wtd_for(file_path: str) -> WINTRUST_DATA:
-    file_info = WINTRUST_FILE_INFO(ctypes.sizeof(WINTRUST_FILE_INFO), file_path, None, None)
+    """Internal helper to populate a WINTRUST_DATA for the given file."""
+    file_info = WINTRUST_FILE_INFO(
+        ctypes.sizeof(WINTRUST_FILE_INFO), file_path, None, None
+    )
     wtd = WINTRUST_DATA()
     ctypes.memset(ctypes.byref(wtd), 0, ctypes.sizeof(wtd))
     wtd.cbStruct = ctypes.sizeof(WINTRUST_DATA)
@@ -1210,12 +687,12 @@ def _build_wtd_for(file_path: str) -> WINTRUST_DATA:
 
 def verify_authenticode_signature(file_path: str) -> int:
     wtd = _build_wtd_for(file_path)
-    return _wintrust.WinVerifyTrust(None, ctypes.byref(WINTRUST_ACTION_GENERIC_VERIFY_V2), ctypes.byref(wtd))
+    return _wintrust.WinVerifyTrust(
+        None, ctypes.byref(WINTRUST_ACTION_GENERIC_VERIFY_V2), ctypes.byref(wtd)
+    )
+
 
 def check_valid_signature(file_path: str) -> dict:
-    """
-    Returns {"is_valid": bool, "status": str}.
-    """
     TRUST_E_BAD_DIGEST = 0x80096010
     TRUST_E_CERT_SIGNATURE = 0x80096004
 
@@ -1231,29 +708,27 @@ def check_valid_signature(file_path: str) -> dict:
             return {"is_valid": False, "status": "Untrusted root"}
         if hresult == TRUST_E_BAD_DIGEST:
             status = f"Fully invalid (bad digest / signature mismatch) (HRESULT=0x{hresult:08X})"
-            logging.warning(f"[Signature] {file_path}: {status}")
+            logging.warning("[Signature] %s: %s", file_path, status)
             return {"is_valid": False, "status": status}
         if hresult == TRUST_E_CERT_SIGNATURE:
             status = f"Fully invalid (certificate signature verification failed) (HRESULT=0x{hresult:08X})"
-            logging.warning(f"[Signature] {file_path}: {status}")
+            logging.warning("[Signature] %s: %s", file_path, status)
             return {"is_valid": False, "status": status}
-        
+
         status = f"Invalid signature (HRESULT=0x{hresult:08X})"
-        logging.warning(f"[Signature] {file_path}: {status}")
+        logging.warning("[Signature] %s: %s", file_path, status)
         return {"is_valid": False, "status": status}
 
     except Exception as ex:
-        logging.error(f"[Signature] check failed for {file_path}: {ex}")
+        logging.error("[Signature] check failed for %s: %s", file_path, ex)
         return {"is_valid": False, "status": str(ex)}
 
-# -----------------------
-# Runtime / location helpers
-# -----------------------
+
 def is_running_pe(path: str) -> bool:
     try:
-        for proc in psutil.process_iter(['exe', 'name']):
+        for proc in psutil.process_iter(["exe", "name"]):
             try:
-                exe = proc.info.get('exe')
+                exe = proc.info.get("exe")
                 if exe and os.path.normcase(exe) == os.path.normcase(path):
                     return True
             except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -1262,232 +737,516 @@ def is_running_pe(path: str) -> bool:
         pass
     return False
 
-# -----------------------
-# YARGEN ANALYSIS (run on-demand for suspicious files)
-# -----------------------
+
 def analyze_yargen_strings(path: str) -> Dict[str, Any]:
-    """Performs a yarGen string analysis on a single file."""
     analysis = {
-        'yargen_strings': [],
-        'yargen_suspicious_percentage': 0.0,
-        'total_strings': 0,
-        'status': 'Not Analyzed'
+        "yargen_strings": [],
+        "yargen_suspicious_percentage": 0.0,
+        "total_strings": 0,
+        "status": "Not Analyzed",
     }
     try:
-        # Uses the local StringExtractor class now
         extractor = StringExtractor(path)
         all_strings = extractor.extract()
         total_strings = len(all_strings)
-        analysis['total_strings'] = total_strings
-        
+        analysis["total_strings"] = total_strings
+
         if total_strings > 0:
             suspicious_strings = [s for s in all_strings if extractor.is_suspicious(s)]
-            analysis['yargen_strings'] = suspicious_strings[:50]
+            analysis["yargen_strings"] = suspicious_strings[:50]
             suspicious_percentage = (len(suspicious_strings) / total_strings) * 100
-            analysis['yargen_suspicious_percentage'] = suspicious_percentage
-            
-            if suspicious_percentage < 1 and total_strings > 100:
-                 analysis['status'] = 'Likely Clean (very low suspicious string ratio)'
-            elif suspicious_percentage > 30:
-                 analysis['status'] = 'Potentially Malicious (high ratio of suspicious strings)'
-            else:
-                 analysis['status'] = 'Unknown/Generic'
-        else:
-            analysis['status'] = 'No strings found'
+            analysis["yargen_suspicious_percentage"] = suspicious_percentage
 
-    except Exception as e:
-        logging.error(f"yarGen string extraction failed for {path}: {e}")
-        analysis['status'] = f"Error during string analysis: {e}"
+            if suspicious_percentage < 1 and total_strings > 100:
+                analysis["status"] = "Likely Clean (very low suspicious string ratio)"
+            elif suspicious_percentage > 30:
+                analysis["status"] = "Potentially Malicious (high ratio of suspicious strings)"
+            else:
+                analysis["status"] = "Unknown/Generic"
+        else:
+            analysis["status"] = "No strings found"
+    except Exception as exc:
+        logging.error("yarGen string extraction failed for %s: %s", path, exc)
+        analysis["status"] = f"Error during string analysis: {exc}"
     return analysis
 
-# -----------------------
-# Single file analysis (Initial Scan)
-# -----------------------
+
 def analyze_single_file(path: str) -> Dict[str, Any]:
-    """Analyze a single file with Capstone disassembly and basic checks (without yarGen)."""
+    """Analyze a single file with Capstone disassembly and basic checks."""
     features = {
-        'path': path,
-        'entropy': 0.0,
-        'size': 0,
-        'is_executable': False,
-        'has_version_info': False,
-        'signature_valid': False,
-        'signature_status': "N/A",
-        'capstone_analysis': None,
-        'is_running': False,
-        'age_days': 0,
-        'extension': '',
-        'suspicious_score': 0,
-        'suspicious': False
+        "path": path,
+        "entropy": 0.0,
+        "size": 0,
+        "is_executable": False,
+        "has_version_info": False,
+        "signature_valid": False,
+        "signature_status": "N/A",
+        "capstone_analysis": None,
+        "is_running": False,
+        "age_days": 0,
+        "extension": "",
+        "suspicious_score": 0,
+        "suspicious": False,
+        "known_good_percent": 0.0,  # <- updated field
     }
 
     try:
+        # Basic FS stats
         stats = os.stat(path)
-        features['size'] = stats.st_size
-        features['age_days'] = (time.time() - stats.st_ctime) / (24*3600)
-        features['entropy'] = calculate_entropy(path)
-        
+        features["size"] = stats.st_size
+        features["age_days"] = (time.time() - stats.st_ctime) / (24 * 3600)
+        features["entropy"] = calculate_entropy(path)
+
         filename_lc = os.path.basename(path).lower()
-        ext = os.path.splitext(filename_lc)[1].lstrip('.')
-        features['extension'] = ext
+        ext = os.path.splitext(filename_lc)[1].lstrip(".")
+        features["extension"] = ext
+
+        # Read file bytes for certain checks
+        file_bytes = b""
+        try:
+            with open(path, "rb") as fh:
+                file_bytes = fh.read()
+        except Exception:
+            logging.debug("Failed to read file bytes for %s", path, exc_info=True)
+
+        # Check known-good DBs as percentage
+        try:
+            features["known_good_percent"] = check_against_good_dbs_percentage(path)
+        except Exception:
+            logging.debug("known_good_percent check failed for %s", path, exc_info=True)
 
         pe_obj = None
         try:
-            pe_obj = pefile.PE(path)
-            features['is_executable'] = True
-            features['has_version_info'] = hasattr(pe_obj, 'VS_FIXEDFILEINFO') and pe_obj.VS_FIXEDFILEINFO is not None
-            features['capstone_analysis'] = analyze_with_capstone(pe_obj, capstone)
-        except pefile.PEFormatError:
-            features['is_executable'] = False
-        except Exception as e:
-            logging.debug(f"PE analysis failed for {path}: {e}")
+            if pefile:
+                pe_obj = pefile.PE(path)
+                features["is_executable"] = True
+                features["has_version_info"] = (
+                    hasattr(pe_obj, "VS_FIXEDFILEINFO") and pe_obj.VS_FIXEDFILEINFO is not None
+                )
+                features["capstone_analysis"] = analyze_with_capstone(pe_obj, capstone)
+        except Exception:
+            features["is_executable"] = features.get("is_executable", False)
+            logging.debug("PE analysis failed for %s", path, exc_info=True)
         finally:
             if pe_obj:
                 try:
                     pe_obj.close()
                 except Exception:
                     pass
-        
-        # yarGen analysis is now deferred until after a file is flagged as suspicious.
 
-        if features['is_executable']:
+        if features["is_executable"]:
             try:
                 sig = check_valid_signature(path)
-                features['signature_valid'] = sig.get('is_valid', False)
-                features['signature_status'] = sig.get('status', "N/A")
-            except Exception as e:
-                logging.debug(f"Signature check failed for {path}: {e}")
-            features['is_running'] = is_running_pe(path)
+                features["signature_valid"] = sig.get("is_valid", False)
+                features["signature_status"] = sig.get("status", "N/A")
+            except Exception:
+                logging.debug("Signature check failed for %s", path, exc_info=True)
+            features["is_running"] = is_running_pe(path)
 
+        # Score heuristics (conservative)
         score = 0
-        if features.get('capstone_analysis') and features['capstone_analysis'].get('overall_analysis', {}).get('is_likely_packed'):
+        if features.get("capstone_analysis") and features["capstone_analysis"].get(
+            "overall_analysis", {}
+        ).get("is_likely_packed"):
             score += 3
-        if features.get('entropy', 0) > 7.5:
-            score += 5 if not features.get('signature_valid') else 2
-        if features.get('age_days', 0) < 1:
+        if features.get("entropy", 0) > 7.5:
+            score += 5 if not features.get("signature_valid") else 2
+        if features.get("age_days", 0) < 1:
             score += 2
-        if 'temp' in path.lower() or 'cache' in path.lower():
+        if "temp" in path.lower() or "cache" in path.lower():
             score += 2
-        if features['is_executable'] and not features.get('has_version_info') and not features.get('signature_valid'):
+        if features["is_executable"] and not features.get("has_version_info") and not features.get(
+            "signature_valid"
+        ):
             score += 1
-        if features['is_executable'] and not features.get('signature_valid'):
-            score += 4 if features.get('signature_status') == "Untrusted root" else 2
-        if features.get('signature_valid'):
+        if features["is_executable"] and not features.get("signature_valid"):
+            score += 4 if features.get("signature_status") == "Untrusted root" else 2
+        if features.get("signature_valid"):
             score = max(score - 3, 0)
-        if features.get('is_running'):
+        if features.get("is_running"):
             score += 3
-        if ext == '':
+        if ext == "":
             score += 2
-        
-        # Scoring based on yarGen is removed from this initial analysis
-        features['suspicious_score'] = score
-        features['suspicious'] = score >= SUSPICIOUS_THRESHOLD
 
-    except Exception as e:
-        logging.error(f"Failed to analyze {path}: {e}")
-        features['error'] = str(e)
+        # Adjust score based on known-good percentage
+        # More matched markers → reduce suspiciousness
+        if features.get("known_good_percent", 0) > 0:
+            # Reduce score proportionally (up to 50% of score)
+            reduction = score * min(features["known_good_percent"] / 100, 0.5)
+            score = max(score - reduction, 0)
+
+        features["suspicious_score"] = score
+        features["suspicious"] = score >= SUSPICIOUS_THRESHOLD
+    except Exception as exc:
+        logging.error("Failed to analyze %s: %s", path, exc)
+        features["error"] = str(exc)
 
     return features
 
-# -----------------------
-# Directory scanning (sequential fallback)
-# -----------------------
-def scan_directory_sequential(folder):
-    print(f"Scanning directory (sequential): {folder}")
-    results = []
-    suspicious_count = 0
-    all_files = [os.path.join(root, f) for root, _, files in os.walk(folder) for f in files]
+def scan_directory_parallel(directory: str) -> List[Dict[str, Any]]:
+    """Scan a directory in parallel with tqdm progress and realtime logging."""
+    suspicious_results = []
+    files = []
+    for root, _, filenames in os.walk(directory):
+        for filename in filenames:
+            files.append(os.path.join(root, filename))
 
-    for path in tqdm(all_files, desc="Scanning sequentially", unit="file"):
+    total_files = len(files)
+    logging.info(
+        "Scanning directory (parallel with Threads): %s, total files=%d",
+        directory,
+        total_files,
+    )
+
+    # ThreadPoolExecutor without max_workers -> uses default thread count
+    with ThreadPoolExecutor() as executor:
+        futures = {executor.submit(analyze_single_file, f): f for f in files}
+        for future in tqdm(as_completed(futures),
+                           total=total_files,
+                           desc="Scanning",
+                           unit="file"):
+            try:
+                result = future.result()
+                # log results as they come in
+                if result.get("suspicious"):
+                    logging.warning(
+                        "Suspicious file detected: %s (score=%d)",
+                        result["path"],
+                        result.get("suspicious_score", -1),
+                    )
+                elif result.get("is_known_good"):
+                    logging.debug("Known good: %s", result["path"])
+
+                suspicious_results.append(result)
+            except Exception as e:
+                logging.error("Error during analysis: %s", e)
+
+    return suspicious_results
+
+class StringExtractor:
+    """A helper class to extract strings from a file."""
+
+    def __init__(self, file_path: str) -> None:
+        self.file_path = file_path
+        self.suspicious_keywords = [
+            b"shell",
+            b"invoke",
+            b"powershell",
+            b"download",
+            b"execute",
+            b"payload",
+        ]
+
+    def extract(self) -> list:
         try:
-            features = analyze_single_file(path)
-            results.append((path, features))
-            if features.get('suspicious', False):
-                suspicious_count += 1
-                logging.warning(f"SUSPICIOUS DETECTED: {path} (Score: {features.get('suspicious_score', 0)})")
-        except Exception as e:
-            logging.error(f"Failed to analyze {path}: {e}")
-            results.append((path, {'error': str(e), 'suspicious': False}))
-            
-    logging.info(f"Sequential scan complete: {len(all_files)} files scanned, {suspicious_count} suspicious")
-    return results
+            with open(self.file_path, "rb") as f:
+                file_data = f.read()
+            return extract_strings(file_data)
+        except IOError as exc:
+            logging.debug("Error reading file %s: %s", self.file_path, exc)
+            return []
 
-# -----------------------
-# Directory scanning (parallel)
-# -----------------------
-def scan_directory_parallel(folder, max_workers: Optional[int] = None):
-    """Scan directory and analyze files in parallel using ThreadPoolExecutor."""
-    print(f"Scanning directory (parallel with Threads): {folder}")
-    file_paths = [os.path.join(root, f) for root, _, files in os.walk(folder) for f in files]
-    total_files = len(file_paths)
-    if total_files == 0:
-        print("No files found to scan.")
-        return []
+    def is_suspicious(self, s) -> bool:
+        try:
+            s_lower = s.lower().encode("utf-8", "ignore")
+        except Exception:
+            s_lower = str(s).lower().encode("utf-8", "ignore")
+        for keyword in self.suspicious_keywords:
+            if keyword in s_lower:
+                return True
+        return False
 
-    results = []
-    suspicious_count = 0
-    worker = analyze_single_file
+
+def save(obj: Any, filename: str) -> None:
+    with gzip.GzipFile(filename, "wb") as file:
+        file.write(bytes(json.dumps(obj), "utf-8"))
+
+
+def load(filename: str) -> Any:
+    with gzip.GzipFile(filename, "rb") as file:
+        obj = json.loads(file.read())
+    return obj
+
+
+def update_databases():
+    try:
+        db_dir = "./dbs/"
+        if not os.path.exists(db_dir):
+            os.makedirs(db_dir)
+    except Exception:
+        logging.exception("Error creating db dir")
+        sys.exit(1)
 
     try:
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            results_iter = executor.map(worker, file_paths)
-            for idx, features in enumerate(tqdm(results_iter, total=total_files, desc="Processing files", unit="file")):
-                path = file_paths[idx]
-                results.append((path, features))
-                if features.get('suspicious', False):
-                    suspicious_count += 1
-                    logging.warning(f"SUSPICIOUS DETECTED: {path} (Score: {features.get('suspicious_score', 0)})")
-    except Exception as e:
-        logging.error(f"Parallel scan failed: {e}")
-        print("Parallel scan failed, falling back to sequential scan. See scanner.log for details.")
-        return scan_directory_sequential(folder)
+        for filename, repo_url in REPO_URLS.items():
+            logging.info("Downloading %s from %s ...", filename, repo_url)
+            with urllib.request.urlopen(repo_url) as response, open(
+                "./dbs/%s" % filename, "wb"
+            ) as out_file:
+                shutil.copyfileobj(response, out_file)
+    except Exception:
+        logging.exception("Error downloading database files")
+        sys.exit(1)
 
-    logging.info(f"Scan complete: {total_files} files scanned, {suspicious_count} suspicious")
-    return results
+
+def getReference(ref: str) -> str:
+    if os.path.exists(ref):
+        reference = getFileContent(ref)
+        logging.info("Read reference from file %s > %s", ref, reference)
+        return reference
+    return ref
+
+
+def getIdentifier(id_str: str, path: str) -> str:
+    if id_str == "not set" or not os.path.exists(id_str):
+        return os.path.basename(path.rstrip("/"))
+    identifier = getFileContent(id_str)
+    logging.info("Read identifier from file %s > %s", id_str, identifier)
+    return identifier
+
+
+def getPrefix(prefix: str, identifier: str) -> str:
+    if prefix == "Auto-generated rule":
+        return identifier
+    return prefix
+
+
+def getFileContent(file_path: str) -> str:
+    try:
+        with open(file_path) as f:
+            return f.read(1024)
+    except Exception:
+        return "not found"
+
+
+def emptyFolder(dir_path: str) -> None:
+    for file in os.listdir(dir_path):
+        file_path = os.path.join(dir_path, file)
+        try:
+            if os.path.isfile(file_path):
+                logging.info("Removing %s ...", file_path)
+                os.unlink(file_path)
+        except Exception as exc:
+            logging.error("Error removing %s: %s", file_path, exc)
+
+
+def generate_general_condition(file_info: dict):
+    conditions = []
+    pe_module_neccessary = False
+    try:
+        magic_headers = []
+        file_sizes = []
+        imphashes = []
+        for file_path in file_info:
+            if "magic" not in file_info[file_path]:
+                continue
+            magic = file_info[file_path]["magic"]
+            size = file_info[file_path]["size"]
+            imphash = file_info[file_path]["imphash"]
+
+            if magic not in magic_headers and magic != "":
+                magic_headers.append(magic)
+            if size not in file_sizes:
+                file_sizes.append(size)
+            if imphash not in imphashes and imphash != "":
+                imphashes.append(imphash)
+
+        if len(magic_headers) <= 5:
+            magic_string = " or ".join(get_uint_string(h) for h in magic_headers)
+            if " or " in magic_string:
+                conditions.append("( {0} )".format(magic_string))
+            else:
+                conditions.append("{0}".format(magic_string))
+
+        if len(file_sizes) > 0:
+            conditions.append(get_file_range(max(file_sizes)))
+
+        if len(imphashes) == 1:
+            conditions.append("pe.imphash() == \"{0}\"".format(imphashes[0]))
+            pe_module_neccessary = True
+
+        condition_string = " and ".join(conditions)
+    except Exception:
+        logging.exception("Error while generating general condition")
+        condition_string = ""
+    return condition_string, pe_module_neccessary
+
+
+def get_strings(string_elements):
+    strings = {
+        "ascii": [],
+        "wide": [],
+        "base64 encoded": [],
+        "hex encoded": [],
+        "reversed": [],
+    }
+    try:
+        _ = base64strings
+    except NameError:
+        base64strings = set()
+    try:
+        _ = hexEncStrings
+    except NameError:
+        hexEncStrings = set()
+    try:
+        _ = reversedStrings
+    except NameError:
+        reversedStrings = set()
+
+    for i, string in enumerate(string_elements):
+        try:
+            if isinstance(string, bytes):
+                string = string.decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+
+        if string[:8] == "UTF16LE:":
+            string = string[8:]
+            strings["wide"].append(string)
+        elif string in base64strings:
+            strings["base64 encoded"].append(string)
+        elif string in hexEncStrings:
+            strings["hex encoded"].append(string)
+        elif string in reversedStrings:
+            strings["reversed"].append(string)
+        else:
+            strings["ascii"].append(string)
+
+    return strings
+
+
+def filter_opcode_set(opcode_set):
+    pref_opcodes = [" 34 ", "ff ff ff "]
+    useful_set = []
+    pref_set = []
+
+    for opcode in opcode_set:
+        if opcode in good_opcodes_db:
+            logging.debug("Skipping good opcode: %s", opcode)
+            continue
+
+        formatted_opcode = get_opcode_string(opcode)
+
+        set_in_pref = False
+        for pref in pref_opcodes:
+            if pref in formatted_opcode:
+                pref_set.append(formatted_opcode)
+                set_in_pref = True
+        if set_in_pref:
+            continue
+
+        useful_set.append(get_opcode_string(opcode))
+
+    useful_set = pref_set + useful_set
+    return useful_set[:50]
+
+
+def get_opcode_string(opcode):
+    return " ".join(opcode[i : i + 2] for i in range(0, len(opcode), 2))
+
+
+def get_uint_string(magic):
+    if len(magic) == 2:
+        return "uint8(0) == 0x{0}{1}".format(magic[0], magic[1])
+    if len(magic) == 4:
+        return "uint16(0) == 0x{2}{3}{0}{1}".format(
+            magic[0], magic[1], magic[2], magic[3]
+        )
+    return ""
+
+
+def get_file_range(size):
+    size_string = ""
+    try:
+        max_size_b = size * 1  # fm multiplier not provided, default 1
+        if max_size_b < 1024:
+            max_size_b = 1024
+        max_size = int(max_size_b / 1024)
+        max_size_kb = max_size
+        if len(str(max_size)) == 2:
+            max_size = int(round(max_size, -1))
+        elif len(str(max_size)) == 3:
+            max_size = int(round(max_size, -2))
+        elif len(str(max_size)) == 4:
+            max_size = int(round(max_size, -3))
+        elif len(str(max_size)) >= 5:
+            max_size = int(round(max_size, -3))
+        size_string = "filesize < {0}KB".format(max_size)
+        logging.debug(
+            "File Size Eval: SampleSize (b): %s SizeWithMultiplier (b/Kb): %s / %s RoundedSize: %s",
+            str(size),
+            str(max_size_b),
+            str(max_size_kb),
+            str(max_size),
+        )
+    except Exception:
+        logging.exception("File range calc failed")
+    return size_string
+
 
 # -----------------------
 # Main execution
 # -----------------------
 if __name__ == "__main__":
-    print("Starting file scan with Capstone analysis (parallel)...")
+    logging.info("Starting file scan with Capstone analysis (parallel)...")
 
-    default_workers = min(32, (os.cpu_count() or 1) * 4) # Threads are lighter, can use more
+    # Attempt to download DBs and load them; keep optional (errors
+    # will be logged, script still runs)
     try:
-        results = scan_directory_parallel(SCAN_FOLDER, max_workers=default_workers)
-    except Exception as e:
-        logging.error(f"Top-level parallel scan failed: {e}")
-        results = scan_directory_sequential(SCAN_FOLDER)
+        # If you want to force an update, uncomment the next line.
+        # update_databases()
+        load_good_dbs("./dbs")
+    except Exception:
+        logging.exception("Failed to update/load good DBs")
+
+    default_workers = min(32, (os.cpu_count() or 1) * 4)
+    try:
+        results = scan_directory_parallel(SCAN_FOLDER)
+    except Exception as exc:
+        logging.error("Top-level parallel scan failed: %s", exc)
 
     suspicious_count = 0
     top_offenders = []
     for path, res in results:
-        if res.get('suspicious', False):
+        if res.get("suspicious", False):
             suspicious_count += 1
-            top_offenders.append((res.get('suspicious_score', 0), path))
+            top_offenders.append((res.get("suspicious_score", 0), path))
 
     top_offenders.sort(reverse=True)
-    print(f"\nScan complete: {len(results)} files scanned, {suspicious_count} suspicious files found.")
-    
-    if top_offenders:
-        print("\n--- Detailed Analysis of Top Suspicious Files ---")
-        for score, path in top_offenders[:20]: # Show details for top 20
-            print(f"\n[!] Path: {path} (Initial Score: {score})")
-            
-            # Find original features to print some context
-            original_features = next((f for p, f in results if p == path), {})
+    logging.info(
+        "Scan complete: %d files scanned, %d suspicious files found.",
+        len(results),
+        suspicious_count,
+    )
 
-            if original_features.get('capstone_analysis', {}).get('overall_analysis', {}).get('is_likely_packed'):
-                print("    - Triage Note: Capstone analysis suggests file may be packed.")
-            if original_features.get('entropy', 0) > 7.5:
-                print(f"    - Triage Note: High entropy detected ({original_features['entropy']:.2f}).")
-            if not original_features.get('signature_valid'):
-                print(f"    - Triage Note: Invalid or missing signature (Status: {original_features.get('signature_status', 'N/A')}).")
-            
-            # Run the on-demand yarGen scan for further analysis
-            print("    - Running on-demand string analysis...")
+    if top_offenders:
+        logging.info("--- Detailed Analysis of Top Suspicious Files ---")
+        for score, path in top_offenders[:20]:
+            original_features = next((f for p, f in results if p == path), {})
+            notes = []
+            if original_features.get("capstone_analysis", {}).get(
+                "overall_analysis", {}
+            ).get("is_likely_packed"):
+                notes.append("Capstone suggests file may be packed")
+            if original_features.get("entropy", 0) > 7.5:
+                notes.append("High entropy detected")
+            if not original_features.get("signature_valid"):
+                notes.append(
+                    "Invalid or missing signature (Status: %s)"
+                    % original_features.get("signature_status", "N/A")
+                )
+
+            logging.info("Path: %s (Initial Score: %d)", path, score)
+            for note in notes:
+                logging.info("  - Triage Note: %s", note)
+
+            logging.info("  - Running on-demand string analysis...")
             yargen_analysis = analyze_yargen_strings(path)
-            
-            print(f"    - String Analysis Result: {yargen_analysis['status']}")
-            print(f"      (Found {yargen_analysis['yargen_suspicious_percentage']:.1f}% suspicious strings out of {yargen_analysis['total_strings']} total.)")
+            logging.info("  - String Analysis Result: %s", yargen_analysis["status"])
+            logging.info(
+                "    (Found %.1f%% suspicious strings out of %d total.)",
+                yargen_analysis["yargen_suspicious_percentage"],
+                yargen_analysis["total_strings"],
+            )
     else:
-        print("\nNo suspicious files found above the threshold.")
+        logging.info("No suspicious files found above the threshold.")
