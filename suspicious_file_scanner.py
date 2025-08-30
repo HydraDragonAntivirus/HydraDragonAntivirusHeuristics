@@ -462,13 +462,14 @@ def is_likely_word(s: str) -> bool:
     return len(s) >= 3 and s.lower() in nltk_words
 
 
-def check_against_good_dbs_percentage(path: str, file_data: Optional[bytes] = None, precomputed_strings: Optional[List[str]] = None) -> float:
+def check_against_good_dbs_percentage(
+    path: str,
+    file_data: Optional[bytes] = None,
+    precomputed_strings: Optional[List[str]] = None
+) -> float:
     """
     Returns the percentage (0-100) of known-good markers that the file at `path` matches.
-
-    This function now accepts `file_data` and/or `precomputed_strings` to avoid
-    re-reading / re-extracting strings when that work has already been done by
-    the caller (avoid double scanning).
+    Accepts `file_data` and/or `precomputed_strings` to avoid re-reading / re-extracting strings.
     """
     try:
         if file_data is None:
@@ -484,9 +485,9 @@ def check_against_good_dbs_percentage(path: str, file_data: Optional[bytes] = No
     # --- IMPHASH ---
     try:
         imphash, _exports = get_pe_info(file_data)
-        if KNOWN_IMPHASHES:
+        if imphash and KNOWN_IMPHASHES:
             total_markers += 1
-            if imphash and imphash.lower() in KNOWN_IMPHASHES:
+            if imphash.lower() in KNOWN_IMPHASHES:
                 matches += 1
     except Exception:
         logging.debug("imphash check failed for %s", path, exc_info=True)
@@ -495,7 +496,7 @@ def check_against_good_dbs_percentage(path: str, file_data: Optional[bytes] = No
     try:
         if good_opcodes_db:
             opcodes = extract_opcodes(file_data)
-            total_markers += len(good_opcodes_db)
+            total_markers += len(opcodes)
             for op in opcodes:
                 if op.replace(" ", "").lower() in good_opcodes_db:
                     matches += 1
@@ -518,9 +519,7 @@ def check_against_good_dbs_percentage(path: str, file_data: Optional[bytes] = No
             else:
                 strings = precomputed_strings
 
-            # Only keep strings that are likely words when possible
-            strings = [s for s in strings if is_likely_word(s)]
-
+            # Keep all strings, but normalize for matching
             for db in string_dbs:
                 total_markers += len(db)
                 for s in strings:
@@ -533,8 +532,7 @@ def check_against_good_dbs_percentage(path: str, file_data: Optional[bytes] = No
     if total_markers == 0:
         return 0.0
 
-    return (matches / total_markers) * 100
-
+    return round((matches / total_markers) * 100, 2)
 
 def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
     analysis = {
