@@ -407,17 +407,19 @@ def calculate_entropy(path: str) -> float:
 
 
 def load_good_dbs(dbs_dir: str = "./dbs"):
-    """Load good-* DBs from a directory into memory sets.
+    """Load good-* DBs from a directory into memory sets, including exports.
 
     - Expects newline-separated plaintext files in ./dbs/.
     - For opcodes, normalizes by removing whitespace and lowercasing.
     - For imphashes, adds to KNOWN_IMPHASHES dict as key -> filename (or empty).
     """
-    global good_opcodes_db, base64strings, hexEncStrings, reversedStrings, KNOWN_IMPHASHES
+    global good_opcodes_db, base64strings, hexEncStrings, reversedStrings, KNOWN_IMPHASHES, KNOWN_EXPORTS
     good_opcodes_db = set()
     base64strings = set()
     hexEncStrings = set()
     reversedStrings = set()
+    KNOWN_IMPHASHES = {}
+    KNOWN_EXPORTS = set()
 
     if not os.path.isdir(dbs_dir):
         logging.info("DBs directory not found: %s", dbs_dir)
@@ -446,93 +448,84 @@ def load_good_dbs(dbs_dir: str = "./dbs"):
         elif "imphash" in bn or "imphashes" in bn:
             for ln in lines:
                 KNOWN_IMPHASHES[ln.lower()] = bn
+        elif "exports" in bn:
+            for ln in lines:
+                KNOWN_EXPORTS.add(ln.lower())
 
     logging.info(
-        "Loaded good DBs: opcodes=%d base64=%d hexEnc=%d reversed=%d imphashes=%d",
+        "Loaded good DBs: opcodes=%d base64=%d hexEnc=%d reversed=%d imphashes=%d exports=%d",
         len(good_opcodes_db),
         len(base64strings),
         len(hexEncStrings),
         len(reversedStrings),
         len(KNOWN_IMPHASHES),
+        len(KNOWN_EXPORTS),
     )
-
 
 def is_likely_word(s: str) -> bool:
     """Return True if string is at least 3 chars and exists in NLTK words."""
     return len(s) >= 3 and s.lower() in nltk_words
 
-
-def check_against_good_dbs_percentage(
-    path: str,
-    file_data: Optional[bytes] = None,
-    precomputed_strings: Optional[List[str]] = None
-) -> float:
+def check_file_against_good_dbs(file_path, file_data=None):
     """
-    Returns the percentage (0-100) of known-good markers that the file at `path` matches.
-    Accepts `file_data` and/or `precomputed_strings` to avoid re-reading / re-extracting strings.
+    Scan a single file like parse_sample_dir, extract strings/opcodes/imphash/exports,
+    and return the known-good match percentage.
     """
     try:
+        # Read file if data not provided
         if file_data is None:
-            with open(path, "rb") as fh:
-                file_data = fh.read()
+            with open(file_path, 'rb') as f:
+                file_data = f.read()
     except Exception:
-        logging.debug("Failed to open for good-db check: %s", path, exc_info=True)
+        print(f"[-] Cannot read file {file_path}")
         return 0.0
 
+    # Extract strings
+    strings = extract_strings(file_data)
+
+    # Extract opcodes if enabled
+    opcodes = extract_opcodes(file_data)
+
+    # Compute imphash and exports
+    imphash, exports = get_pe_info(file_data)
+
+    # Compute match against known-good DBs
     total_markers = 0
     matches = 0
 
     # --- IMPHASH ---
-    try:
-        imphash, _exports = get_pe_info(file_data)
-        if imphash and KNOWN_IMPHASHES:
-            total_markers += 1
-            if imphash.lower() in KNOWN_IMPHASHES:
+    if KNOWN_IMPHASHES:
+        total_markers += 1
+        if imphash and imphash.lower() in KNOWN_IMPHASHES:
+            matches += 1
+
+    # --- EXPORTS ---
+    if KNOWN_EXPORTS:
+        total_markers += len(KNOWN_EXPORTS)
+        for exp in exports:
+            if exp.lower() in KNOWN_EXPORTS:
                 matches += 1
-    except Exception:
-        logging.debug("imphash check failed for %s", path, exc_info=True)
 
     # --- OPCODES ---
-    try:
-        if good_opcodes_db:
-            opcodes = extract_opcodes(file_data)
-            total_markers += len(opcodes)
-            for op in opcodes:
-                if op.replace(" ", "").lower() in good_opcodes_db:
-                    matches += 1
-    except Exception:
-        logging.debug("opcode check failed for %s", path, exc_info=True)
+    if good_opcodes_db:
+        total_markers += len(good_opcodes_db)
+        for op in opcodes:
+            if op.replace(" ", "").lower() in good_opcodes_db:
+                matches += 1
 
     # --- STRINGS ---
-    try:
-        string_dbs = []
-        if base64strings:
-            string_dbs.append(base64strings)
-        if hexEncStrings:
-            string_dbs.append(hexEncStrings)
-        if reversedStrings:
-            string_dbs.append(reversedStrings)
+    string_dbs = [db for db in (base64strings, hexEncStrings, reversedStrings) if db]
+    if string_dbs:
+        strings_filtered = [s for s in strings if is_likely_word(s)]
+        for db in string_dbs:
+            total_markers += len(db)
+            for s in strings_filtered:
+                s_l = s.lower()
+                if s in db or s_l in db:
+                    matches += 1
 
-        if string_dbs:
-            if precomputed_strings is None:
-                strings = extract_strings(file_data)
-            else:
-                strings = precomputed_strings
-
-            # Keep all strings, but normalize for matching
-            for db in string_dbs:
-                total_markers += len(db)
-                for s in strings:
-                    s_l = s.lower()
-                    if s in db or s_l in db:
-                        matches += 1
-    except Exception:
-        logging.debug("string DB check failed for %s", path, exc_info=True)
-
-    if total_markers == 0:
-        return 0.0
-
-    return round((matches / total_markers) * 100, 2)
+    # Compute final percentage
+    return (matches / total_markers * 100) if total_markers > 0 else 0.0
 
 def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
     analysis = {
