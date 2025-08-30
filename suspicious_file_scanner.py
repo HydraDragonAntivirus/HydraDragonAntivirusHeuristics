@@ -466,66 +466,88 @@ def is_likely_word(s: str) -> bool:
     """Return True if string is at least 3 chars and exists in NLTK words."""
     return len(s) >= 3 and s.lower() in nltk_words
 
-def check_file_against_good_dbs(file_path, file_data=None):
+def check_against_good_dbs_percentage(path: str, file_data: Optional[bytes] = None, precomputed_strings: Optional[List[str]] = None) -> float:
     """
-    Scan a single file like parse_sample_dir, extract strings/opcodes/imphash/exports,
-    and return the known-good match percentage.
+    Returns the percentage (0-100) of known-good markers the file matches.
+    Checks: imphash, exports, opcodes, strings.
+    Accepts file_data / precomputed_strings to avoid double extraction.
     """
     try:
-        # Read file if data not provided
         if file_data is None:
-            with open(file_path, 'rb') as f:
-                file_data = f.read()
+            with open(path, "rb") as fh:
+                file_data = fh.read()
     except Exception:
-        print(f"[-] Cannot read file {file_path}")
+        logging.debug("Failed to open for good-db check: %s", path, exc_info=True)
         return 0.0
 
-    # Extract strings
-    strings = extract_strings(file_data)
-
-    # Extract opcodes if enabled
-    opcodes = extract_opcodes(file_data)
-
-    # Compute imphash and exports
-    imphash, exports = get_pe_info(file_data)
-
-    # Compute match against known-good DBs
     total_markers = 0
     matches = 0
 
     # --- IMPHASH ---
-    if KNOWN_IMPHASHES:
-        total_markers += 1
-        if imphash and imphash.lower() in KNOWN_IMPHASHES:
-            matches += 1
+    try:
+        imphash, exports = get_pe_info(file_data)
+        if KNOWN_IMPHASHES:
+            total_markers += 1
+            if imphash and imphash.lower() in KNOWN_IMPHASHES:
+                matches += 1
+    except Exception:
+        logging.debug("imphash check failed for %s", path, exc_info=True)
 
     # --- EXPORTS ---
-    if KNOWN_EXPORTS:
-        total_markers += len(KNOWN_EXPORTS)
-        for exp in exports:
-            if exp.lower() in KNOWN_EXPORTS:
-                matches += 1
+    try:
+        if KNOWN_EXPORTS:
+            total_markers += len(KNOWN_EXPORTS)
+            for exp in exports:
+                exp_l = exp.lower().strip()
+                if exp_l in KNOWN_EXPORTS:
+                    matches += 1
+    except Exception:
+        logging.debug("exports check failed for %s", path, exc_info=True)
 
     # --- OPCODES ---
-    if good_opcodes_db:
-        total_markers += len(good_opcodes_db)
-        for op in opcodes:
-            if op.replace(" ", "").lower() in good_opcodes_db:
-                matches += 1
+    try:
+        if good_opcodes_db:
+            opcodes = extract_opcodes(file_data)
+            total_markers += len(good_opcodes_db)
+            for op in opcodes:
+                op_l = op.replace(" ", "").lower()
+                if op_l in good_opcodes_db:
+                    matches += 1
+    except Exception:
+        logging.debug("opcode check failed for %s", path, exc_info=True)
 
     # --- STRINGS ---
-    string_dbs = [db for db in (base64strings, hexEncStrings, reversedStrings) if db]
-    if string_dbs:
-        strings_filtered = [s for s in strings if is_likely_word(s)]
-        for db in string_dbs:
-            total_markers += len(db)
-            for s in strings_filtered:
-                s_l = s.lower()
-                if s in db or s_l in db:
-                    matches += 1
+    try:
+        string_dbs = []
+        if base64strings:
+            string_dbs.append(base64strings)
+        if hexEncStrings:
+            string_dbs.append(hexEncStrings)
+        if reversedStrings:
+            string_dbs.append(reversedStrings)
 
-    # Compute final percentage
-    return (matches / total_markers * 100) if total_markers > 0 else 0.0
+        if string_dbs:
+            if precomputed_strings is None:
+                strings = extract_strings(file_data)
+            else:
+                strings = precomputed_strings
+
+            # Keep likely words
+            strings = [s for s in strings if is_likely_word(s)]
+
+            for db in string_dbs:
+                total_markers += len(db)
+                for s in strings:
+                    s_l = s.lower()
+                    if s in db or s_l in db:
+                        matches += 1
+    except Exception:
+        logging.debug("string DB check failed for %s", path, exc_info=True)
+
+    if total_markers == 0:
+        return 0.0
+
+    return (matches / total_markers) * 100
 
 def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
     analysis = {
@@ -903,12 +925,10 @@ def analyze_yargen_strings_from_list(strings: List[str]) -> Dict[str, Any]:
     """
     return _simple_yargen_scores(strings)
 
-def analyze_single_file(path: str) -> Dict[str, Any]:
-    """Analyze a single file with Capstone disassembly and basic checks.
+def analyze_single_file(path: str) -> dict:
+    """Analyze a single file with Capstone, basic checks, and known-good DB percentage.
 
-    Key change: extract strings once and reuse them for both "good db" checks
-    and yara-like string analysis. yarGen-like analysis is executed *only* if
-    the file's heuristic suspicious_score >= SUSPICIOUS_THRESHOLD.
+    Strings are extracted exactly once and reused everywhere.
     """
     features = {
         "path": path,
@@ -925,7 +945,8 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         "suspicious_score": 0,
         "suspicious": False,
         "known_good_percent": 0.0,
-        "unknown": False,   # <-- added default
+        "unknown": False,
+        "strings": [],  # store extracted strings
     }
 
     try:
@@ -939,7 +960,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         ext = os.path.splitext(filename_lc)[1].lstrip(".")
         features["extension"] = ext
 
-        # Read file bytes once for all binary checks
+        # Read file bytes once
         file_bytes = b""
         try:
             with open(path, "rb") as fh:
@@ -947,17 +968,23 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         except Exception:
             logging.debug("Failed to read file bytes for %s", path, exc_info=True)
 
-        # Extract strings once and reuse
-        strings = extract_strings(file_bytes) if file_bytes else []
+        # Extract strings once
+        if file_bytes:
+            extracted_strings = extract_strings(file_bytes)
+        else:
+            extracted_strings = []
 
-        # Check known-good DBs as percentage
+        features["strings"] = extracted_strings
+
+        # Known-good DB percentage using the precomputed strings
         try:
             features["known_good_percent"] = check_against_good_dbs_percentage(
-                path, file_data=file_bytes, precomputed_strings=strings
+                path, file_data=file_bytes, precomputed_strings=extracted_strings
             )
         except Exception:
             logging.debug("known_good_percent check failed for %s", path, exc_info=True)
 
+        # PE analysis
         pe_obj = None
         try:
             if pefile:
@@ -986,65 +1013,55 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
                 logging.debug("Signature check failed for %s", path, exc_info=True)
             features["is_running"] = is_running_pe(path)
 
-        # Score heuristics (conservative)
+        # Heuristic scoring
         score = 0
-        if features.get("capstone_analysis") and features["capstone_analysis"].get(
-            "overall_analysis", {}
-        ).get("is_likely_packed"):
+        cap_analysis = features.get("capstone_analysis", {}).get("overall_analysis", {})
+        if cap_analysis.get("is_likely_packed"):
             score += 3
-        if features.get("entropy", 0) > 7.5:
-            score += 5 if not features.get("signature_valid") else 2
-        if features.get("age_days", 0) < 1:
+        if features["entropy"] > 7.5:
+            score += 5 if not features["signature_valid"] else 2
+        if features["age_days"] < 1:
             score += 2
         if "temp" in path.lower() or "cache" in path.lower():
             score += 2
-        if features["is_executable"] and not features.get("has_version_info") and not features.get(
-            "signature_valid"
-        ):
+        if features["is_executable"] and not features["has_version_info"] and not features["signature_valid"]:
             score += 1
-        if features["is_executable"] and not features.get("signature_valid"):
-            score += 4 if features.get("signature_status") == "Untrusted root" else 2
-        if features.get("signature_valid"):
+        if features["is_executable"] and not features["signature_valid"]:
+            score += 4 if features["signature_status"] == "Untrusted root" else 2
+        if features["signature_valid"]:
             score = max(score - 3, 0)
-        if features.get("is_running"):
+        if features["is_running"]:
             score += 3
         if ext == "":
             score += 2
 
-        # Adjust score based on known-good percentage (cap reduction)
-        if features.get("known_good_percent", 0) > 0:
+        # Adjust based on known-good DB
+        if features["known_good_percent"] > 0:
             reduction = score * min(features["known_good_percent"] / 100, 0.5)
             score = max(score - reduction, 0)
 
         features["suspicious_score"] = score
         features["suspicious"] = score >= SUSPICIOUS_THRESHOLD
 
-        # Mark unknownness (only if suspicious)
+        # Mark unknown only if suspicious
         if features["suspicious"]:
-            is_good = features.get("known_good_percent", 0) > 0
-            is_signed = features.get("signature_valid", False)
-            if not is_good and not is_signed:
-                features["unknown"] = True
-            else:
-                features["unknown"] = False
+            is_good = features["known_good_percent"] > 0
+            is_signed = features["signature_valid"]
+            features["unknown"] = not is_good and not is_signed
 
-        # Only run yarGen-like analysis if file is suspicious
+        # YarGen-like analysis only if suspicious
         if features["suspicious"]:
             try:
-                yargen_analysis = analyze_yargen_strings_from_list(strings)
-                features["yargen_summary"] = yargen_analysis
-                # Optional: bump score if yarGen finds lots of suspicious strings
-                try:
-                    if yargen_analysis.get("yargen_suspicious_percentage", 0) > 30:
-                        features["suspicious_score"] += 3
-                except Exception:
-                    pass
+                features["yargen_summary"] = analyze_yargen_strings_from_list(extracted_strings)
+                yargen_pct = features["yargen_summary"].get("yargen_suspicious_percentage", 0)
+                if yargen_pct > 30:
+                    features["suspicious_score"] += 3
             except Exception:
                 logging.debug("YarGen-like analysis failed for %s", path, exc_info=True)
         else:
             features["yargen_summary"] = {
                 "status": "Not analyzed (below suspicious threshold)",
-                "total_strings": len(strings),
+                "total_strings": len(extracted_strings),
             }
 
     except Exception as exc:
