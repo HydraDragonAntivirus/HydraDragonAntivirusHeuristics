@@ -100,6 +100,14 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+# Define missing Windows types if not provided by ctypes
+if not hasattr(ctypes, "DWORD"):
+    ctypes.DWORD = ctypes.c_uint32
+if not hasattr(ctypes, "WORD"):
+    ctypes.WORD = ctypes.c_uint16
+if not hasattr(ctypes, "BYTE"):
+    ctypes.BYTE = ctypes.c_ubyte
+
 # --------------------
 # Config / Globals
 # --------------------
@@ -132,12 +140,6 @@ STARTUP_DIRS = [
 # PEStudio whitelist file (user requested location)
 # --------------------
 PE_STRINGS_FILE = "./3rdparty/strings.xml"
-
-# Known imphashes mapping (example)
-KNOWN_IMPHASHES = {
-    'a04dd9f5ee88d7774203e0a0cfa1b941': 'PsExec',
-    '2b8c9d9ab6fefc247adaf927e83dcea6': 'RAR SFX variant'
-}
 
 # pestudio strings global store (populated at startup)
 pestudio_strings_global: Dict[str, List[str]] = {}
@@ -489,8 +491,6 @@ def verify_authenticode_signature(file_path: str) -> int:
     return _trust.WinVerifyTrust(None, ctypes.byref(WINTRUST_ACTION_GENERIC_VERIFY), ctypes.byref(wtd))
 
 def check_valid_signature(file_path: str) -> dict:
-    if sys.platform != "win32":
-        return {"is_valid": False, "status": "Not on Windows"}
     try:
         res = verify_authenticode_signature(file_path)
         h = res & 0xFFFFFFFF
@@ -570,7 +570,6 @@ def analyze_single_file(path: str) -> dict:
         "Optional Header LoaderFlags field is valued illegal": "Clean",
         "Non-ascii or empty section names detected": "Clean",
         "Illegal size of optional Header": "Clean",
-        "Packer detection on signature database": "Unknown",
         "Based on the sections entropy check! file is possibly packed": "Clean",
         "Timestamp value suspicious": "Clean",
         "Header Checksum is zero!": "Suspicious",
@@ -767,17 +766,6 @@ def analyze_single_file(path: str) -> dict:
                     if hasattr(pe, 'DIRECTORY_ENTRY_TLS') and getattr(pe, 'DIRECTORY_ENTRY_TLS') is not None:
                         msg = "TLS callback functions array detected"
                         pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
-                except Exception:
-                    pass
-
-                # Packer detection via imphash/signature database
-                try:
-                    imphash, exports = get_pe_info(file_bytes)
-                    if imphash:
-                        name = KNOWN_IMPHASHES.get(imphash.lower())
-                        if name:
-                            msg = "Packer detection on signature database"
-                            pe_checks.append((f"{msg}: {name}", verdict_map.get(msg, 'Unknown')))
                 except Exception:
                     pass
 
