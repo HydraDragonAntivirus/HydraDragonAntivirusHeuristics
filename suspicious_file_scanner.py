@@ -857,13 +857,14 @@ if __name__ == "__main__":
     suspicious = [r for r in results if r.get("suspicious")]
     print("\n--- Scan Summary ---")
     print(f"Completed in {dur:.2f}s. Files scanned: {len(results)} Suspicious: {len(suspicious)}")
+    # Top suspicious files
     if suspicious:
         suspicious.sort(key=lambda x: x.get("suspicious_score", 0), reverse=True)
         print("\nTop suspicious files:")
         for r in suspicious[:20]:
-            ysum = r.get("phase2_summary", {})  # düzeltildi
+            ysum = r.get("phase2_summary") or {}  # <- Use empty dict if None
             print(f"{r['path']}\n  Score: {r['suspicious_score']}  Sig: {r.get('signature_status','N/A')}  Strings suspicious: {ysum.get('unknown_percentage',0):.1f}% ({ysum.get('total_strings',0)})")
-            top = ysum.get("top_unknowns", [])  # düzeltildi
+            top = ysum.get("top_unknowns") or []  # <- Use empty list if None
             if top:
                 for ts in top[:3]:
                     disp = ts['string'].replace("\n","\\n").replace("\r","\\r")
