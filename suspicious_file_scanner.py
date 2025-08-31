@@ -679,6 +679,11 @@ def is_in_suspicious_location_pe(path: str) -> bool:
 # Single-file analysis (no known-extension/filename lookups)
 # --------------------
 def analyze_single_file(path: str) -> dict:
+    """
+    Analyze a single file with PE, Capstone, entropy, runtime, signature checks.
+    Phase 1: basic heuristics (entropy, packing, location, running, signature)
+    Phase 2: YarGen-style string scoring (only if phase1_score >= threshold)
+    """
     features = {
         'path': path,
         'entropy': 0.0,
@@ -692,36 +697,28 @@ def analyze_single_file(path: str) -> dict:
         'in_suspicious_location': False,
         'age_days': 0,
         'suspicious_score': 0,
-        'suspicious': False
+        'suspicious': False,
+        'phase1_score': 0,
+        'phase2_summary': None
     }
 
     try:
-        # Phase 1: basic file info
         stats = os.stat(path)
         features['size'] = stats.st_size
         features['age_days'] = (time.time() - stats.st_ctime) / (24 * 3600)
         features['entropy'] = calculate_entropy(path)
 
-        # Temporary Phase 1 suspicion score (simple heuristics)
-        phase1_score = 0
-        if features['entropy'] > 7.5:
-            phase1_score += 5
-        if features['age_days'] < 1:
-            phase1_score += 2
-        if 'temp' in path.lower() or 'cache' in path.lower():
-            phase1_score += 2
-
-        # Log Phase 1 only if suspicious
-        if phase1_score >= 3:
-            logging.info(f"[Phase 1] Suspicious detected: {path} | entropy={features['entropy']:.2f} | age_days={features['age_days']:.2f} | score={phase1_score}")
-
-        # Only process valid PEs
         pe = None
         try:
             pe = pefile.PE(path)
             features['is_executable'] = True
             features['has_version_info'] = hasattr(pe, 'VS_FIXEDFILEINFO') and getattr(pe, 'VS_FIXEDFILEINFO') is not None
+
+            # Capstone analysis
+            features['capstone_analysis'] = analyze_with_capstone_pe(pe)
+
         except pefile.PEFormatError:
+            # Not a valid PE, skip executable-specific
             return features
         finally:
             if pe:
@@ -730,44 +727,63 @@ def analyze_single_file(path: str) -> dict:
                 except Exception:
                     pass
 
-        # Phase 2: full analysis
-        try:
-            features['capstone_analysis'] = analyze_with_capstone_pe(pe)
-        except Exception:
-            pass
+        # Signature check
         try:
             sig = check_valid_signature(path)
             features['signature_valid'] = sig.get('is_valid', False)
             features['signature_status'] = sig.get('status', "N/A")
         except Exception:
             pass
+
+        # Runtime/location checks
         features['is_running'] = is_running_pe(path)
         features['in_suspicious_location'] = is_in_suspicious_location_pe(path)
 
-        # Suspicious score calculation (Phase 2)
-        score = 0
-        if (features.get('capstone_analysis') and 
-            features['capstone_analysis'].get('overall_analysis', {}).get('is_likely_packed')):
-            score += 3
-        if features.get('entropy', 0) > 7.5:
-            score += 5 if not features.get('signature_valid') else 2
-        if features.get('age_days', 0) < 1:
-            score += 2
+        # --------------------
+        # Phase 1 scoring
+        # --------------------
+        phase1 = 0
+        cap = features.get('capstone_analysis', {}).get('overall_analysis', {})
+        if cap.get('is_likely_packed'):
+            phase1 += 3
+        if features['entropy'] > 7.5:
+            phase1 += 5 if not features['signature_valid'] else 2
+        if features['age_days'] < 1:
+            phase1 += 2
         if 'temp' in path.lower() or 'cache' in path.lower():
-            score += 2
-        if features.get('is_executable') and not features.get('has_version_info') and not features.get('signature_valid'):
-            score += 1
-        if features.get('is_executable') and not features.get('signature_valid'):
-            score += 4 if features.get('signature_status') == "Untrusted root" else 2
-        if features.get('signature_valid'):
-            score = max(score - 3, 0)
-        if features.get('in_suspicious_location'):
-            score += 2
-        if features.get('is_running'):
-            score += 3
+            phase1 += 2
+        if features['is_executable'] and not features['has_version_info'] and not features['signature_valid']:
+            phase1 += 1
+        if features['is_executable'] and not features['signature_valid']:
+            if features['signature_status'] == "Untrusted root":
+                phase1 += 4
+            else:
+                phase1 += 2
+        if features['in_suspicious_location']:
+            phase1 += 2
+        if features['is_running']:
+            phase1 += 3
+        if features['signature_valid']:
+            phase1 = max(phase1 - 3, 0)
 
-        features['suspicious_score'] = score
-        features['suspicious'] = score >= SUSPICIOUS_THRESHOLD
+        features['phase1_score'] = phase1
+        features['suspicious_score'] = phase1
+        features['suspicious'] = phase1 >= SUSPICIOUS_THRESHOLD
+
+        if features['suspicious']:
+            logging.info(f"[Phase 1] Suspicious detected: {path} | Score: {phase1}")
+
+            # --------------------
+            # Phase 2: YarGen string scoring
+            # --------------------
+            try:
+                with open(path, "rb") as fh:
+                    file_data = fh.read()
+                strings = extract_strings(file_data)
+                yargen_summary = score_strings_yargen_style(strings)
+                features['phase2_summary'] = yargen_summary
+            except Exception as e:
+                logging.warning(f"Phase 2 failed for {path}: {e}")
 
     except Exception as e:
         logging.error(f"Failed to analyze {path}: {e}")
