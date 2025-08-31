@@ -1,10 +1,5 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-#
-# Unified Suspicious File Scanner with yarGen Logic
-# Combines the parallel scanning framework of suspicious_file_scanner.py
-# with the advanced string scoring and analysis engine of yarGen.py.
-#
 
 import glob
 import logging
@@ -14,91 +9,66 @@ import re
 import sys
 import time
 import traceback
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Any, Dict, List, Set, Optional
+
+import ctypes
+import binascii
+import lief
+import psutil
+from ctypes import wintypes
+from tqdm import tqdm
+
+import gzip
+import json
+
 import argparse
 import shutil
 import urllib.request
-import binascii
-import json
-import gzip
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from typing import Any, Dict, List, Set, Optional, Counter as TypingCounter
-from collections import Counter
-
-import ctypes
-from ctypes import wintypes
 
 # Optional imports that some environments may not have
 try:
-    import lief
-except ImportError:
-    lief = None
-try:
-    import psutil
-except ImportError:
-    psutil = None
-try:
-    from tqdm import tqdm
-except ImportError:
-    # Dummy tqdm if not installed
-    def tqdm(iterable, **kwargs):
-        return iterable
-try:
     import pefile
-except ImportError:
+except Exception:
     pefile = None
+
 try:
     import capstone
-except ImportError:
+except Exception:
     capstone = None
 
 # NLTK usage is best-effort
 try:
     import nltk
-    # Suppress verbose download output
-    import io
-    from contextlib import redirect_stdout
-    with redirect_stdout(io.StringIO()):
-        try:
-            nltk.data.find('tokenizers/punkt')
-        except nltk.downloader.DownloadError:
-            nltk.download("punkt", quiet=True)
-        try:
-            nltk.data.find('corpora/words')
-        except nltk.downloader.DownloadError:
-            nltk.download("words", quiet=True)
-    from nltk.corpus import words
-    nltk_words: Set[str] = set(words.words())
-except ImportError:
+    try:
+        nltk.download("punkt", quiet=True)
+    except Exception:
+        pass
+    try:
+        nltk.download("words", quiet=True)
+    except Exception:
+        pass
+    from nltk.corpus import words  # type: ignore
+    nltk_words = set(words.words())
+except Exception:
     nltk = None
+    words = None  # type: ignore
     nltk_words = set()
 
-
 # ------------------------------
-# Global Configuration & Containers
+# Global Known-Good DB Containers (normalized)
 # ------------------------------
-SUSPICIOUS_THRESHOLD = 11  # Base score to be considered suspicious
-SCAN_FOLDER = "."          # Default scan folder
-
-# --- Global DB Containers ---
-# These will be populated by load_good_dbs()
-good_strings_db: TypingCounter[str] = Counter()
 good_opcodes_db: Set[str] = set()
-good_imphashes_db: Set[str] = set()
-good_exports_db: Set[str] = set()
-# yarGen-style special string sets, populated during analysis
-base64strings: Dict[str, bytes] = {}
-hexEncStrings: Dict[str, bytes] = {}
-reversedStrings: Dict[str, str] = {}
-stringScores: Dict[str, float] = {}
-
+base64strings: Set[str] = set()
+hexEncStrings: Set[str] = set()
+reversedStrings: Set[str] = set()
+KNOWN_IMPHASHES: Set[str] = set()
+KNOWN_EXPORTS: Set[str] = set()
 USE_OPCODES = False
 
-# ------------------------------
-# Regexes and Constants
-# ------------------------------
-ASCII_RE = re.compile(rb"[\x1f-\x7e]{6,}")
-WIDE_RE = re.compile(rb"(?:[\x1f-\x7e][\x00]){6,}")
-HEX_CAND_RE = re.compile(rb"([A-Fa-f0-9]{10,})")
+# Basic configuration
+SCAN_FOLDER = "D:\\datas2\\datamaliciousorder"
+SUSPICIOUS_THRESHOLD = 11
 
 REPO_URLS = {
     'good-opcodes-part1.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part1.db',
@@ -110,6 +80,7 @@ REPO_URLS = {
     'good-opcodes-part7.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part7.db',
     'good-opcodes-part8.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part8.db',
     'good-opcodes-part9.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part9.db',
+
     'good-strings-part1.db': 'https://www.bsk-consulting.de/yargen/good-strings-part1.db',
     'good-strings-part2.db': 'https://www.bsk-consulting.de/yargen/good-strings-part2.db',
     'good-strings-part3.db': 'https://www.bsk-consulting.de/yargen/good-strings-part3.db',
@@ -119,6 +90,7 @@ REPO_URLS = {
     'good-strings-part7.db': 'https://www.bsk-consulting.de/yargen/good-strings-part7.db',
     'good-strings-part8.db': 'https://www.bsk-consulting.de/yargen/good-strings-part8.db',
     'good-strings-part9.db': 'https://www.bsk-consulting.de/yargen/good-strings-part9.db',
+
     'good-exports-part1.db': 'https://www.bsk-consulting.de/yargen/good-exports-part1.db',
     'good-exports-part2.db': 'https://www.bsk-consulting.de/yargen/good-exports-part2.db',
     'good-exports-part3.db': 'https://www.bsk-consulting.de/yargen/good-exports-part3.db',
@@ -128,6 +100,7 @@ REPO_URLS = {
     'good-exports-part7.db': 'https://www.bsk-consulting.de/yargen/good-exports-part7.db',
     'good-exports-part8.db': 'https://www.bsk-consulting.de/yargen/good-exports-part8.db',
     'good-exports-part9.db': 'https://www.bsk-consulting.de/yargen/good-exports-part9.db',
+
     'good-imphashes-part1.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part1.db',
     'good-imphashes-part2.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part2.db',
     'good-imphashes-part3.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part3.db',
@@ -139,49 +112,284 @@ REPO_URLS = {
     'good-imphashes-part9.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part9.db',
 }
 
+# ===============================
+# Regexes for string extraction (yarGen style) - now actually used
+# ===============================
+ASCII_RE = re.compile(rb"[\x1f-\x7e]{6,}")  # ASCII strings length >=6
+WIDE_RE = re.compile(rb"(?:[\x1f-\x7e][\x00]){6,}")  # UTF-16LE wide strings length >=6
+HEX_CAND_RE = re.compile(rb"([A-Fa-f0-9]{10,})")  # Hex-like substrings length >=10
+
+PE_STRINGS_FILE = "./3rdparty/strings.xml"
+
+KNOWN_IMPHASHES = {
+    "a04dd9f5ee88d7774203e0a0cfa1b941": "PsExec",
+    "2b8c9d9ab6fefc247adaf927e83dcea6": "RAR SFX variant",
+}
+
+RELEVANT_EXTENSIONS = [
+    ".asp", ".vbs", ".ps", ".ps1", ".tmp", ".bas", ".bat", ".cmd", ".com", ".cpl",
+    ".crt", ".dll", ".exe", ".msc", ".scr", ".sys", ".vb", ".vbe", ".vbs",
+    ".wsc", ".wsf", ".wsh", ".input", ".war", ".jsp", ".php", ".asp", ".aspx",
+    ".psd1", ".psm1", ".py",
+]
+
 # Logging setup
 logging.basicConfig(
-    filename="unified_scanner.log",
+    filename="scanner.log",
     filemode="a",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
 
-# =============================================================================
-# UTILITY AND HELPER FUNCTIONS
-# =============================================================================
+def get_abs_path(filename: str) -> str:
+    """Return absolute path relative to this file."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), filename)
+
+
+def get_files(folder: str, not_recursive: bool):
+    """Yield files from folder, optionally non-recursive."""
+    if not_recursive:
+        for filename in os.listdir(folder):
+            file_path = os.path.join(folder, filename)
+            if os.path.isdir(file_path):
+                continue
+            yield file_path
+    else:
+        for root, _dirs, files in os.walk(folder, topdown=False):
+            for name in files:
+                file_path = os.path.join(root, name)
+                yield file_path
+
+
+def extract_hex_strings(s: bytes):
+    strings = []
+    hex_strings = re.findall(b"([a-fA-F0-9]{10,})", s)
+    for string in list(hex_strings):
+        hex_strings += string.split(b"0000")
+        hex_strings += string.split(b"0d0a")
+        hex_strings += re.findall(
+            b"((?:0000|002[a-f0-9]|00[3-9a-f][0-9a-f]){6,})", string, re.IGNORECASE
+        )
+    hex_strings = list(set(hex_strings))
+    # ASCII Encoded Strings
+    for string in hex_strings:
+        for x in string.split(b"00"):
+            if len(x) > 10:
+                try:
+                    strings.append(x.decode('utf-8', errors='ignore'))
+                except Exception:
+                    strings.append(str(x))
+    # WIDE Encoded Strings
+    for string in hex_strings:
+        try:
+            if len(string) % 2 != 0 or len(string) < 8:
+                continue
+            if b"0000" in string:
+                continue
+            dec = string.replace(b"00", b"")
+            if is_ascii_string(dec, padding_allowed=False):
+                try:
+                    strings.append(dec.decode('utf-8', errors='ignore'))
+                except Exception:
+                    strings.append(str(dec))
+        except Exception:
+            traceback.print_exc()
+    return strings
+
 
 def is_ascii_char(b: bytes, padding_allowed: bool = False) -> int:
-    """Check if a byte represents a printable ASCII character."""
-    o = ord(b)
     if padding_allowed:
-        return 1 if (31 < o < 127) or o == 0 else 0
+        if (ord(b) < 127 and ord(b) > 31) or ord(b) == 0:
+            return 1
     else:
-        return 1 if 31 < o < 127 else 0
+        if ord(b) < 127 and ord(b) > 31:
+            return 1
+    return 0
 
 
 def is_ascii_string(string: bytes, padding_allowed: bool = False) -> int:
-    """Check if a byte string contains only printable ASCII characters."""
-    for b in (i.to_bytes(1, sys.byteorder) for i in string):
-        if not is_ascii_char(b, padding_allowed):
-            return 0
+    for b in [i.to_bytes(1, sys.byteorder) for i in string]:
+        if padding_allowed:
+            if not ((ord(b) < 127 and ord(b) > 31) or ord(b) == 0):
+                return 0
+        else:
+            if not (ord(b) < 127 and ord(b) > 31):
+                return 0
     return 1
 
 
 def is_base_64(s: str) -> bool:
-    """Check if a string is a valid Base64 encoded string."""
     return (len(s) % 4 == 0) and re.match(r"^[A-Za-z0-9+/]+[=]{0,2}$", s) is not None
 
 
 def is_hex_encoded(s: str, check_length: bool = True) -> bool:
-    """Check if a string is hex encoded."""
     if re.match(r"^[A-Fa-f0-9]+$", s):
-        return len(s) % 2 == 0 if check_length else True
+        if check_length:
+            return len(s) % 2 == 0
+        return True
     return False
 
+
+def extract_strings(file_data: bytes) -> List[str]:
+    """Faster string extraction using precompiled regexes (ASCII, wide, hex candidates).
+    This replaces the older multi-pass approach and aims to reduce duplicate
+    decoding/reads. It returns a de-duplicated list of strings (order preserved).
+    """
+    results: List[str] = []
+    seen = set()
+    try:
+        # ASCII matches
+        for m in ASCII_RE.findall(file_data):
+            try:
+                s = m.decode('utf-8', errors='ignore')
+            except Exception:
+                s = str(m)
+            if s and s not in seen:
+                seen.add(s)
+                results.append(s)
+
+        # UTF-16LE wide matches
+        for m in WIDE_RE.findall(file_data):
+            try:
+                s = m.decode('utf-16le', errors='ignore')
+            except Exception:
+                try:
+                    s = m.decode('utf-8', errors='ignore')
+                except Exception:
+                    s = str(m)
+            if s and s not in seen:
+                seen.add(s)
+                results.append(s)
+
+        # Hex candidate matches -> try to extract readable sequences
+        for m in HEX_CAND_RE.findall(file_data):
+            try:
+                if isinstance(m, bytes):
+                    hex_bytes = m
+                else:
+                    hex_bytes = m.encode()
+                hex_strings = extract_hex_strings(hex_bytes)
+                for hs in hex_strings:
+                    if hs and hs not in seen:
+                        seen.add(hs)
+                        results.append(hs)
+            except Exception:
+                continue
+
+    except Exception:
+        logging.debug("Error extracting strings (regex path)", exc_info=True)
+    return results
+
+
+def extract_opcodes(file_data: bytes) -> list:
+    opcodes = []
+    try:
+        binary = lief.parse(file_data)
+        ep = binary.entrypoint
+        text = None
+        if isinstance(binary, lief.PE.Binary):
+            for sec in binary.sections:
+                try:
+                    if (
+                        sec.virtual_address + binary.imagebase
+                        <= ep
+                        < sec.virtual_address + binary.imagebase + sec.virtual_size
+                    ):
+                        content = sec.content
+                        if isinstance(content, (bytes, bytearray)):
+                            text = bytes(content)
+                        else:
+                            text = bytes(content)
+                        break
+                except Exception:
+                    continue
+        elif isinstance(binary, lief.ELF.Binary):
+            for sec in binary.sections:
+                try:
+                    if sec.virtual_address <= ep < sec.virtual_address + sec.size:
+                        content = sec.content
+                        if isinstance(content, (bytes, bytearray)):
+                            text = bytes(content)
+                        else:
+                            text = bytes(content)
+                        break
+                except Exception:
+                    continue
+
+        if text is not None:
+            text_parts = re.split(b"[\x00]{3,}", text)
+            for text_part in text_parts:
+                if text_part == b"" or len(text_part) < 8:
+                    continue
+                opcodes.append(
+                    binascii.hexlify(text_part[:16]).decode(encoding="ascii")
+                )
+    except Exception:
+        logging.debug("Opcode extraction failed", exc_info=True)
+    return opcodes
+
+
+def get_pe_info(file_data: bytes) -> tuple:
+    imphash = ""
+    exports: list = []
+    try:
+        if not file_data or file_data[:2] != b"MZ":
+            return imphash, exports
+    except Exception:
+        return imphash, exports
+
+    binary = None
+    try:
+        binary = lief.parse(file_data)
+    except Exception:
+        try:
+            binary = lief.parse(list(file_data))
+        except Exception:
+            binary = None
+
+    if binary is None:
+        return imphash, exports
+
+    try:
+        try:
+            imphash = lief.PE.get_imphash(binary, lief.PE.IMPHASH_MODE.PEFILE)
+        except Exception:
+            try:
+                imphash = binary.imphash
+            except Exception:
+                imphash = ""
+        if imphash is None:
+            imphash = ""
+    except Exception:
+        imphash = ""
+
+    try:
+        expobj = None
+        try:
+            expobj = binary.get_export()
+        except Exception:
+            expobj = None
+
+        if expobj:
+            for entry in getattr(expobj, "entries", []) or []:
+                try:
+                    name = entry.name
+                    if name is None:
+                        continue
+                    if isinstance(name, (bytes, bytearray)):
+                        exports.append(name.decode("utf-8", errors="ignore"))
+                    else:
+                        exports.append(str(name))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    return imphash, exports
+
+
 def calculate_entropy(path: str) -> float:
-    """Calculate Shannon entropy for a file."""
     freq = [0] * 256
     total = 0
     try:
@@ -200,614 +408,1341 @@ def calculate_entropy(path: str) -> float:
                     p = f / total
                     entropy -= p * math.log2(p)
         return entropy
-    except Exception as e:
-        logging.debug("Entropy calc failed for %s: %s", path, e, exc_info=True)
+    except Exception:
+        logging.debug("Entropy calc failed for %s", path, exc_info=True)
         return 0.0
 
-def is_likely_word(s: str) -> bool:
-    """Return True if string is at least 3 chars and exists in NLTK words."""
-    if not nltk_words:
-        return False
-    return len(s) >= 3 and s.lower() in nltk_words
-
-
-# =============================================================================
-# DATABASE MANAGEMENT FUNCTIONS
-# =============================================================================
 
 def load_good_dbs(db_path="./dbs", use_opcodes: bool = False):
     """
-    Loads all known-good DBs safely and populates global containers.
-    - Handles gzipped, plain json, and plain text line formats.
-    - Populates 'good_strings_db' as a Counter for weighted scoring.
-    - Populates other DBs as sets for fast membership checking.
+    Loads all known-good DBs safely and normalizes them for matching.
+    `use_opcodes` controls whether opcode DB files are processed.
     """
-    global good_strings_db, good_opcodes_db, good_imphashes_db, good_exports_db
-    good_strings_db, good_opcodes_db, good_imphashes_db, good_exports_db = Counter(), set(), set(), set()
+    global good_opcodes_db, base64strings, hexEncStrings, reversedStrings
+    global KNOWN_IMPHASHES, KNOWN_EXPORTS
+
+    # Clear and initialize globals
+    good_opcodes_db = set()
+    base64strings = set()
+    hexEncStrings = set()
+    reversedStrings = set()
+    KNOWN_IMPHASHES = set()
+    KNOWN_EXPORTS = set()
 
     if not os.path.exists(db_path):
-        logging.warning("Database path does not exist, skipping DB load: %s", db_path)
+        logging.warning("Database path does not exist: %s", db_path)
         return
 
     files = sorted(glob.glob(os.path.join(db_path, "*.db")))
-    if not files:
-        logging.warning("No .db files found in %s", db_path)
-        return
+    skipped = []
+    loaded_count = 0
 
-    print(f"Loading databases from: {db_path}")
+    logging.info("Attempting to load good DBs from: %s", db_path)
+    print(f"Found {len(files)} database files in {db_path}")
+
     for p in files:
         bn = os.path.basename(p).lower()
+        logging.info("Processing DB file: %s", bn)
+        print(f"Loading: {bn}")
+
+        # Skip opcode DBs unless explicitly requested
         if "opcodes" in bn and not use_opcodes:
+            skipped.append(p)
+            logging.info("Skipping opcode DB (use_opcodes=False): %s", bn)
+            print(f"  -> Skipping opcode DB (use_opcodes=False)")
             continue
 
-        db_data = None
         try:
-            with gzip.open(p, "rt", encoding="utf-8", errors="ignore") as f:
-                content = f.read()
-                try:
-                    db_data = json.loads(content)
-                except json.JSONDecodeError:
-                    db_data = [line for line in content.splitlines() if line.strip()]
-        except (gzip.BadGzipFile, IOError, EOFError):
+            # Try multiple loading strategies
+            db_data = None
+            load_method = "unknown"
+
+            # Strategy 1: Gzipped JSON
             try:
-                with open(p, "r", encoding="utf-8", errors="ignore") as f:
-                    content = f.read()
-                    try:
+                with gzip.open(p, "rt", encoding="utf-8", errors="ignore") as f:
+                    content = f.read().strip()
+                    if content.startswith('[') or content.startswith('{'):
                         db_data = json.loads(content)
-                    except json.JSONDecodeError:
-                        db_data = [line for line in content.splitlines() if line.strip()]
+                        load_method = "gzipped_json"
+                    else:
+                        # Plain text lines in gzip
+                        db_data = [line.strip() for line in content.split('\n') if line.strip()]
+                        load_method = "gzipped_lines"
+                print(f"  -> Loaded as {load_method}")
+            except Exception:
+                # Strategy 2: Regular JSON
+                try:
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read().strip()
+                        if content.startswith('[') or content.startswith('{'):
+                            db_data = json.loads(content)
+                            load_method = "regular_json"
+                        else:
+                            # Plain text lines
+                            db_data = [line.strip() for line in content.split('\n') if line.strip()]
+                            load_method = "plain_lines"
+                    print(f"  -> Loaded as {load_method}")
+                except Exception:
+                    # Strategy 3: Binary read and try to decode
+                    try:
+                        with open(p, "rb") as f:
+                            raw_data = f.read()
+                            try:
+                                # Try UTF-8
+                                content = raw_data.decode('utf-8', errors='ignore').strip()
+                            except:
+                                # Try latin-1 as fallback
+                                content = raw_data.decode('latin-1', errors='ignore').strip()
+
+                            if content.startswith('[') or content.startswith('{'):
+                                db_data = json.loads(content)
+                                load_method = "binary_json"
+                            else:
+                                db_data = [line.strip() for line in content.split('\n') if line.strip()]
+                                load_method = "binary_lines"
+                        print(f"  -> Loaded as {load_method}")
+                    except Exception as e:
+                        logging.error("All load methods failed for %s: %s", p, e)
+                        print(f"  -> FAILED to load: {e}")
+                        skipped.append(p)
+                        continue
+
+            if not db_data:
+                logging.warning("No data loaded from %s", p)
+                print(f"  -> WARNING: No data found")
+                skipped.append(p)
+                continue
+
+            # Handle different data structures
+            if isinstance(db_data, dict):
+                items = list(db_data.keys())
+            elif isinstance(db_data, list):
+                items = db_data
+            else:
+                logging.error("Unexpected data type in %s: %s", p, type(db_data))
+                print(f"  -> ERROR: Unexpected data type: {type(db_data)}")
+                skipped.append(p)
+                continue
+
+            items_processed = 0
+
+            # Normalize DB contents based on type
+            if "opcodes" in bn:
+                for op in items:
+                    if isinstance(op, str) and op.strip():
+                        good_opcodes_db.add(op.lower().strip())
+                        items_processed += 1
+
+            elif "imphashes" in bn:
+                for imp in items:
+                    if isinstance(imp, str) and imp.strip():
+                        KNOWN_IMPHASHES.add(imp.lower().strip())
+                        items_processed += 1
+
+            elif "exports" in bn:
+                for exp in items:
+                    if isinstance(exp, str) and exp.strip():
+                        KNOWN_EXPORTS.add(exp.lower().strip())
+                        items_processed += 1
+
+            elif "strings" in bn:
+                for s in items:
+                    if not isinstance(s, str) or not s.strip():
+                        continue
+
+                    s = s.strip()
+                    s_l = s.lower()
+
+                    # Classify and store strings
+                    if len(s) >= 6:  # Only process strings of reasonable length
+                        if is_base_64(s):
+                            base64strings.add(s)
+                            base64strings.add(s_l)
+                            items_processed += 1
+                        elif is_hex_encoded(re.sub(r"[^0-9a-fA-F]", "", s), check_length=False):
+                            hexEncStrings.add(s)
+                            hexEncStrings.add(s_l)
+                            items_processed += 1
+                        else:
+                            # Store as reversed strings (normal strings stored in reverse for matching)
+                            reversedStrings.add(s[::-1])
+                            reversedStrings.add(s_l[::-1])
+                            items_processed += 1
+
+            loaded_count += 1
+            print(f"  -> Successfully processed: {items_processed} items")
+            logging.info("Successfully processed %s: %d items loaded", bn, items_processed)
+
+        except Exception as e:
+            logging.error("Failed to process DB file %s: %s", p, e)
+            print(f"  -> ERROR processing file: {e}")
+            skipped.append(p)
+            continue
+
+    # Final summary
+    print(f"\n=== DATABASE LOADING SUMMARY ===")
+    print(f"Files processed: {loaded_count}")
+    print(f"Files skipped: {len(skipped)}")
+    print(f"Opcodes loaded: {len(good_opcodes_db)}")
+    print(f"Base64 strings loaded: {len(base64strings)}")
+    print(f"Hex strings loaded: {len(hexEncStrings)}")
+    print(f"Regular strings loaded: {len(reversedStrings)}")
+    print(f"Import hashes loaded: {len(KNOWN_IMPHASHES)}")
+    print(f"Exports loaded: {len(KNOWN_EXPORTS)}")
+    print("=" * 35)
+
+    logging.info(
+        "Loaded good DBs: opcodes=%d base64=%d hexEnc=%d strings=%d imphashes=%d exports=%d (files_loaded=%d skipped=%d)",
+        len(good_opcodes_db),
+        len(base64strings),
+        len(hexEncStrings),
+        len(reversedStrings),
+        len(KNOWN_IMPHASHES),
+        len(KNOWN_EXPORTS),
+        loaded_count,
+        len(skipped),
+    )
+
+    # Diagnostic output
+    if loaded_count == 0:
+        logging.error("No database files were successfully loaded!")
+        print("ERROR: No database files were successfully loaded!")
+    elif len(base64strings) == 0 and len(hexEncStrings) == 0 and len(reversedStrings) == 0:
+        logging.warning("String databases appear to be empty - check file formats and content")
+        print("WARNING: String databases appear to be empty")
+
+
+def is_likely_word(s: str) -> bool:
+    """Return True if string is at least 3 chars and exists in NLTK words."""
+    return len(s) >= 3 and s.lower() in nltk_words
+
+
+def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=None, debug=False):
+    """
+    Robust known-good DB matching with normalization.
+    - Detects empty DB sets and logs a clear error.
+    - Normalizes extracted strings into multiple candidate forms:
+      original, lower, nul-stripped, reversed, hex-cleaned, base64-trimmed.
+    - Returns percentage of matches (float).
+    """
+    global good_opcodes_db, base64strings, hexEncStrings, reversedStrings
+    global KNOWN_IMPHASHES, KNOWN_EXPORTS, USE_OPCODES
+
+    matches = 0
+    total_markers = 0
+    db_hits = {"opcodes": 0, "imphashes": 0, "exports": 0, "strings": 0}
+    debug_seen = []
+
+    # quick sanity: ensure DBs are present
+    if not (good_opcodes_db or base64strings or hexEncStrings or reversedStrings or KNOWN_IMPHASHES or KNOWN_EXPORTS):
+        logging.error("No good-* DBs loaded (all sets empty) — known_good_percent will be 0.0. Check ./dbs and load_good_dbs().")
+        if debug:
+            print("DEBUG: DB sets empty. Run update_databases() or place .db files in ./dbs and call load_good_dbs('./dbs').")
+        return 0.0
+
+    # --- OPCODES ---
+    try:
+        if USE_OPCODES and good_opcodes_db:
+            opcodes = extract_opcodes(file_data)
+            total_markers += len(opcodes)
+            for op in opcodes:
+                op_normalized = op.replace(" ", "").lower()
+                if op_normalized in good_opcodes_db:
+                    matches += 1
+                    db_hits["opcodes"] += 1
+                    if debug and len(debug_seen) < 25:
+                        debug_seen.append(("opcode", op))
+    except Exception as e:
+        logging.debug("Opcode check failed for %s: %s", path, e)
+
+    # --- IMPORT HASHES & EXPORTS ---
+    try:
+        imphash, exports = get_pe_info(file_data)
+    except Exception:
+        imphash, exports = None, []
+
+    try:
+        if KNOWN_IMPHASHES and imphash:
+            total_markers += 1
+            if imphash.lower() in KNOWN_IMPHASHES:
+                matches += 1
+                db_hits["imphashes"] += 1
+                if debug and len(debug_seen) < 25:
+                    debug_seen.append(("imphash", imphash))
+    except Exception as e:
+        logging.debug("IMPHASH check failed for %s: %s", path, e)
+
+    try:
+        if KNOWN_EXPORTS and exports:
+            total_markers += len(exports)
+            for e in exports:
+                try:
+                    if not e:
+                        continue
+                    e_norm = e.lower()
+                    if e_norm in KNOWN_EXPORTS:
+                        matches += 1
+                        db_hits["exports"] += 1
+                        if debug and len(debug_seen) < 25:
+                            debug_seen.append(("export", e))
+                except Exception:
+                    continue
+    except Exception as e:
+        logging.debug("Export check failed for %s: %s", path, e)
+
+    # --- STRINGS ---
+    try:
+        strings = precomputed_strings or extract_strings(file_data)
+        if strings:
+            total_markers += len(strings)
+
+            for s in strings:
+                # normalize to python str
+                try:
+                    if isinstance(s, bytes):
+                        s0 = s.decode("utf-8", errors="ignore")
+                    else:
+                        s0 = str(s)
+                except Exception:
+                    s0 = str(s)
+
+                s0 = s0.strip()
+                if not s0:
+                    continue
+
+                # Prepare candidates
+                cand = set()
+                cand.add(s0)
+                cand.add(s0.lower())
+                # nul/utf16 noise removed
+                s_nul = s0.replace("\x00", "")
+                if s_nul:
+                    cand.add(s_nul)
+                    cand.add(s_nul.lower())
+                # reversed forms
+                cand.add(s0[::-1])
+                cand.add(s0[::-1].lower())
+                if s_nul:
+                    cand.add(s_nul[::-1])
+                    cand.add(s_nul[::-1].lower())
+                # hex-clean (only digits A-F)
+                hex_clean = re.sub(r'[^0-9a-fA-F]', '', s0)
+                if hex_clean:
+                    cand.add(hex_clean)
+                    cand.add(hex_clean.lower())
+                # base64 trim padding
+                b64_trim = s0.rstrip("=")
+                if b64_trim:
+                    cand.add(b64_trim)
+                    cand.add(b64_trim.lower())
+
+                matched = False
+
+                # base64 DB check
+                if base64strings:
+                    for c in (cand if cand else []):
+                        if c in base64strings or c.lower() in base64strings:
+                            matches += 1
+                            db_hits["strings"] += 1
+                            matched = True
+                            if debug and len(debug_seen) < 25:
+                                debug_seen.append(("base64", s0))
+                            break
+                if matched:
+                    continue
+
+                # hex DB check
+                if hexEncStrings:
+                    # prefer hex_clean for this
+                    if hex_clean and (hex_clean in hexEncStrings or hex_clean.lower() in hexEncStrings):
+                        matches += 1
+                        db_hits["strings"] += 1
+                        if debug and len(debug_seen) < 25:
+                            debug_seen.append(("hex", s0))
+                        continue
+                    for c in cand:
+                        if c in hexEncStrings or c.lower() in hexEncStrings:
+                            matches += 1
+                            db_hits["strings"] += 1
+                            if debug and len(debug_seen) < 25:
+                                debug_seen.append(("hex_any", s0))
+                            matched = True
+                            break
+                    if matched:
+                        continue
+
+                # reversed / normal string DB check
+                if reversedStrings:
+                    for c in cand:
+                        # reversedStrings in your loader is stored reversed and maybe lowercased.
+                        if c in reversedStrings or c.lower() in reversedStrings:
+                            matches += 1
+                            db_hits["strings"] += 1
+                            if debug and len(debug_seen) < 25:
+                                debug_seen.append(("rev_or_norm", s0))
+                            matched = True
+                            break
+                    if matched:
+                        continue
+
+                # final fallback: direct membership check against any string DB
+                for c in cand:
+                    if c in base64strings or c in hexEncStrings or c in reversedStrings:
+                        matches += 1
+                        db_hits["strings"] += 1
+                        if debug and len(debug_seen) < 25:
+                            debug_seen.append(("fallback", s0))
+                        matched = True
+                        break
+
+    except Exception as e:
+        logging.debug("String check failed for %s: %s", path, e)
+
+    # compute percent
+    percent = 0.0 if total_markers == 0 else round((matches / total_markers) * 100.0, 2)
+
+    # useful debug/logging
+    if debug or percent > 1.0 or db_hits["strings"] > 0:
+        logging.debug(
+            "Goodware match stats for %s: opcodes=%d, imphashes=%d, exports=%d, strings=%d, total=%d, percent=%.2f%%",
+            path, db_hits["opcodes"], db_hits["imphashes"], db_hits["exports"], db_hits["strings"],
+            matches, percent
+        )
+        if debug and debug_seen:
+            logging.debug("Sample matches (first 25): %s", debug_seen)
+            print("DEBUG sample matches:", debug_seen)
+
+    return percent
+
+def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
+    """
+    Capstone analysis with safety guards:
+      - caps max bytes disassembled per section to avoid CS_ERR_MEM
+      - always returns a dict (never None)
+      - catches Capstone errors and returns them in analysis['error']
+    """
+    analysis = {
+        "overall_analysis": {
+            "total_instructions": 0,
+            "add_count": 0,
+            "mov_count": 0,
+            "is_likely_packed": None,
+        },
+        "sections": {},
+        "error": None,
+    }
+
+    try:
+        if not capstone_module:
+            analysis["error"] = "capstone module not available"
+            return analysis
+
+        # choose architecture
+        if getattr(pe, "FILE_HEADER", None) and getattr(pe.FILE_HEADER, "Machine", None) == 0x014C:
+            md = capstone_module.Cs(capstone_module.CS_ARCH_X86, capstone_module.CS_MODE_32)
+        elif getattr(pe, "FILE_HEADER", None) and getattr(pe.FILE_HEADER, "Machine", None) == 0x8664:
+            md = capstone_module.Cs(capstone_module.CS_ARCH_X86, capstone_module.CS_MODE_64)
+        else:
+            analysis["error"] = "Unsupported architecture."
+            return analysis
+
+        # Safety: cap bytes per section to avoid OOM (tune as needed)
+        MAX_SECTION_BYTES = 256 * 1024  # 256 KB per section
+
+        total_add_count = 0
+        total_mov_count = 0
+        grand_total_instructions = 0
+
+        for section in pe.sections:
+            try:
+                section_name = section.Name.decode(errors="ignore").strip("\x00")
+            except Exception:
+                section_name = str(getattr(section, "Name", "unknown"))
+
+            try:
+                code = section.get_data()
+            except Exception:
+                code = b""
+
+            if not code:
+                analysis["sections"][section_name] = {
+                    "instruction_counts": {},
+                    "total_instructions": 0,
+                    "add_count": 0,
+                    "mov_count": 0,
+                    "is_likely_packed": False,
+                }
+                continue
+
+            # Trim oversized sections to avoid Capstone OOMs
+            if len(code) > MAX_SECTION_BYTES:
+                code = code[:MAX_SECTION_BYTES]
+
+            base_address = 0
+            try:
+                base_address = pe.OPTIONAL_HEADER.ImageBase + section.VirtualAddress
+            except Exception:
+                # fallback if OPTIONAL_HEADER missing / broken
+                base_address = section.VirtualAddress if hasattr(section, "VirtualAddress") else 0
+
+            instruction_counts = {}
+            total_instructions_in_section = 0
+
+            try:
+                instructions = md.disasm(code, base_address)
+                for i in instructions:
+                    mnemonic = getattr(i, "mnemonic", None)
+                    if not mnemonic:
+                        continue
+                    instruction_counts[mnemonic] = instruction_counts.get(mnemonic, 0) + 1
+                    total_instructions_in_section += 1
             except Exception as e:
-                logging.error("Failed to load DB file %s: %s", p, e)
+                # Capstone error for this section: record and continue
+                logging.debug("Capstone section disasm failed for %s: %s", section_name, e)
+                analysis["sections"][section_name] = {
+                    "instruction_counts": {},
+                    "total_instructions": 0,
+                    "add_count": 0,
+                    "mov_count": 0,
+                    "is_likely_packed": False,
+                }
                 continue
-        except Exception as e:
-            logging.error("Unhandled error loading DB file %s: %s", p, e)
-            continue
-        
-        if not db_data:
-            continue
 
-        items = db_data if isinstance(db_data, list) else list(db_data.items())
+            add_count = instruction_counts.get("add", 0)
+            mov_count = instruction_counts.get("mov", 0)
 
-        if "strings" in bn:
-            # For strings, we need the counts for scoring, so use a Counter
-            good_strings_db.update(dict(items) if isinstance(db_data, dict) else {i: 1 for i in items})
-        elif "opcodes" in bn:
-            good_opcodes_db.update(k for k,v in items) if isinstance(db_data, dict) else good_opcodes_db.update(items)
-        elif "imphashes" in bn:
-            good_imphashes_db.update(k for k,v in items) if isinstance(db_data, dict) else good_imphashes_db.update(items)
-        elif "exports" in bn:
-            good_exports_db.update(k for k,v in items) if isinstance(db_data, dict) else good_exports_db.update(items)
+            total_add_count += add_count
+            total_mov_count += mov_count
+            grand_total_instructions += total_instructions_in_section
 
-    logging.info(f"DBs loaded: {len(good_strings_db)} strings, {len(good_opcodes_db)} opcodes, "
-                 f"{len(good_imphashes_db)} imphashes, {len(good_exports_db)} exports.")
-    print(f"DBs loaded successfully.")
+            analysis["sections"][section_name] = {
+                "instruction_counts": instruction_counts,
+                "total_instructions": total_instructions_in_section,
+                "add_count": add_count,
+                "mov_count": mov_count,
+                "is_likely_packed": (add_count > mov_count if total_instructions_in_section > 0 else False),
+            }
 
+        analysis["overall_analysis"]["total_instructions"] = grand_total_instructions
+        analysis["overall_analysis"]["add_count"] = total_add_count
+        analysis["overall_analysis"]["mov_count"] = total_mov_count
+        analysis["overall_analysis"]["is_likely_packed"] = (
+            total_add_count > total_mov_count if grand_total_instructions > 0 else False
+        )
 
-def update_databases(force: bool = False, db_dir: str = "./dbs", use_opcodes: bool = False):
-    """Download yarGen DBs from the repository."""
-    os.makedirs(db_dir, exist_ok=True)
-    for filename, repo_url in REPO_URLS.items():
-        if "opcodes" in filename and not use_opcodes:
-            continue
-        out_path = os.path.join(db_dir, filename)
-        if os.path.exists(out_path) and not force:
-            continue
-        try:
-            print(f"Downloading {filename}...")
-            with urllib.request.urlopen(repo_url, timeout=30) as response, open(out_path, "wb") as out_file:
-                shutil.copyfileobj(response, out_file)
-            logging.info("Saved DB: %s", out_path)
-        except Exception as e:
-            logging.exception("Error downloading %s: %s", filename, e)
+    except Exception as exc:
+        logging.error("Capstone disassembly failed: %s", exc)
+        analysis["error"] = str(exc)
+
+    return analysis
+
+# --- WinVerifyTrust / Authenticode functions (unchanged) ---
+class CERT_CONTEXT(ctypes.Structure):
+    _fields_ = [
+        ("dwCertEncodingType", wintypes.DWORD),
+        ("pbCertEncoded", ctypes.POINTER(ctypes.c_byte)),
+        ("cbCertEncoded", wintypes.DWORD),
+        ("pCertInfo", ctypes.c_void_p),
+        ("hCertStore", ctypes.c_void_p),
+    ]
 
 
-# =============================================================================
-# CORE FILE ANALYSIS FUNCTIONS (string/opcode/PE extraction)
-# =============================================================================
+PCCERT_CONTEXT = ctypes.POINTER(CERT_CONTEXT)
 
-def extract_hex_strings(s: bytes) -> List[bytes]:
-    """yarGen's hex string extraction logic."""
-    strings = []
-    hex_strings = HEX_CAND_RE.findall(s)
-    for string in list(hex_strings):
-        hex_strings += string.split(b'0000')
-        hex_strings += string.split(b'0d0a')
-    hex_strings = list(set(hex_strings))
-    for string in hex_strings:
-        for x in string.split(b'00'):
-            if len(x) > 10:
-                strings.append(x)
-    for string in hex_strings:
-        try:
-            if len(string) % 2 != 0 or len(string) < 8 or b'0000' in string:
-                continue
-            dec = string.replace(b'00', b'')
-            if is_ascii_string(dec, padding_allowed=False):
-                strings.append(string)
-        except Exception:
-            pass
-    return strings
-
-def extract_strings(file_data: bytes) -> List[str]:
-    """Extracts ASCII, UTF-16LE, and hex-encoded strings from file data."""
-    cleaned_strings = set()
-    if not file_data:
-        return []
-
-    # ASCII and hex
-    strings_full = ASCII_RE.findall(file_data)
-    strings_hex = extract_hex_strings(file_data)
-    
-    # UTF-16LE
-    wide_strings_raw = WIDE_RE.findall(file_data)
-
-    all_byte_strings = set(strings_full) | set(strings_hex)
-
-    for string in all_byte_strings:
-        try:
-            s = string.replace(b'\\', b'\\\\').replace(b'"', b'\\"')
-            cleaned_strings.add(s.decode('utf-8', errors='ignore'))
-        except Exception:
-            pass
-
-    for ws in wide_strings_raw:
-        try:
-            # Prepend marker for scoring logic to identify wide strings
-            decoded_ws = ws.decode('utf-16le', errors='ignore')
-            cleaned_strings.add(f"UTF16LE:{decoded_ws}")
-        except Exception:
-            pass
-            
-    return list(cleaned_strings)
-
-def extract_opcodes(file_data: bytes) -> List[str]:
-    """Extracts opcodes from the entry point section of a PE/ELF file."""
-    if not lief:
-        return []
-    opcodes = []
-    try:
-        binary = lief.parse(list(file_data)) # Use list(file_data) for better parsing resilience
-        if not binary:
-            return []
-            
-        ep = binary.entrypoint
-        text = None
-
-        if isinstance(binary, lief.PE.Binary):
-            for sec in binary.sections:
-                if sec.virtual_address + binary.imagebase <= ep < sec.virtual_address + binary.imagebase + sec.size:
-                    text = bytes(sec.content)
-                    break
-        elif isinstance(binary, lief.ELF.Binary):
-            for sec in binary.sections:
-                if sec.virtual_address <= ep < sec.virtual_address + sec.size:
-                    text = bytes(sec.content)
-                    break
-        
-        if text:
-            text_parts = re.split(b"[\x00]{3,}", text)
-            for text_part in text_parts:
-                if len(text_part) >= 8:
-                    opcodes.append(binascii.hexlify(text_part[:16]).decode())
-    except Exception as e:
-        logging.debug("Opcode extraction failed: %s", e)
-    return opcodes
-
-
-def get_pe_info(file_data: bytes) -> tuple:
-    """Extracts Imphash and exports from a PE file."""
-    imphash, exports = "", []
-    if not lief or not file_data or file_data[:2] != b"MZ":
-        return imphash, exports
-    try:
-        binary = lief.parse(list(file_data))
-        if isinstance(binary, lief.PE.Binary):
-            imphash = lief.PE.get_imphash(binary, lief.PE.IMPHASH_MODE.PEFILE)
-            if binary.has_exports:
-                for entry in binary.exported_functions:
-                    if entry.name:
-                        exports.append(entry.name)
-    except Exception as e:
-        logging.debug("PE info extraction failed: %s", e)
-    return imphash or "", exports
-
-# =============================================================================
-# SIGNATURE AND CAPSTONE ANALYSIS (for Triage)
-# =============================================================================
 
 class WinVerifyTrust_GUID(ctypes.Structure):
     _fields_ = [
-        ("Data1", wintypes.DWORD), ("Data2", wintypes.WORD), ("Data3", wintypes.WORD),
-        ("Data4", ctypes.c_ubyte * 8)
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
     ]
 
+
 WINTRUST_ACTION_GENERIC_VERIFY_V2 = WinVerifyTrust_GUID(
-    0x00AAC56B, 0xCD44, 0x11D0,
-    (ctypes.c_ubyte * 8)(0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE)
+    0x00AAC56B,
+    0xCD44,
+    0x11D0,
+    (ctypes.c_ubyte * 8)(0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE),
 )
 
 class WINTRUST_FILE_INFO(ctypes.Structure):
     _fields_ = [
-        ("cbStruct", wintypes.DWORD), ("pcwszFilePath", wintypes.LPCWSTR),
-        ("hFile", wintypes.HANDLE), ("pgKnownSubject", ctypes.POINTER(WinVerifyTrust_GUID))
+        ("cbStruct", wintypes.DWORD),
+        ("pcwszFilePath", wintypes.LPCWSTR),
+        ("hFile", wintypes.HANDLE),
+        ("pgKnownSubject", ctypes.POINTER(WinVerifyTrust_GUID)),
     ]
+
+
+WORD   = ctypes.c_ushort     # 16-bit
+DWORD  = ctypes.c_uint32     # 32-bit unsigned
+BOOL   = ctypes.c_int        # 32-bit signed (BOOL in WinAPI)
+HANDLE = ctypes.c_void_p     # pointer-sized handle
+LPVOID = ctypes.c_void_p
 
 class WINTRUST_DATA(ctypes.Structure):
     _fields_ = [
-        ("cbStruct", wintypes.DWORD), ("pPolicyCallbackData", wintypes.LPVOID),
-        ("pSIPClientData", wintypes.LPVOID), ("dwUIChoice", wintypes.DWORD),
-        ("fdwRevocationChecks", wintypes.DWORD), ("dwUnionChoice", wintypes.DWORD),
-        ("pFile", ctypes.POINTER(WINTRUST_FILE_INFO)), ("dwStateAction", wintypes.DWORD),
-        ("hWVTStateData", wintypes.HANDLE), ("pwszURLReference", wintypes.LPCWSTR),
-        ("dwProvFlags", wintypes.DWORD), ("dwUIContext", wintypes.DWORD),
-        ("pSignatureSettings", wintypes.LPVOID)
+        ("cbStruct", wintypes.DWORD),
+        ("pPolicyCallbackData", ctypes.c_void_p),
+        ("pSIPClientData", ctypes.c_void_p),
+        ("dwUIChoice", wintypes.DWORD),
+        ("fdwRevocationChecks", wintypes.DWORD),
+        ("dwUnionChoice", wintypes.DWORD),
+        ("pFile", ctypes.POINTER(WINTRUST_FILE_INFO)),
+        ("dwStateAction", wintypes.DWORD),
+        ("hWVTStateData", wintypes.HANDLE),
+        ("pwszURLReference", wintypes.LPCWSTR),
+        ("dwProvFlags", wintypes.DWORD),
+        ("dwUIContext", wintypes.DWORD),
+        ("pSignatureSettings", ctypes.c_void_p),
     ]
 
+
+WTD_UI_NONE = 2
+WTD_REVOKE_NONE = 0
+WTD_CHOICE_FILE = 1
+WTD_STATEACTION_IGNORE = 0x00000000
+
+_wintrust = ctypes.windll.wintrust
+
+TRUST_E_NOSIGNATURE = 0x800B0100
+TRUST_E_SUBJECT_FORM_UNKNOWN = 0x800B0008
+TRUST_E_PROVIDER_UNKNOWN = 0x800B0001
+CERT_E_UNTRUSTEDROOT = 0x800B0109
+NO_SIGNATURE_CODES = {TRUST_E_NOSIGNATURE, TRUST_E_SUBJECT_FORM_UNKNOWN, TRUST_E_PROVIDER_UNKNOWN}
+
+
+def _build_wtd_for(file_path: str) -> WINTRUST_DATA:
+    """Internal helper to populate a WINTRUST_DATA for the given file."""
+    file_info = WINTRUST_FILE_INFO(
+        ctypes.sizeof(WINTRUST_FILE_INFO), file_path, None, None
+    )
+    wtd = WINTRUST_DATA()
+    ctypes.memset(ctypes.byref(wtd), 0, ctypes.sizeof(wtd))
+    wtd.cbStruct = ctypes.sizeof(WINTRUST_DATA)
+    wtd.dwUIChoice = WTD_UI_NONE
+    wtd.fdwRevocationChecks = WTD_REVOKE_NONE
+    wtd.dwUnionChoice = WTD_CHOICE_FILE
+    wtd.pFile = ctypes.pointer(file_info)
+    wtd.dwStateAction = WTD_STATEACTION_IGNORE
+    return wtd
+
+
+def verify_authenticode_signature(file_path: str) -> int:
+    wtd = _build_wtd_for(file_path)
+    return _wintrust.WinVerifyTrust(
+        None, ctypes.byref(WINTRUST_ACTION_GENERIC_VERIFY_V2), ctypes.byref(wtd)
+    )
+
+
 def check_valid_signature(file_path: str) -> dict:
-    """Uses WinVerifyTrust to check for a valid Authenticode signature."""
-    if sys.platform != 'win32':
-        return {"is_valid": False, "status": "Not on Windows"}
+    TRUST_E_BAD_DIGEST = 0x80096010
+    TRUST_E_CERT_SIGNATURE = 0x80096004
 
     try:
-        file_info = WINTRUST_FILE_INFO(
-            cbStruct=ctypes.sizeof(WINTRUST_FILE_INFO),
-            pcwszFilePath=file_path
-        )
-        wtd = WINTRUST_DATA(
-            cbStruct=ctypes.sizeof(WINTRUST_DATA),
-            dwUnionChoice=1, # WTD_CHOICE_FILE
-            pFile=ctypes.byref(file_info),
-            dwUIChoice=2, # WTD_UI_NONE
-            fdwRevocationChecks=0, # WTD_REVOKE_NONE
-            dwStateAction=0 # WTD_STATEACTION_IGNORE
-        )
-        
-        result = ctypes.windll.wintrust.WinVerifyTrust(
-            None, ctypes.byref(WINTRUST_ACTION_GENERIC_VERIFY_V2), ctypes.byref(wtd)
-        )
-        
-        if result == 0:
+        result = verify_authenticode_signature(file_path)
+        hresult = result & 0xFFFFFFFF
+
+        if hresult == 0:
             return {"is_valid": True, "status": "Valid"}
-        else:
-            return {"is_valid": False, "status": f"Invalid signature (Code: 0x{result & 0xFFFFFFFF:08X})"}
-    except Exception as e:
-        return {"is_valid": False, "status": f"Error: {e}"}
+        if hresult in NO_SIGNATURE_CODES:
+            return {"is_valid": False, "status": "No signature"}
+        if hresult == CERT_E_UNTRUSTEDROOT:
+            return {"is_valid": False, "status": "Untrusted root"}
+        if hresult == TRUST_E_BAD_DIGEST:
+            status = f"Fully invalid (bad digest / signature mismatch) (HRESULT=0x{hresult:08X})"
+            logging.warning("[Signature] %s: %s", file_path, status)
+            return {"is_valid": False, "status": status}
+        if hresult == TRUST_E_CERT_SIGNATURE:
+            status = f"Fully invalid (certificate signature verification failed) (HRESULT=0x{hresult:08X})"
+            logging.warning("[Signature] %s: %s", file_path, status)
+            return {"is_valid": False, "status": status}
 
-def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
-    """Performs disassembly with Capstone to find packing indicators."""
-    analysis = {"overall_analysis": {"is_likely_packed": False}, "error": None}
-    if not capstone_module or not pe:
-        return analysis
+        status = f"Invalid signature (HRESULT=0x{hresult:08X})"
+        logging.warning("[Signature] %s: %s", file_path, status)
+        return {"is_valid": False, "status": status}
 
+    except Exception as ex:
+        logging.error("[Signature] check failed for %s: %s", file_path, ex)
+        return {"is_valid": False, "status": str(ex)}
+
+
+def is_running_pe(path: str) -> bool:
     try:
-        machine = getattr(pe, "FILE_HEADER", None)
-        if machine and machine.Machine == 0x014C:
-             md = capstone_module.Cs(capstone_module.CS_ARCH_X86, capstone_module.CS_MODE_32)
-        elif machine and machine.Machine == 0x8664:
-             md = capstone_module.Cs(capstone_module.CS_ARCH_X86, capstone_module.CS_MODE_64)
-        else:
-            return analysis
+        for proc in psutil.process_iter(["exe", "name"]):
+            try:
+                exe = proc.info.get("exe")
+                if exe and os.path.normcase(exe) == os.path.normcase(path):
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except Exception:
+        pass
+    return False
 
-        total_add, total_mov = 0, 0
-        for section in pe.sections:
-            code = section.get_data()
-            if not code: continue
-            
-            # Simple heuristic: high add vs mov can indicate unpacking stub
-            add_count = code.count(b'\x01') + code.count(b'\x83\xc0') # ADD reg, imm; ADD eax, imm
-            mov_count = code.count(b'\x8b') + code.count(b'\xb8') # MOV reg, reg; MOV eax, imm
-            total_add += add_count
-            total_mov += mov_count
-        
-        if total_add > total_mov and total_mov > 0:
-             analysis["overall_analysis"]["is_likely_packed"] = True
 
-    except Exception as e:
-        analysis["error"] = str(e)
-    return analysis
-
-# =============================================================================
-# YARGEN SCORING ENGINE
-# =============================================================================
-
-def score_strings_yargen_style(strings: List[str], min_score_threshold: int = 0) -> Dict[str, Any]:
+# --- YarGen-like scoring and wrappers (unchanged) ---
+def _simple_yargen_scores(strings: List[str]) -> Dict[str, Any]:
     """
-    Analyzes a list of strings using yarGen's scoring logic.
-    Returns a dictionary with top strings, suspicious percentage, and status.
+    YarGen-inspired scoring with integration of filtering heuristics.
     """
-    global stringScores, base64strings, hexEncStrings, reversedStrings
-    stringScores, base64strings, hexEncStrings, reversedStrings = {}, {}, {}, {}
-
-    localStringScores = {}
-    suspicious_count = 0
-    
-    for s_orig in strings:
-        # yarGen's logic starts here
-        goodstring = False
-        goodcount = 0
-        
-        s = s_orig
-        if s.startswith("UTF16LE:"):
-            s = s[8:]
-
-        # Check against goodware DB
-        if s_orig in good_strings_db or s in good_strings_db:
-            goodstring = True
-            goodcount = good_strings_db.get(s_orig, 0) or good_strings_db.get(s, 0)
-        
-        score = (goodcount * -1) + 5 if goodstring else 0
-
-        # Heuristic scoring (simplified from yarGen for clarity)
-        if not goodstring:
-            if re.search(r'(shell|powershell|invoke|download|execute|payload|encrypt|inject|credential)', s, re.I): score += 4
-            if re.search(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b', s): score += 5
-            if re.search(r'([A-Za-z]:\\|%appdata%|/tmp/|/var/|system32)', s, re.I): score += 3
-            if re.search(r'\.(exe|dll|scr|bat|ps1|vbs)\b', s, re.I): score += 2
-            if re.search(r'(rat\b|meterpreter|metasploit|katz|mimikatz|backdoor|implant)', s, re.I): score += 5
-            if re.search(r'^(?:[A-Za-z0-9+/]{4}){10,}', s) and is_base_64(s): score += 6
-            if len(s) > 20 and is_hex_encoded(re.sub(r'[^0-9a-fA-F]', '', s), False): score += 4
-            if s[::-1] in good_strings_db:
-                score += 10
-                reversedStrings[s_orig] = s[::-1]
-
-        # Encoding detection
-        try:
-            if len(s) > 8:
-                for m_string in (s, s[1:], s[:-1], s + "=", s + "=="):
-                    if is_base_64(m_string):
-                        decoded = base64.b64decode(m_string, validate=True)
-                        if is_ascii_string(decoded, padding_allowed=True):
-                            score += 10
-                            base64strings[s_orig] = decoded
-                            break
-                if is_hex_encoded(s):
-                    decoded = bytes.fromhex(s)
-                    if is_ascii_string(decoded, padding_allowed=True):
-                        score += 8
-                        hexEncStrings[s_orig] = decoded
-        except Exception:
-            pass
-            
-        localStringScores[s_orig] = score
-        stringScores[s_orig] = score
-        if score >= min_score_threshold:
-            suspicious_count += 1
-            
-    # Compile results
-    total_strings = len(strings)
-    suspicious_percentage = (suspicious_count / total_strings) * 100.0 if total_strings > 0 else 0.0
-    
-    sorted_scores = sorted(localStringScores.items(), key=lambda kv: kv[1], reverse=True)
-    top_strings = [
-        {"string": s, "score": sc} for s, sc in sorted_scores if sc > min_score_threshold
-    ][:50]
-    
-    status = "Unknown/Generic"
-    if suspicious_percentage < 1 and total_strings > 100:
-        status = "Likely Clean (very low suspicious string ratio)"
-    elif suspicious_percentage > 30:
-        status = "Potentially Malicious (high ratio of suspicious strings)"
-
-    return {
-        "top_strings": top_strings,
-        "suspicious_percentage": suspicious_percentage,
-        "total_strings": total_strings,
-        "status": status,
+    analysis = {
+        "yargen_strings": [],
+        "yargen_suspicious_percentage": 0.0,
+        "total_strings": len(strings),
+        "status": "Not Analyzed",
+        "scores": {},
     }
 
+    try:
+        if not strings:
+            analysis["status"] = "No strings found"
+            return analysis
 
-# =============================================================================
-# MAIN FILE SCANNER LOGIC
-# =============================================================================
+        scores = {}
+        suspicious_count = 0
+        utfstrings = []
+
+        # Precompile frequently used regexes
+        ip_re = re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b')
+        base64_re = re.compile(r'^(?:[A-Za-z0-9+/]{4}){10,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$')
+        hexhash_re = re.compile(r'\b([a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})\b')
+        suspicious_keywords = re.compile(
+            r'(shell|powershell|invoke|download|execute|payload|encrypt|inject|token|credential|creds|net use|schtasks|rundll32|cmd\.exe|whoami|bitsadmin|Invoke-Expression)',
+            re.IGNORECASE
+        )
+
+        for s in strings:
+            original_string = s
+            score = 0.0
+
+            # UTF16LE handling
+            if s.startswith("UTF16LE:"):
+                s = s[8:]
+                utfstrings.append(s)
+
+            # Skip very short strings
+            if len(s) < 6:
+                scores[original_string] = score
+                continue
+
+            # Noise penalty
+            if re.fullmatch(r'[\-\_\.0-9]+', s) or len(set(s)) == 1:
+                score -= 5
+
+            # Keyword scoring
+            if suspicious_keywords.search(s):
+                score += 4
+
+            # Common malware phrases
+            if re.search(r'(bypass|encodedcommand|frombase64string|memoryloadlibrary|downloadfile|wget|curl|base64decode|execv|system32|appdata|%appdata%)', s, re.IGNORECASE):
+                score += 3
+
+            # IP address
+            if ip_re.search(s):
+                score += 5
+
+            # Base64 / Hex detection
+            if base64_re.match(s) or is_base_64(s):
+                score += 6
+            if is_hex_encoded(re.sub(r'[^0-9a-fA-F]', '', s), check_length=False):
+                score += 4
+            if hexhash_re.search(s):
+                score += 2
+
+            # File paths, registry, temp
+            if re.search(r'([A-Za-z]:\\|%appdata%|/tmp/|/var/)', s, re.IGNORECASE):
+                score += 3
+
+            # Executable references
+            if re.search(r'\.(exe|dll|scr|bat|ps1)\b', s, re.IGNORECASE):
+                score += 2
+
+            # RAT/malware keywords
+            if re.search(r'(rat\b|meterpreter|metasploit|katz|payload|reverse shell|bind shell|backdoor|implant)', s, re.IGNORECASE):
+                score += 5
+
+            # Credentials
+            if re.search(r'(password|passwd|token|auth|cookie|credential|creds|username|user|pass)', s, re.IGNORECASE):
+                score += 3
+
+            # Suspicious punctuation
+            if re.search(r'(-->|!!!|<<<|>>>)', s):
+                score += 2
+
+            # Likely dictionary word bonus
+            if is_likely_word(s) or any(w.isalpha() and len(w) >= 3 and w.lower() in nltk_words for w in re.split(r'\W+', s) if nltk_words):
+                score += 0.5
+
+            # High-entropy heuristic
+            non_alnum = sum(1 for ch in s if not ch.isalnum())
+            if len(s) > 12 and (non_alnum / len(s)) < 0.05 and len(set(s)) > (len(s) // 4):
+                score += 1.5
+
+            # Store final score
+            scores[original_string] = score
+            if score >= 4.0:
+                suspicious_count += 1
+
+        # Sort top suspicious strings
+        sorted_scores = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        top_strings = [t[0] for t in sorted_scores if t[1] > 0][:50]
+        suspicious_percentage = (suspicious_count / len(strings)) * 100.0
+
+        analysis.update({
+            "yargen_strings": top_strings,
+            "yargen_suspicious_percentage": suspicious_percentage,
+            "scores": dict(sorted_scores[:200]),
+        })
+
+        if suspicious_percentage < 1 and len(strings) > 100:
+            analysis["status"] = "Likely Clean (very low suspicious string ratio)"
+        elif suspicious_percentage > 30:
+            analysis["status"] = "Potentially Malicious (high ratio of suspicious strings)"
+        else:
+            analysis["status"] = "Unknown/Generic"
+
+    except Exception as exc:
+        logging.error("yarGen scoring failed: %s", exc)
+        analysis["status"] = f"Error during string analysis: {exc}"
+
+    return analysis
+
+
+def analyze_yargen_strings_from_list(strings: List[str]) -> Dict[str, Any]:
+    """
+    Wrapper to keep compatibility with original name. Uses the conservative yarGen-style scorer above.
+    """
+    return _simple_yargen_scores(strings)
 
 def analyze_single_file(path: str) -> dict:
     """
-    Analyzes a single file using a two-stage process: a lightweight triage
-    followed by a deep analysis for suspicious files.
+    Two-stage analysis: light-first, heavy-only-if-needed.
+    Ensures features['capstone_analysis'] is always a dict to avoid None.get errors.
     """
     features = {
-        "path": path, "size": 0, "is_executable": False,
-        "suspicious": False, "suspicious_score": 0,
-        "yargen_summary": {"status": "Not analyzed", "total_strings": 0},
-        "error": None
+        "path": path,
+        "entropy": 0.0,
+        "size": 0,
+        "is_executable": False,
+        "has_version_info": False,
+        "signature_valid": False,
+        "signature_status": "N/A",
+        "capstone_analysis": {},  # <- ensure default is dict
+        "is_running": False,
+        "age_days": 0,
+        "extension": "",
+        "suspicious_score": 0,
+        "suspicious": False,
+        "known_good_percent": 0.0,
+        "unknown": False,
+        "strings": [],  # populated only in heavy stage
+        "yargen_summary": {"status": "Not analyzed (light-pass)", "total_strings": 0},
     }
 
-    pe_obj = None
     try:
-        # --- Stage 1: Triage (Lightweight Checks) ---
-        stats = os.stat(path)
-        features["size"] = stats.st_size
-        if features["size"] < 100 or features["size"] > 20 * 1024 * 1024:
-            return features
+        # Basic FS stats (very cheap)
+        try:
+            stats = os.stat(path)
+            features["size"] = stats.st_size
+            features["age_days"] = (time.time() - stats.st_ctime) / (24 * 3600)
+        except Exception:
+            logging.debug("stat failed for %s", path, exc_info=True)
 
-        with open(path, "rb") as f:
-            header = f.read(2)
-        is_executable = features["is_executable"] = header == b'MZ'
+        # Entropy (chunked)
+        try:
+            features["entropy"] = calculate_entropy(path)
+        except Exception:
+            logging.debug("Entropy calc failed for %s", path, exc_info=True)
 
-        prelim_score = 0
-        signature_valid = False
-        
-        if is_executable:
-            sig = check_valid_signature(path)
-            signature_valid = sig.get("is_valid", False)
-            if not signature_valid:
-                prelim_score += 4 if "invalid" in sig.get("status", "").lower() else 2
-            
-            if pefile and capstone:
+        filename_lc = os.path.basename(path).lower()
+        ext = os.path.splitext(filename_lc)[1].lstrip(".")
+        features["extension"] = ext
+
+        # --- PE quick analysis ---
+        pe_obj = None
+        try:
+            if pefile:
                 try:
                     pe_obj = pefile.PE(path, fast_load=True)
-                    cap_analysis = analyze_with_capstone(pe_obj, capstone)
-                    if cap_analysis.get("overall_analysis", {}).get("is_likely_packed"):
-                        prelim_score += 3
-                finally:
-                    if pe_obj: pe_obj.close()
-        
-        entropy = calculate_entropy(path)
-        if entropy > 7.5:
-            prelim_score += 5 if not signature_valid else 2
+                    features["is_executable"] = True
+                    features["has_version_info"] = (
+                        hasattr(pe_obj, "VS_FIXEDFILEINFO") and pe_obj.VS_FIXEDFILEINFO is not None
+                    )
+                except Exception:
+                    # If PE parsing fails, keep going but mark as not executable
+                    logging.debug("pefile quick_load failed for %s", path, exc_info=True)
+                    features["is_executable"] = False
+                else:
+                    # Run capstone analysis but guard that result is a dict
+                    try:
+                        cap_res = analyze_with_capstone(pe_obj, capstone)
+                        if isinstance(cap_res, dict):
+                            features["capstone_analysis"] = cap_res
+                        else:
+                            # unexpected return type from analyzer -> use empty dict
+                            features["capstone_analysis"] = {}
+                            logging.debug("analyze_with_capstone returned non-dict for %s", path)
+                    except Exception as e:
+                        logging.debug("Capstone analysis raised for %s: %s", path, e, exc_info=True)
+                        features["capstone_analysis"] = {}
+        except Exception:
+            logging.debug("PE quick-check block failed for %s", path, exc_info=True)
+        finally:
+            if pe_obj:
+                try:
+                    pe_obj.close()
+                except Exception:
+                    pass
 
-        # --- Triage Gate ---
+        # Defensive fallback (in case something overwrote it)
+        if not isinstance(features.get("capstone_analysis"), dict):
+            features["capstone_analysis"] = {}
+
+        # Signature & running status
+        try:
+            if features["is_executable"]:
+                sig = check_valid_signature(path)
+                features["signature_valid"] = sig.get("is_valid", False)
+                features["signature_status"] = sig.get("status", "N/A")
+        except Exception:
+            logging.debug("Signature check failed for %s", path, exc_info=True)
+
+        try:
+            features["is_running"] = is_running_pe(path)
+        except Exception:
+            features["is_running"] = False
+
+        # ---------- LIGHTWEIGHT HEURISTICS (no strings) ----------
+        prelim_score = 0
+        capstone_obj = features.get("capstone_analysis") or {}
+        cap_analysis = capstone_obj.get("overall_analysis") or {}
+
+        if cap_analysis.get("is_likely_packed"):
+            prelim_score += 3
+        if features["entropy"] > 7.5:
+            prelim_score += 5 if not features["signature_valid"] else 2
+        if features["age_days"] < 1:
+            prelim_score += 2
+        if "temp" in path.lower() or "cache" in path.lower():
+            prelim_score += 2
+        if features["is_executable"] and not features["has_version_info"] and not features["signature_valid"]:
+            prelim_score += 1
+        if features["is_executable"] and not features["signature_valid"]:
+            prelim_score += 4 if features["signature_status"] == "Untrusted root" else 2
+        if features["is_running"]:
+            prelim_score += 3
+        if ext == "":
+            prelim_score += 2
+
+        # store prelim score
+        features["suspicious_score"] = prelim_score
+
+        # Tune this threshold if you want lighter/heavier filtering
         LIGHT_ANALYSIS_THRESHOLD = max(1, int(SUSPICIOUS_THRESHOLD / 2))
         if prelim_score < LIGHT_ANALYSIS_THRESHOLD:
-            features["yargen_summary"]["status"] = "Skipped (low triage score)"
+            features["suspicious"] = prelim_score >= SUSPICIOUS_THRESHOLD
+            features["yargen_summary"] = {
+                "status": "Not analyzed (light-pass, below threshold)",
+                "total_strings": 0,
+            }
             return features
 
-        # --- Stage 2: Deep Analysis (Heavy Checks) ---
-        with open(path, "rb") as fh:
-            file_bytes = fh.read()
-            
-        extracted_strings = extract_strings(file_bytes)
-        imphash, exports = get_pe_info(file_bytes)
+        # ---------- HEAVY STAGE ----------
+        file_bytes = b""
+        try:
+            with open(path, "rb") as fh:
+                file_bytes = fh.read()
+        except Exception:
+            logging.debug("Failed to read file bytes for heavy stage %s", path, exc_info=True)
 
-        # Goodware DB checks
-        score_adjustment = 0
-        if imphash and imphash in good_imphashes_db:
-             score_adjustment -= 10
-        if exports and any(e in good_exports_db for e in exports):
-             score_adjustment -= 5
-        
-        yargen_analysis = score_strings_yargen_style(extracted_strings)
-        features["yargen_summary"] = yargen_analysis
-        
-        # Final score calculation
-        final_score = prelim_score + score_adjustment
-        if yargen_analysis["suspicious_percentage"] > 30:
-            final_score += 5
-        elif yargen_analysis["suspicious_percentage"] > 10:
-            final_score += 2
-            
-        if USE_OPCODES and is_executable:
-            opcodes = extract_opcodes(file_bytes)
-            if opcodes:
-                unique_opcodes = set(opcodes)
-                bad_opcodes = len(unique_opcodes - good_opcodes_db)
-                if bad_opcodes > len(unique_opcodes) / 2:
-                    final_score += 3
+        extracted_strings = extract_strings(file_bytes) if file_bytes else []
+        features["strings"] = extracted_strings
 
-        features["suspicious_score"] = int(max(0, final_score))
-        if features["suspicious_score"] >= SUSPICIOUS_THRESHOLD:
-            features["suspicious"] = True
+        # Known-good DB percentage
+        try:
+            features["known_good_percent"] = check_against_good_dbs_percentage(
+                path, file_data=file_bytes, precomputed_strings=extracted_strings
+            )
+        except Exception:
+            logging.debug("known_good_percent check failed for %s", path, exc_info=True)
+
+        # Final score adjustments
+        score = prelim_score
+        if features["known_good_percent"] > 0:
+            reduction = score * min(features["known_good_percent"] / 100, 0.5)
+            score = max(score - reduction, 0)
+
+        features["suspicious_score"] = int(score)
+        features["suspicious"] = score >= SUSPICIOUS_THRESHOLD
+
+        if features["suspicious"]:
+            try:
+                features["yargen_summary"] = analyze_yargen_strings_from_list(extracted_strings)
+                yargen_pct = features["yargen_summary"].get("yargen_suspicious_percentage", 0)
+                if yargen_pct > 30:
+                    features["suspicious_score"] += 3
+            except Exception:
+                logging.debug("YarGen-like analysis failed for %s", path, exc_info=True)
+                features["yargen_summary"] = {"status": "Analysis failed", "total_strings": len(extracted_strings)}
+        else:
+            features["yargen_summary"] = {
+                "status": "Not analyzed (final score below suspicious threshold)",
+                "total_strings": len(extracted_strings),
+            }
+
+        if features["suspicious"]:
+            is_good = features["known_good_percent"] > 0
+            is_signed = features["signature_valid"]
+            features["unknown"] = not is_good and not is_signed
 
     except Exception as exc:
-        logging.error("Failed to analyze %s: %s", path, exc, exc_info=True)
+        logging.error("Failed to analyze %s: %s", path, exc)
         features["error"] = str(exc)
-    finally:
-        if pe_obj and not pe_obj.is_closed():
-            pe_obj.close()
-            
+
     return features
 
-
 def scan_directory_parallel(directory: str, max_workers: Optional[int] = None) -> List[Dict[str, Any]]:
-    """Scans a directory in parallel using a process pool."""
-    results = []
-    files = [os.path.join(root, f) for root, _, filenames in os.walk(directory) for f in filenames]
+    """
+    Scan a directory in parallel using ProcessPoolExecutor (one process per CPU by default).
+    Returns a list of feature dictionaries (same shape as before).
+    """
+    suspicious_results = []
+    files = []
+    for root, _, filenames in os.walk(directory):
+        for filename in filenames:
+            files.append(os.path.join(root, filename))
 
-    if not files:
-        print("No files found to scan.")
-        return []
+    total_files = len(files)
+    logging.info(
+        "Scanning directory (parallel with Processes): %s, total files=%d",
+        directory,
+        total_files,
+    )
 
+    # Default to CPU count if not provided
     workers = max_workers or os.cpu_count() or 1
+
+    # Use ProcessPoolExecutor (each analyze_single_file runs in its own process)
     with ProcessPoolExecutor(max_workers=workers) as executor:
         futures = {executor.submit(analyze_single_file, f): f for f in files}
-        
-        # Use tqdm for progress bar
-        for future in tqdm(as_completed(futures), total=len(files), desc="Scanning", unit="file"):
+        # Use as_completed to iterate as jobs finish
+        for future in tqdm(as_completed(futures),
+                           total=total_files,
+                           desc="Scanning",
+                           unit="file"):
             try:
                 result = future.result()
-                results.append(result)
+                if result.get("suspicious"):
+                    logging.warning(
+                        "Suspicious file detected: %s (score=%d, unknown=%s, known_good_percent=%.1f%%)",
+                        result["path"],
+                        result.get("suspicious_score", -1),
+                        result.get("unknown", False),
+                        result.get("known_good_percent", 0.0),
+                    )
+                suspicious_results.append(result)
             except Exception as e:
-                logging.error("Error processing file %s: %s", futures[future], e)
-    
-    return results
+                logging.error("Error during analysis of %s: %s", futures.get(future), e)
+
+    return suspicious_results
 
 
-# =============================================================================
-# MAIN EXECUTION
-# =============================================================================
+def generate_general_condition(file_info: dict):
+    conditions = []
+    pe_module_neccessary = False
+    try:
+        magic_headers = []
+        file_sizes = []
+        imphashes = []
+        for file_path in file_info:
+            if "magic" not in file_info[file_path]:
+                continue
+            magic = file_info[file_path]["magic"]
+            size = file_info[file_path]["size"]
+            imphash = file_info[file_path]["imphash"]
+
+            if magic not in magic_headers and magic != "":
+                magic_headers.append(magic)
+            if size not in file_sizes:
+                file_sizes.append(size)
+            if imphash not in imphashes and imphash != "":
+                imphashes.append(imphash)
+
+        if len(magic_headers) <= 5:
+            magic_string = " or ".join(get_uint_string(h) for h in magic_headers)
+            if " or " in magic_string:
+                conditions.append("( {0} )".format(magic_string))
+            else:
+                conditions.append("{0}".format(magic_string))
+
+        if len(file_sizes) > 0:
+            conditions.append(get_file_range(max(file_sizes)))
+
+        if len(imphashes) == 1:
+            conditions.append("pe.imphash() == \"{0}\"".format(imphashes[0]))
+            pe_module_neccessary = True
+
+        condition_string = " and ".join(conditions)
+    except Exception:
+        logging.exception("Error while generating general condition")
+        condition_string = ""
+    return condition_string, pe_module_neccessary
+
+
+def get_strings(string_elements):
+    strings = {
+        "ascii": [],
+        "wide": [],
+        "base64 encoded": [],
+        "hex encoded": [],
+        "reversed": [],
+    }
+    try:
+        _ = base64strings
+    except NameError:
+        base64strings = set()
+    try:
+        _ = hexEncStrings
+    except NameError:
+        hexEncStrings = set()
+    try:
+        _ = reversedStrings
+    except NameError:
+        reversedStrings = set()
+
+    for i, string in enumerate(string_elements):
+        try:
+            if isinstance(string, bytes):
+                string = string.decode("utf-8", errors="ignore")
+        except Exception:
+            pass
+
+        if string[:8] == "UTF16LE:":
+            string = string[8:]
+            strings["wide"].append(string)
+        elif string in base64strings:
+            strings["base64 encoded"].append(string)
+        elif string in hexEncStrings:
+            strings["hex encoded"].append(string)
+        elif string in reversedStrings:
+            strings["reversed"].append(string)
+        else:
+            strings["ascii"].append(string)
+
+    return strings
+
+
+def filter_opcode_set(opcode_set):
+    pref_opcodes = [" 34 ", "ff ff ff "]
+    useful_set = []
+    pref_set = []
+
+    for opcode in opcode_set:
+        if opcode in good_opcodes_db:
+            logging.debug("Skipping good opcode: %s", opcode)
+            continue
+
+        formatted_opcode = get_opcode_string(opcode)
+
+        set_in_pref = False
+        for pref in pref_opcodes:
+            if pref in formatted_opcode:
+                pref_set.append(formatted_opcode)
+                set_in_pref = True
+        if set_in_pref:
+            continue
+
+        useful_set.append(get_opcode_string(opcode))
+
+    useful_set = pref_set + useful_set
+    return useful_set[:50]
+
+
+def get_opcode_string(opcode):
+    return " ".join(opcode[i : i + 2] for i in range(0, len(opcode), 2))
+
+
+def get_uint_string(magic):
+    if len(magic) == 2:
+        return "uint8(0) == 0x{0}{1}".format(magic[0], magic[1])
+    if len(magic) == 4:
+        return "uint16(0) == 0x{2}{3}{0}{1}".format(
+            magic[0], magic[1], magic[2], magic[3]
+        )
+    return ""
+
+
+def get_file_range(size):
+    size_string = ""
+    try:
+        max_size_b = size * 1
+        if max_size_b < 1024:
+            max_size_b = 1024
+        max_size = int(max_size_b / 1024)
+        max_size_kb = max_size
+        if len(str(max_size)) == 2:
+            max_size = int(round(max_size, -1))
+        elif len(str(max_size)) == 3:
+            max_size = int(round(max_size, -2))
+        elif len(str(max_size)) == 4:
+            max_size = int(round(max_size, -3))
+        elif len(str(max_size)) >= 5:
+            max_size = int(round(max_size, -3))
+        size_string = "filesize < {0}KB".format(max_size)
+        logging.debug(
+            "File Size Eval: SampleSize (b): %s SizeWithMultiplier (b/Kb): %s / %s RoundedSize: %s",
+            str(size),
+            str(max_size_b),
+            str(max_size_kb),
+            str(max_size),
+        )
+    except Exception:
+        logging.exception("File range calc failed")
+    return size_string
+
+
+# -----------------------
+# Database update helper + Main execution
+# -----------------------
+
+def update_databases(force: bool = False, db_dir: str = "./dbs", use_opcodes: bool = False):
+    """Download REPO_URLS into db_dir.
+
+    - If force is False, only download missing files (resume-safe).
+    - If force is True, re-download all files.
+    - If use_opcodes is False, skip downloading files that contain 'opcodes' in the name.
+    """
+    try:
+        if not os.path.exists(db_dir):
+            os.makedirs(db_dir, exist_ok=True)
+    except Exception:
+        logging.exception("Error creating db dir %s", db_dir)
+        return
+
+    for filename, repo_url in REPO_URLS.items():
+        # Skip opcode files unless user specifically requested them
+        if "opcodes" in filename and not use_opcodes:
+            logging.info("Skipping download of opcode DB (use_opcodes=False): %s", filename)
+            continue
+
+        out_path = os.path.join(db_dir, filename)
+        if os.path.exists(out_path) and not force:
+            logging.info("DB already present, skipping: %s", out_path)
+            continue
+        try:
+            logging.info("Downloading %s from %s ...", filename, repo_url)
+            with urllib.request.urlopen(repo_url, timeout=30) as response, open(out_path, "wb") as out_file:
+                shutil.copyfileobj(response, out_file)
+            logging.info("Saved DB: %s", out_path)
+        except Exception:
+            logging.exception("Error downloading %s from %s", filename, repo_url)
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Unified file scanner with yarGen analysis engine.")
-    parser.add_argument(
-        "-m", "--malware-path",
-        dest="scan_path",
-        default=SCAN_FOLDER,
-        help=f"Path to scan for files (default: {SCAN_FOLDER}).",
-    )
+    parser = argparse.ArgumentParser(description="Parallel scanner (uses optional good-* DBs).")
     parser.add_argument(
         "--update-db",
         action="store_true",
-        help="Download/update goodware DB files into ./dbs before scanning.",
+        help="Download/update DB files from REPO_URLS into ./dbs before scanning (no other flags).",
     )
     parser.add_argument(
         "--use-opcodes",
         action="store_true",
-        help="Enable opcode extraction and DB checks (CPU-intensive).",
+        help="Enable opcode extraction and good-opcodes DB checks (CPU heavy). Default: OFF",
     )
-    parser.add_argument(
-        "-t", "--threshold",
-        type=int,
-        default=SUSPICIOUS_THRESHOLD,
-        help=f"Suspicion score threshold (default: {SUSPICIOUS_THRESHOLD})."
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Enable debug logging to console.",
-    )
+
     args = parser.parse_args()
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
+    # enable opcodes only if user explicitly asked — set this BEFORE loading DBs
+    USE_OPCODES = getattr(args, "use_opcodes", False)
 
-    # Set globals from args
-    USE_OPCODES = args.use_opcodes
-    SUSPICIOUS_THRESHOLD = args.threshold
-    SCAN_FOLDER = args.scan_path
+    logging.info("Starting file scan with Capstone analysis (parallel)...")
 
-    print("--- Unified File Scanner ---")
-    
-    # DB update and load
+    # DB update / load: only the single --update-db flag controls network activity.
     if args.update_db:
-        update_databases(force=True, use_opcodes=USE_OPCODES)
-    
-    load_good_dbs(use_opcodes=USE_OPCODES)
-    
-    # Run scan
-    print(f"Starting scan on directory: {SCAN_FOLDER}")
-    start_time = time.time()
-    all_results = scan_directory_parallel(SCAN_FOLDER)
-    end_time = time.time()
-    
-    suspicious_files = [r for r in all_results if r.get("suspicious")]
-    
-    # Print summary
-    print("\n--- Scan Summary ---")
-    print(f"Scan completed in {end_time - start_time:.2f} seconds.")
-    print(f"Total files scanned: {len(all_results)}")
-    print(f"Suspicious files found: {len(suspicious_files)}")
-    
-    if suspicious_files:
-        print("\n--- Top Suspicious Files ---")
-        # Sort by score, descending
-        suspicious_files.sort(key=lambda x: x.get('suspicious_score', 0), reverse=True)
-        
-        for res in suspicious_files[:20]: # Show top 20
-            yara_summary = res.get('yargen_summary', {})
-            print(f"\nPath: {res['path']}")
-            print(f"  Score: {res['suspicious_score']} (Threshold: {SUSPICIOUS_THRESHOLD})")
-            print(f"  String Analysis: {yara_summary.get('status', 'N/A')}")
-            print(f"    Suspicious Strings: {yara_summary.get('suspicious_percentage', 0.0):.1f}% of {yara_summary.get('total_strings', 0)}")
-            
-            top_strings = yara_summary.get('top_strings', [])
-            if top_strings:
-                print("    Top Scored Strings:")
-                for ts in top_strings[:3]:
-                     # Truncate long strings for display
-                    display_str = ts['string'].replace('\n', '\\n').replace('\r', '\\r')
-                    if len(display_str) > 80:
-                        display_str = display_str[:77] + "..."
-                    print(f"      - (Score: {ts['score']:.1f}) \"{display_str}\"")
+        try:
+            logging.info("Requested DB update: downloading into ./dbs (respecting use_opcodes).")
+            update_databases(force=False, db_dir="./dbs", use_opcodes=USE_OPCODES)
+            load_good_dbs("./dbs", use_opcodes=USE_OPCODES)
+        except Exception:
+            logging.exception("Failed to update/load good DBs")
+    else:
+        # Try to load DBs if present; do not attempt network activity.
+        try:
+            load_good_dbs("./dbs", use_opcodes=USE_OPCODES)
+        except Exception:
+            logging.exception("Failed to load good DBs")
 
-    print("\nScan finished. Check unified_scanner.log for detailed logs.")
+    # Run scan (always uses configured SCAN_FOLDER)
+    try:
+        results = scan_directory_parallel(SCAN_FOLDER)
+    except Exception as exc:
+        logging.error("Top-level parallel scan failed: %s", exc)
+        results = []
+
+    # Summarize suspicious results (store index instead of path for stable lookup)
+    suspicious_count = 0
+    top_offenders = []  # list of (score:int, idx:int)
+
+    for idx, res in enumerate(results):
+        try:
+            if res.get("suspicious", False):
+                suspicious_count += 1
+                try:
+                    score_val = int(res.get("suspicious_score", 0))
+                except Exception:
+                    score_val = 0
+                top_offenders.append((score_val, idx))
+        except Exception:
+            logging.debug("Bad result entry while summarizing: %s", res, exc_info=True)
+
+    # Sort descending by score (highest first)
+    top_offenders.sort(key=lambda x: x[0], reverse=True)
+
+    logging.info(
+        "Scan complete: %d files scanned, %d suspicious files found.",
+        len(results),
+        suspicious_count,
+    )
+
+    # Detailed logging for top offenders (defensive; lookup by index)
+    if top_offenders:
+        logging.info("--- Detailed Analysis of Top Suspicious Files ---")
+        for score, idx in top_offenders[:20]:
+            original_features = results[idx] if 0 <= idx < len(results) else {}
+            # defensive values
+            path = original_features.get("path") or "<unknown>"
+            logging.info("Path: %s (Initial Score: %d)", path, int(score or 0))
+
+            # Defensive capstone access
+            capstone_obj = original_features.get("capstone_analysis") or {}
+            overall = capstone_obj.get("overall_analysis") or {}
+            if overall.get("is_likely_packed"):
+                logging.info("  - Triage Note: Capstone suggests file may be packed")
+
+            if original_features.get("entropy", 0) > 7.5:
+                logging.info("  - Triage Note: High entropy detected")
+
+            if not original_features.get("signature_valid"):
+                logging.info(
+                    "  - Triage Note: Invalid or missing signature (Status: %s)",
+                    original_features.get("signature_status", "N/A"),
+                )
+
+            logging.info("  - Running on-demand string analysis... (already precomputed)")
+            yargen_analysis = original_features.get("yargen_summary") or {}
+            logging.info("  - String Analysis Result: %s", yargen_analysis.get("status", "N/A"))
+            try:
+                pct = float(yargen_analysis.get("yargen_suspicious_percentage", 0.0))
+            except Exception:
+                pct = 0.0
+            try:
+                total_strings = int(yargen_analysis.get("total_strings", 0))
+            except Exception:
+                total_strings = 0
+            logging.info("    (Found %.1f%% suspicious strings out of %d total.)", pct, total_strings)
+    else:
+        logging.info("No suspicious files found above the threshold.")
 
