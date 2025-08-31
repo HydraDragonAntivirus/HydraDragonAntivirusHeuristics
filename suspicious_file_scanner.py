@@ -776,14 +776,24 @@ def analyze_single_file(path: str) -> dict:
             # --------------------
             # Phase 2: YarGen string scoring
             # --------------------
-            try:
-                with open(path, "rb") as fh:
-                    file_data = fh.read()
-                strings = extract_strings(file_data)
-                yargen_summary = score_strings_yargen_style(strings)
-                features['phase2_summary'] = yargen_summary
-            except Exception as e:
-                logging.warning(f"Phase 2 failed for {path}: {e}")
+            if features['suspicious']:
+                logging.info(f"[Phase 1] Suspicious detected: {path} | Score: {phase1}")
+                try:
+                    # Read file for string extraction
+                    with open(path, "rb") as fh:
+                        file_data = fh.read()
+                    strings = extract_strings(file_data)
+
+                    # Score strings
+                    yargen_summary = score_strings_yargen_style(strings)
+                    features['phase2_summary'] = yargen_summary
+
+                    # Log Phase 2 result
+                    logging.info(f"[Phase 2] YarGen summary for {path}: {yargen_summary}")
+
+                except Exception as e:
+                    logging.warning(f"[Phase 2] Failed for {path}: {e}")
+
 
     except Exception as e:
         logging.error(f"Failed to analyze {path}: {e}")
