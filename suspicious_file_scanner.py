@@ -18,24 +18,11 @@ import binascii
 from collections import Counter
 from typing import Any, Dict, List, Set, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
-
-# Optional heavy libs (best-effort)
-try:
-    import pefile
-except Exception:
-    pefile = None
-try:
-    import capstone
-except Exception:
-    capstone = None
-try:
-    import lief
-except Exception:
-    lief = None
-try:
-    from tqdm import tqdm
-except Exception:
-    def tqdm(it, **k): return it
+import psutil 
+import pefile
+import capstone
+import lief
+from tqdm import tqdm
 
 # NLTK optional for "is_likely_word"
 try:
@@ -577,16 +564,8 @@ def check_valid_signature(file_path: str) -> dict:
 # --------------------
 # YarGen-style string scoring (fixed)
 # --------------------
-def score_strings_yargen_style(strings: List[str], good_strings_db: Dict[str, int]) -> Dict[str, Any]:
-    """
-    Score strings in YarGen style:
-    - Baseline unknown strings get +1
-    - Known words (NLTK) get +1
-    - Base64 / hex decodable strings get extra +2
-    - Reversed known strings get +2
-    Returns top unknowns and summary percentages.
-    """
-    global stringScores, base64strings, hexEncStrings, reversedStrings
+def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
+    global stringScores, base64strings, hexEncStrings, reversedStrings, good_strings_db
     stringScores, base64strings, hexEncStrings, reversedStrings = {}, {}, {}, {}
     local_scores = {}
     unknown_count = 0
@@ -596,17 +575,27 @@ def score_strings_yargen_style(strings: List[str], good_strings_db: Dict[str, in
         if s.startswith("UTF16LE:"):
             s = s[8:]
 
-        # Check DB
+        # Known in whitelist DB?
         known = s_orig in good_strings_db or s in good_strings_db
         known_count = good_strings_db.get(s_orig, 0) or good_strings_db.get(s, 0) if known else 0
         score = -known_count if known else 1  # baseline unknown score
 
         if not known:
-            # NLTK likely word check
+            # Likely English word but unknown to DB
             if is_likely_word(s):
-                score += 1
+                score += 1  # extra weight for real word
 
-            # Attempt decoding (Base64 / Hex)
+            # Extra unknownity weight for encoding/obfuscation
+            if re.fullmatch(r'(?:[A-Za-z0-9+/]{4}){2,}(?:==|=)?', s) and is_base_64(s):
+                score += 2
+            hex_candidate = re.sub(r'[^0-9a-fA-F]', '', s)
+            if len(hex_candidate) > 8 and is_hex_encoded(hex_candidate, False):
+                score += 2
+            if s[::-1] in good_strings_db:
+                score += 2
+                reversedStrings[s_orig] = s[::-1]
+
+            # Attempt decoding
             try:
                 for m_string in (s, s[1:], s[:-1], s + "=", s + "=="):
                     if is_base_64(m_string):
@@ -639,7 +628,6 @@ def score_strings_yargen_style(strings: List[str], good_strings_db: Dict[str, in
         if score > 0:
             unknown_count += 1
 
-    # Summary
     total_strings = len(strings)
     unknown_percentage = (unknown_count / total_strings) * 100 if total_strings else 0.0
     sorted_scores = sorted(local_scores.items(), key=lambda kv: kv[1], reverse=True)
@@ -662,10 +650,6 @@ def score_strings_yargen_style(strings: List[str], good_strings_db: Dict[str, in
 # Runtime helpers
 # --------------------
 def is_running_pe(path: str) -> bool:
-    try:
-        import psutil
-    except Exception:
-        return False
     try:
         for proc in psutil.process_iter(['exe', 'name']):
             try:
@@ -691,7 +675,7 @@ def is_in_suspicious_location_pe(path: str) -> bool:
 def analyze_single_file(path: str) -> dict:
     """
     Analyze a single file with PE, Capstone, entropy, runtime, signature checks.
-    Phase 1: basic heuristics (entropy, packing, location, running, signature)
+    Phase 1: basic heuristics (entropy, packing, location, running, signature, opcodes)
     Phase 2: YarGen-style string scoring (only if phase1_score >= threshold)
     """
     features = {
@@ -754,6 +738,7 @@ def analyze_single_file(path: str) -> dict:
         # --------------------
         phase1 = 0
         cap = features.get('capstone_analysis', {}).get('overall_analysis', {})
+
         if cap.get('is_likely_packed'):
             phase1 += 3
         if features['entropy'] > 7.5:
@@ -776,6 +761,22 @@ def analyze_single_file(path: str) -> dict:
         if features['signature_valid']:
             phase1 = max(phase1 - 3, 0)
 
+        # --------------------
+        # Opcode scoring
+        # --------------------
+        if USE_OPCODES and features['is_executable']:
+            try:
+                with open(path, "rb") as fh:
+                    file_bytes = fh.read()
+                opcodes = extract_opcodes_from_bytes(file_bytes)
+                for op in opcodes:
+                    if op in good_opcodes_db:
+                        phase1 -= 1
+                    else:
+                        phase1 += 1
+            except Exception:
+                pass
+
         features['phase1_score'] = phase1
         features['suspicious_score'] = phase1
         features['suspicious'] = phase1 >= SUSPICIOUS_THRESHOLD
@@ -786,24 +787,15 @@ def analyze_single_file(path: str) -> dict:
             # --------------------
             # Phase 2: YarGen string scoring
             # --------------------
-            if features['suspicious']:
-                logging.info(f"[Phase 1] Suspicious detected: {path} | Score: {phase1}")
-                try:
-                    # Read file for string extraction
-                    with open(path, "rb") as fh:
-                        file_data = fh.read()
-                    strings = extract_strings(file_data)
-
-                    # Score strings
-                    yargen_summary = score_strings_yargen_style(strings)
-                    features['phase2_summary'] = yargen_summary
-
-                    # Log Phase 2 result
-                    logging.info(f"[Phase 2] YarGen summary for {path}: {yargen_summary}")
-
-                except Exception as e:
-                    logging.warning(f"[Phase 2] Failed for {path}: {e}")
-
+            try:
+                with open(path, "rb") as fh:
+                    file_data = fh.read()
+                strings = extract_strings(file_data)
+                yargen_summary = score_strings_yargen_style(strings)  # uses global good_strings_db
+                features['phase2_summary'] = yargen_summary
+                logging.info(f"[Phase 2] YarGen summary for {path}: {yargen_summary}")
+            except Exception as e:
+                logging.warning(f"[Phase 2] Failed for {path}: {e}")
 
     except Exception as e:
         logging.error(f"Failed to analyze {path}: {e}")
@@ -869,9 +861,9 @@ if __name__ == "__main__":
         suspicious.sort(key=lambda x: x.get("suspicious_score", 0), reverse=True)
         print("\nTop suspicious files:")
         for r in suspicious[:20]:
-            ysum = r.get("yargen_summary", {})
-            print(f"{r['path']}\n  Score: {r['suspicious_score']}  Sig: {r.get('signature_status','N/A')}  Strings suspicious: {ysum.get('suspicious_percentage',0):.1f}% ({ysum.get('total_strings',0)})")
-            top = ysum.get("top_strings", [])
+            ysum = r.get("phase2_summary", {})  # düzeltildi
+            print(f"{r['path']}\n  Score: {r['suspicious_score']}  Sig: {r.get('signature_status','N/A')}  Strings suspicious: {ysum.get('unknown_percentage',0):.1f}% ({ysum.get('total_strings',0)})")
+            top = ysum.get("top_unknowns", [])  # düzeltildi
             if top:
                 for ts in top[:3]:
                     disp = ts['string'].replace("\n","\\n").replace("\r","\\r")
