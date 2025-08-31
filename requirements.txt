@@ -3,6 +3,4 @@ psutil
 pefile 
 capstone 
 lief 
-nltk
 lxml
-joblib

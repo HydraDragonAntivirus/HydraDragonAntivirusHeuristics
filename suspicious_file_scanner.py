@@ -1,46 +1,30 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Suspicious file scanner (original) + Phase2 (YarGen unknown_percentage) ML regressor.
+Suspicious file scanner (YarGen & opcode DB & update-db removed) + PEStudio XML whitelist preserved.
 
-This updated version integrates a PEStudio-style strings XML (whitelist) loader and
-a simple pestudio scoring helper. Place your XML at ./3rdparty/strings.xml or change
-PE_STRINGS_FILE accordingly.
-
-Behavior:
- - All original heuristics remain hardcoded.
- - If you provide --ml-model <file>, the scanner will use the regressor to predict
-   the Phase2 YarGen `unknown_percentage` for suspicious files (skipping expensive
-   string extraction for those files). If the regressor prediction fails, it
-   falls back to running YarGen locally.
- - You can train the Phase2 regressor via --train-phase2 --benign-dir ... --malicious-dir ...
- - The pestudio strings XML is loaded at startup and its entries are added to
-   the good_strings_db whitelist so YarGen treats them as known.
+This version:
+ - Keeps Phase1 heuristics (entropy, age, signature, capstone packing analysis).
+ - Loads PEStudio-style strings XML (whitelist) and injects entries into good_strings_db.
+ - Removes YarGen string extraction/scoring, Phase2 ML training/prediction, opcode-related logic/DB flags, and the --update-db downloader.
 """
 from __future__ import annotations
 
 import os
 import sys
 import io
-import re
-import gzip
-import json
 import math
 import time
-import glob
-import base64
-import shutil
 import logging
 import argparse
-import binascii
 from collections import Counter
 from typing import Any, Dict, List, Set, Optional, Tuple
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import ctypes
 from ctypes import wintypes
 
-# Optional heavy deps
+# Optional heavy deps (kept where useful)
 try:
     import psutil
 except Exception:
@@ -74,34 +58,39 @@ except Exception:
     import xml.etree.ElementTree as lxml_etree  # type: ignore
     etree = lxml_etree
 
-# NLTK optional for "is_likely_word"
+# Optional heavy deps (kept where useful)
 try:
-    import nltk
-    import io as _io
-    from contextlib import redirect_stdout
-    with redirect_stdout(_io.StringIO()):
-        try:
-            nltk.data.find('tokenizers/punkt')
-        except Exception:
-            nltk.download('punkt', quiet=True)
-        try:
-            nltk.data.find('corpora/words')
-        except Exception:
-            nltk.download('words', quiet=True)
-    from nltk.corpus import words as _nltk_words
-    nltk_words: Set[str] = set(_nltk_words.words())
+    import psutil
 except Exception:
-    nltk = None
-    nltk_words = set()
+    psutil = None
 
-# ML deps (for training / regressor). If not installed, training will fail with a clear message.
-SKLEARN_AVAILABLE = True
 try:
-    from sklearn.ensemble import RandomForestRegressor
-    import joblib
+    import pefile
 except Exception:
-    SKLEARN_AVAILABLE = False
-    # training/prediction code will check flag at runtime
+    pefile = None
+
+try:
+    import capstone
+except Exception:
+    capstone = None
+
+try:
+    import lief
+except Exception:
+    lief = None
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(it, **kwargs): return it
+
+# lxml preferred for robust XML parsing; fallback to ElementTree
+try:
+    from lxml import etree as lxml_etree
+    etree = lxml_etree
+except Exception:
+    import xml.etree.ElementTree as lxml_etree  # type: ignore
+    etree = lxml_etree
 
 # Logging
 logging.basicConfig(
@@ -116,67 +105,11 @@ logging.basicConfig(
 # --------------------
 SUSPICIOUS_THRESHOLD = 11
 SCAN_FOLDER = "."
-USE_OPCODES = False
 
-# DB containers
+# DB containers (opcode DB removed)
 good_strings_db: Counter = Counter()
-good_opcodes_db: Set[str] = set()
 good_imphashes_db: Set[str] = set()
 good_exports_db: Set[str] = set()
-
-# yarGen style result containers (populated per-run)
-base64strings: Dict[str, bytes] = {}
-hexEncStrings: Dict[str, bytes] = {}
-reversedStrings: Dict[str, str] = {}
-stringScores: Dict[str, float] = {}
-
-# Candidate regexes
-ASCII_RE = re.compile(rb"[\x1f-\x7e]{6,}")
-WIDE_RE = re.compile(rb"(?:[\x1f-\x7e][\x00]){6,}")
-HEX_CAND_RE = re.compile(rb"([A-Fa-f0-9]{10,})")
-
-# Example REPO URLS (same as original snippet)
-REPO_URLS = {
-    'good-opcodes-part1.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part1.db',
-    'good-opcodes-part2.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part2.db',
-    'good-opcodes-part3.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part3.db',
-    'good-opcodes-part4.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part4.db',
-    'good-opcodes-part5.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part5.db',
-    'good-opcodes-part6.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part6.db',
-    'good-opcodes-part7.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part7.db',
-    'good-opcodes-part8.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part8.db',
-    'good-opcodes-part9.db': 'https://www.bsk-consulting.de/yargen/good-opcodes-part9.db',
-
-    'good-strings-part1.db': 'https://www.bsk-consulting.de/yargen/good-strings-part1.db',
-    'good-strings-part2.db': 'https://www.bsk-consulting.de/yargen/good-strings-part2.db',
-    'good-strings-part3.db': 'https://www.bsk-consulting.de/yargen/good-strings-part3.db',
-    'good-strings-part4.db': 'https://www.bsk-consulting.de/yargen/good-strings-part4.db',
-    'good-strings-part5.db': 'https://www.bsk-consulting.de/yargen/good-strings-part5.db',
-    'good-strings-part6.db': 'https://www.bsk-consulting.de/yargen/good-strings-part6.db',
-    'good-strings-part7.db': 'https://www.bsk-consulting.de/yargen/good-strings-part7.db',
-    'good-strings-part8.db': 'https://www.bsk-consulting.de/yargen/good-strings-part8.db',
-    'good-strings-part9.db': 'https://www.bsk-consulting.de/yargen/good-strings-part9.db',
-
-    'good-exports-part1.db': 'https://www.bsk-consulting.de/yargen/good-exports-part1.db',
-    'good-exports-part2.db': 'https://www.bsk-consulting.de/yargen/good-exports-part2.db',
-    'good-exports-part3.db': 'https://www.bsk-consulting.de/yargen/good-exports-part3.db',
-    'good-exports-part4.db': 'https://www.bsk-consulting.de/yargen/good-exports-part4.db',
-    'good-exports-part5.db': 'https://www.bsk-consulting.de/yargen/good-exports-part5.db',
-    'good-exports-part6.db': 'https://www.bsk-consulting.de/yargen/good-exports-part6.db',
-    'good-exports-part7.db': 'https://www.bsk-consulting.de/yargen/good-exports-part7.db',
-    'good-exports-part8.db': 'https://www.bsk-consulting.de/yargen/good-exports-part8.db',
-    'good-exports-part9.db': 'https://www.bsk-consulting.de/yargen/good-exports-part9.db',
-
-    'good-imphashes-part1.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part1.db',
-    'good-imphashes-part2.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part2.db',
-    'good-imphashes-part3.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part3.db',
-    'good-imphashes-part4.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part4.db',
-    'good-imphashes-part5.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part5.db',
-    'good-imphashes-part6.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part6.db',
-    'good-imphashes-part7.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part7.db',
-    'good-imphashes-part8.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part8.db',
-    'good-imphashes-part9.db': 'https://www.bsk-consulting.de/yargen/good-imphashes-part9.db',
-}
 
 # Suspicious / system directories (used by capstone scanner)
 SUSPICIOUS_DIRS = [
@@ -212,30 +145,6 @@ pestudio_strings_global: Dict[str, List[str]] = {}
 # --------------------
 # Utility functions
 # --------------------
-def is_ascii_char(b: bytes, padding_allowed: bool = False) -> int:
-    o = b[0] if isinstance(b, (bytes, bytearray)) else ord(b)
-    if padding_allowed:
-        return 1 if (31 < o < 127) or o == 0 else 0
-    else:
-        return 1 if 31 < o < 127 else 0
-
-def is_ascii_string(string: bytes, padding_allowed: bool = False) -> bool:
-    try:
-        for b in string:
-            if not is_ascii_char(bytes([b]), padding_allowed):
-                return False
-        return True
-    except Exception:
-        return False
-
-def is_base_64(s: str) -> bool:
-    return (len(s) % 4 == 0) and re.match(r"^[A-Za-z0-9+/]+[=]{0,2}$", s) is not None
-
-def is_hex_encoded(s: str, check_length: bool = True) -> bool:
-    if re.match(r"^[A-Fa-f0-9]+$", s):
-        return (len(s) % 2 == 0) if check_length else True
-    return False
-
 def calculate_entropy(path: str) -> float:
     freq = [0] * 256
     total = 0
@@ -258,74 +167,115 @@ def calculate_entropy(path: str) -> float:
         logging.debug("Entropy calc failed for %s: %s", path, e, exc_info=True)
         return 0.0
 
-def is_likely_word(s: str) -> bool:
-    if not nltk_words:
-        return False
-    return len(s) >= 3 and s.lower() in nltk_words
+# --------------------
+# PEStudio strings loader & scorer (kept)
+# --------------------
+def get_abs_path(path: str) -> str:
+    """Return an absolute path if possible, otherwise return the input unchanged."""
+    try:
+        return os.path.abspath(path) if path else path
+    except Exception:
+        return path
 
-# --------------------
-# PEStudio strings loader & scorer
-# --------------------
+
 def initialize_pestudio_strings(xml_path: str = PE_STRINGS_FILE) -> Dict[str, List[str]]:
     """
-    Parse the pestudio strings XML and return a dict mapping types to lists of strings.
-    We look for tags: string, av, folder, os, reg, guid, ssdl, ext, agent, oid, priv
+    Parse the PEStudio strings XML and return a dict mapping types to lists of **string texts**.
+
+    This version is permissive: it looks for child tags <string> and <item>, and also
+    captures direct node text. It normalizes (strips, lowercases) and deduplicates the results.
+    It also builds a fast lookup map `pestudio_marker` for O(1) matching.
     """
     keys = ["strings", "av", "folder", "os", "reg", "guid", "ssdl", "ext", "agent", "oid", "priv"]
     pestudio: Dict[str, List[str]] = {k: [] for k in keys}
+
     try:
         if not xml_path or not os.path.exists(xml_path):
             logging.info("PEStudio strings XML not found: %s", xml_path)
             return pestudio
 
-        tree = etree.parse(xml_path)
+        tree = etree.parse(get_abs_path(xml_path))
         root = tree.getroot()
-        # Some files use <strings><string>...</string></strings>
-        # Others may use <strings><item>...</item></strings> - handle both.
+
         for k in keys:
-            nodes = root.findall(".//" + k)
-            # if nodes found, dig children (string/item)
+            nodes = root.findall('.//' + k)
             for node in nodes:
-                # prefer child tags named 'string' or 'item'; otherwise take node.text
+                # prefer children named 'string' or 'item'
                 for child_tag in ("string", "item"):
-                    for child in node.findall(".//" + child_tag):
+                    for child in node.findall('.//' + child_tag):
                         if child is None or child.text is None:
                             continue
                         s = child.text.strip()
                         if s:
                             pestudio[k].append(s)
-                # if node has direct text and wasn't captured by children
+                # fallback to node text
                 if (node.text is not None) and node.text.strip():
                     pestudio[k].append(node.text.strip())
 
-        # Normalize: remove duplicates while preserving simple list
+        # normalize: strip, dedupe, preserve case variants (store lower for marker)
         for k in keys:
             seen = set()
             cleaned = []
             for it in pestudio[k]:
                 if not it:
                     continue
-                if it in seen:
+                norm = it.strip()
+                if not norm:
                     continue
-                seen.add(it)
-                cleaned.append(it)
+                if norm in seen:
+                    continue
+                seen.add(norm)
+                cleaned.append(norm)
             pestudio[k] = cleaned
+
+        # build a quick marker dict for O(1) lookups (lowercased keys)
+        global pestudio_marker
+        pestudio_marker = {}
+        for typ, lst in pestudio.items():
+            for s in lst:
+                if s:
+                    pestudio_marker[s.strip().lower()] = typ
 
         logging.info("Loaded pestudio strings from %s: %s", xml_path, {k: len(v) for k, v in pestudio.items()})
         return pestudio
+
     except Exception as e:
         logging.exception("Failed to initialize pestudio strings from %s: %s", xml_path, e)
         return pestudio
 
-def get_pestudio_score(string: str, pestudio_strings: Optional[Dict[str, List[str]]] = None) -> Tuple[int, str]:
+
+def get_pestudio_score(string: str) -> Tuple[int, str]:
     """
-    Return (score:int, matched_type:str).
-    Score 5 for exact full match found in pestudio lists (excluding 'ext' type).
+    Efficient lookup using the pre-built `pestudio_marker` map.
+
+    Returns (score:int, matched_type:str). Score 5 for exact full match found in pestudio lists
+    (excluding the 'ext' type which is ignored).
     """
-    if pestudio_strings is None:
-        pestudio_strings = pestudio_strings_global
-    if not string or not pestudio_strings:
+    if not string:
         return 0, ""
+    # build marker on first use if missing
+    global pestudio_marker, pestudio_strings_global
+    try:
+        if 'pestudio_marker' not in globals() or not pestudio_marker:
+            # ensure pestudio_strings_global is initialized
+            if not pestudio_strings_global:
+                pestudio_strings_global = initialize_pestudio_strings(PE_STRINGS_FILE)
+            # initialize marker from global store
+            pestudio_marker = {}
+            for typ, lst in pestudio_strings_global.items():
+                for s in lst:
+                    if s:
+                        pestudio_marker[s.strip().lower()] = typ
+    except Exception:
+        pestudio_marker = {}
+
+    key = string.strip().lower()
+    typ = pestudio_marker.get(key)
+    if not typ:
+        return 0, ""
+    if typ == 'ext':
+        return 0, ""
+    return 5, typ
     s_lower = string.strip().lower()
     for typ, lst in pestudio_strings.items():
         if not lst:
@@ -340,126 +290,10 @@ def get_pestudio_score(string: str, pestudio_strings: Optional[Dict[str, List[st
     return 0, ""
 
 # --------------------
-# DB Management
+# DB Management (keeps local db loading from ./dbs, downloader removed)
 # --------------------
-def load_good_dbs(db_path: str = "./dbs", use_opcodes: bool = False):
-    global good_strings_db, good_opcodes_db, good_imphashes_db, good_exports_db
-    good_strings_db, good_opcodes_db, good_imphashes_db, good_exports_db = Counter(), set(), set(), set()
-
-    if not os.path.exists(db_path):
-        logging.warning("Database path not found: %s", db_path)
-        return
-    files = sorted(glob.glob(os.path.join(db_path, "*.db")))
-    if not files:
-        logging.info("No DB files in %s", db_path)
-        return
-
-    for p in files:
-        bn = os.path.basename(p).lower()
-        if "opcodes" in bn and not use_opcodes:
-            continue
-        try:
-            # try gzip then text
-            try:
-                with gzip.open(p, "rt", encoding="utf-8", errors="ignore") as fh:
-                    content = fh.read()
-            except (gzip.BadGzipFile, OSError):
-                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
-                    content = fh.read()
-            try:
-                data = json.loads(content)
-            except Exception:
-                data = [line for line in content.splitlines() if line.strip()]
-            if "strings" in bn:
-                if isinstance(data, dict):
-                    good_strings_db.update(data)
-                else:
-                    good_strings_db.update({s: 1 for s in data})
-            elif "opcodes" in bn:
-                if isinstance(data, dict):
-                    good_opcodes_db.update(data.keys())
-                else:
-                    good_opcodes_db.update(data)
-            elif "imphashes" in bn:
-                if isinstance(data, dict):
-                    good_imphashes_db.update(data.keys())
-                else:
-                    good_imphashes_db.update(data)
-            elif "exports" in bn:
-                if isinstance(data, dict):
-                    good_exports_db.update(data.keys())
-                else:
-                    good_exports_db.update(data)
-        except Exception as e:
-            logging.warning("Failed to load DB %s: %s", p, e)
-    logging.info("Loaded DBs: strings=%d opcodes=%d imphashes=%d exports=%d",
-                 len(good_strings_db), len(good_opcodes_db), len(good_imphashes_db), len(good_exports_db))
-
-def update_databases(force: bool = False, db_dir: str = "./dbs", use_opcodes: bool = False):
-    os.makedirs(db_dir, exist_ok=True)
-    for filename, url in REPO_URLS.items():
-        if "opcodes" in filename and not use_opcodes:
-            continue
-        out = os.path.join(db_dir, filename)
-        if os.path.exists(out) and not force:
-            continue
-        try:
-            with __import__("urllib.request").request.urlopen(url, timeout=30) as resp, open(out, "wb") as fh:
-                shutil.copyfileobj(resp, fh)
-            logging.info("Downloaded DB %s", filename)
-        except Exception as e:
-            logging.warning("Failed to download %s: %s", filename, e)
-
 # --------------------
-# String/hex extraction (yarGen-like)
-# --------------------
-def extract_hex_strings(s: bytes) -> List[bytes]:
-    strings = []
-    hex_strings = HEX_CAND_RE.findall(s)
-    for string in list(hex_strings):
-        hex_strings += string.split(b'0000')
-        hex_strings += string.split(b'0d0a')
-    hex_strings = list(set(hex_strings))
-    for string in hex_strings:
-        for x in string.split(b'00'):
-            if len(x) > 10:
-                strings.append(x)
-    for string in hex_strings:
-        try:
-            if len(string) % 2 != 0 or len(string) < 8 or b'0000' in string:
-                continue
-            dec = string.replace(b'00', b'')
-            if is_ascii_string(dec, padding_allowed=False):
-                strings.append(string)
-        except Exception:
-            pass
-    return strings
-
-def extract_strings(file_data: bytes) -> List[str]:
-    cleaned = set()
-    if not file_data:
-        return []
-    ascii_found = ASCII_RE.findall(file_data)
-    hex_found = extract_hex_strings(file_data)
-    wide_found = WIDE_RE.findall(file_data)
-
-    all_byte_strings = set(ascii_found) | set(hex_found)
-    for bs in all_byte_strings:
-        try:
-            s = bs.replace(b'\\', b'\\\\').replace(b'"', b'\\"')
-            cleaned.add(s.decode('utf-8', errors='ignore'))
-        except Exception:
-            pass
-    for ws in wide_found:
-        try:
-            dec = ws.decode('utf-16le', errors='ignore')
-            cleaned.add(f"UTF16LE:{dec}")
-        except Exception:
-            pass
-    return list(cleaned)
-
-# --------------------
-# PE/Capstone utilities
+# PE/Capstone utilities (kept)
 # --------------------
 def get_pe_info(file_bytes: bytes) -> Tuple[str, List[str]]:
     imphash, exports = "", []
@@ -480,7 +314,6 @@ def get_pe_info(file_bytes: bytes) -> Tuple[str, List[str]]:
         except Exception:
             pass
     else:
-        # fallback using pefile if available
         try:
             if pefile:
                 pe = pefile.PE(data=file_bytes, fast_load=True)
@@ -499,34 +332,8 @@ def get_pe_info(file_bytes: bytes) -> Tuple[str, List[str]]:
             pass
     return imphash or "", exports
 
-def extract_opcodes_from_bytes(file_bytes: bytes) -> List[str]:
-    try:
-        parts = []
-        if lief:
-            try:
-                binary = lief.parse(io.BytesIO(file_bytes))
-                if binary:
-                    ep = getattr(binary, "entrypoint", None)
-                    if isinstance(binary, lief.PE.Binary):
-                        for sec in binary.sections:
-                            start = sec.virtual_address + binary.imagebase
-                            if ep and start <= ep < start + sec.size:
-                                raw = bytes(sec.content)
-                                parts.append(binascii.hexlify(raw[:64]).decode())
-                                break
-            except Exception:
-                pass
-        if not parts:
-            parts.append(binascii.hexlify(file_bytes[:128]).decode())
-        return parts
-    except Exception:
-        return []
 
 def analyze_with_capstone_pe(pe_obj) -> Dict[str, Any]:
-    """
-    Analyze a PE object using Capstone and return per-section and overall instruction stats.
-    Detects potential packing heuristically via ADD vs MOV counts.
-    """
     analysis = {
         "overall_analysis": {
             "is_likely_packed": False,
@@ -542,7 +349,6 @@ def analyze_with_capstone_pe(pe_obj) -> Dict[str, Any]:
         return analysis
 
     try:
-        # Determine architecture
         machine_type = getattr(getattr(pe_obj, "FILE_HEADER", None), "Machine", None)
         if machine_type == pefile.MACHINE_TYPE.get('IMAGE_FILE_MACHINE_I386', 0x014c):
             md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
@@ -594,7 +400,6 @@ def analyze_with_capstone_pe(pe_obj) -> Dict[str, Any]:
             except Exception:
                 continue
 
-        # Overall aggregation
         analysis["overall_analysis"]["add_count"] = total_add
         analysis["overall_analysis"]["mov_count"] = total_mov
         analysis["overall_analysis"]["total_instructions"] = total_instructions
@@ -606,9 +411,8 @@ def analyze_with_capstone_pe(pe_obj) -> Dict[str, Any]:
     return analysis
 
 # --------------------
-# WinVerifyTrust signature checking (robust handling)
+# WinVerifyTrust signature checking (kept)
 # --------------------
-
 class WinVerifyTrust_GUID(ctypes.Structure):
     _fields_ = [
         ("Data1", wintypes.DWORD),
@@ -639,11 +443,11 @@ class WINTRUST_DATA(ctypes.Structure):
         ("fdwRevocationChecks", wintypes.DWORD),
         ("dwUnionChoice", ctypes.c_void_p),
         ("pFile", ctypes.POINTER(WINTRUST_FILE_INFO)),
-        ("dwStateAction", wintypes.DWORD),
+        ("dwStateAction", ctypes.DWORD),
         ("hWVTStateData", wintypes.HANDLE),
         ("pwszURLReference", wintypes.LPCWSTR),
-        ("dwProvFlags", wintypes.DWORD),
-        ("dwUIContext", wintypes.DWORD),
+        ("dwProvFlags", ctypes.DWORD),
+        ("dwUIContext", ctypes.DWORD),
         ("pSignatureSettings", ctypes.c_void_p),
     ]
 
@@ -658,7 +462,6 @@ try:
 except Exception:
     _trust = None
 
-# HRESULT constants
 TRUST_E_NOSIGNATURE = 0x800B0100
 TRUST_E_SUBJECT_FORM_UNKNOWN = 0x800B0008
 TRUST_E_PROVIDER_UNKNOWN     = 0x800B0001
@@ -707,106 +510,12 @@ def check_valid_signature(file_path: str) -> dict:
         return {"is_valid": False, "status": str(e)}
 
 # --------------------
-# YarGen-style string scoring (fixed)
-# --------------------
-def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
-    global stringScores, base64strings, hexEncStrings, reversedStrings, good_strings_db
-    stringScores, base64strings, hexEncStrings, reversedStrings = {}, {}, {}, {}
-    local_scores = {}
-    total_unknown_weight = 0.0
-
-    # Maximum possible score per string (adjust if you change scoring rules)
-    max_score_per_string = 9  # base 1 + english 1 + base64 2 + hex 2 + decode 2 + reversed 1
-
-    for s_orig in strings:
-        s = s_orig
-        if s.startswith("UTF16LE:"):
-            s = s[8:]
-
-        # Known in whitelist DB?
-        known = s_orig in good_strings_db or s in good_strings_db or s.lower() in good_strings_db
-        score = 0 if known else 1  # baseline
-
-        if not known:
-            # Pestudio check: if pestudio lists contain exact match, reduce score (treat as known)
-            pscore, ptype = get_pestudio_score(s)
-            if pscore > 0:
-                score = 0
-                # still record the match in reversedStrings? no - we treat as known
-
-            else:
-                # English word
-                if is_likely_word(s):
-                    score += 1
-
-                # Base64
-                if re.fullmatch(r'(?:[A-Za-z0-9+/]{4}){2,}(?:==|=)?', s) and is_base_64(s):
-                    score += 2
-
-                # Hex
-                hex_candidate = re.sub(r'[^0-9a-fA-F]', '', s)
-                if len(hex_candidate) > 8 and is_hex_encoded(hex_candidate, False):
-                    score += 2
-
-                # Base64 decode attempt
-                try:
-                    for m_string in (s, s[1:], s[:-1], s + "=", s + "=="):
-                        if is_base_64(m_string):
-                            decoded = base64.b64decode(m_string, validate=True)
-                            if is_ascii_string(decoded, padding_allowed=True):
-                                score += 2
-                                base64strings[s_orig] = decoded
-                                break
-                except Exception:
-                    pass
-
-                # Hex decode attempt
-                try:
-                    if is_hex_encoded(s):
-                        decoded = bytes.fromhex(s)
-                        if is_ascii_string(decoded, padding_allowed=True):
-                            score += 2
-                            hexEncStrings[s_orig] = decoded
-                except Exception:
-                    pass
-
-                # Reversed string detection
-                rev = s[::-1]
-                if rev in good_strings_db:
-                    score += 2
-                    reversedStrings[s_orig] = rev
-
-        local_scores[s_orig] = score
-        stringScores[s_orig] = score
-
-        # Add normalized unknown weight (0–1) per string
-        total_unknown_weight += min(score / max_score_per_string, 1.0)
-
-    total_strings = len(strings)
-    unknown_percentage = (total_unknown_weight / total_strings) * 100 if total_strings else 0.0
-
-    sorted_scores = sorted(local_scores.items(), key=lambda kv: kv[1], reverse=True)
-    top_unknowns = [{"string": s, "score": sc} for s, sc in sorted_scores if sc > 0][:50]
-
-    # Status based on unknown percentage
-    status = "Mostly Known"
-    if unknown_percentage > 50:
-        status = "Mostly Unknown"
-    elif unknown_percentage > 20:
-        status = "Partially Unknown"
-
-    return {
-        "top_unknowns": top_unknowns,
-        "unknown_percentage": unknown_percentage,
-        "total_strings": total_strings,
-        "status": status
-    }
-
-# --------------------
 # Runtime helpers
 # --------------------
 def is_running_pe(path: str) -> bool:
     try:
+        if not psutil:
+            return False
         for proc in psutil.process_iter(['exe', 'name']):
             try:
                 exe = proc.info.get('exe')
@@ -826,50 +535,15 @@ def is_in_suspicious_location_pe(path: str) -> bool:
     return False
 
 # --------------------
-# ML feature vector for Phase2 regressor
+# Single-file analysis (Phase1 only)
 # --------------------
-FEATURE_ORDER = [
-    'size', 'entropy', 'age_days',
-    'is_executable', 'has_version_info', 'signature_valid',
-    'in_suspicious_location', 'is_running',
-    'cap_add_count', 'cap_mov_count', 'cap_total_instructions',
-]
-
-def extract_feature_vector(features: dict) -> List[float]:
-    # Safe access to nested capstone data
-    capstone_analysis = features.get('capstone_analysis') or {}
-    cap = capstone_analysis.get('overall_analysis') or {}
-    
-    vals = {
-        'size': features.get('size', 0),
-        'entropy': features.get('entropy', 0.0),
-        'age_days': features.get('age_days', 0.0),
-        'is_executable': 1.0 if features.get('is_executable') else 0.0,
-        'has_version_info': 1.0 if features.get('has_version_info') else 0.0,
-        'signature_valid': 1.0 if features.get('signature_valid') else 0.0,
-        'in_suspicious_location': 1.0 if features.get('in_suspicious_location') else 0.0,
-        'is_running': 1.0 if features.get('is_running') else 0.0,
-        'cap_add_count': float(cap.get('add_count', 0)),
-        'cap_mov_count': float(cap.get('mov_count', 0)),
-        'cap_total_instructions': float(cap.get('total_instructions', 0)),
-    }
-    return [float(vals.get(k, 0.0)) for k in FEATURE_ORDER]
-
-# --------------------
-# Single-file analysis (modified to allow ML-predicted Phase2)
-# --------------------
-# Global pointers for runtime ML usage (set when loading model)
-ML_REGRESSOR = None  # if set, used to predict phase2_percentage (only value predicted by ML)
-USE_ML_PHASE2 = False
-
 def analyze_single_file(path: str) -> dict:
     """
-    Same logic as original analyze_single_file, but:
-     - If file is flagged suspicious and USE_ML_PHASE2 and ML_REGRESSOR is set,
-       skip YarGen string scoring and use ML_REGRESSOR to set phase2_percentage.
-     - Otherwise compute YarGen exactly as before.
+    Phase1 heuristics + PE-specific checks. Returns features dict including `pe_checks`.
+    Each entry in `pe_checks` is a tuple: (message, verdict) where verdict is one of
+    'Clean', 'Suspicious', or 'Unknown'.
     """
-    features = {
+    features: Dict[str, Any] = {
         'path': path,
         'entropy': 0.0,
         'size': 0,
@@ -884,8 +558,27 @@ def analyze_single_file(path: str) -> dict:
         'suspicious_score': 0,
         'suspicious': False,
         'phase1_score': 0,
+        # phase2 placeholders (removed/unused but keep for compatibility)
         'phase2_summary': None,
-        'phase2_percentage': 0.0
+        'phase2_percentage': 0.0,
+        # new: detailed checks
+        'pe_checks': []
+    }
+
+    # verdict defaults following your table
+    verdict_map = {
+        "Optional Header LoaderFlags field is valued illegal": "Clean",
+        "Non-ascii or empty section names detected": "Clean",
+        "Illegal size of optional Header": "Clean",
+        "Packer detection on signature database": "Unknown",
+        "Based on the sections entropy check! file is possibly packed": "Clean",
+        "Timestamp value suspicious": "Clean",
+        "Header Checksum is zero!": "Suspicious",
+        "Entry point is outside the 1st(.code) section! Binary is possibly packed": "Clean",
+        "Optional Header NumberOfRvaAndSizes field is valued illegal": "Clean",
+        "Anti-vm present": "Clean",
+        "The Size Of Raw data is valued illegal! Binary might crash your disassembler/debugger": "Suspicious",
+        "TLS callback functions array detected": "Clean"
     }
 
     try:
@@ -894,6 +587,14 @@ def analyze_single_file(path: str) -> dict:
         features['age_days'] = (time.time() - stats.st_ctime) / (24 * 3600)
         features['entropy'] = calculate_entropy(path)
 
+        # read file bytes once (used for imphash/signature checks)
+        file_bytes = b''
+        try:
+            with open(path, 'rb') as fh:
+                file_bytes = fh.read()
+        except Exception:
+            file_bytes = b''
+
         pe = None
         try:
             if pefile:
@@ -901,10 +602,9 @@ def analyze_single_file(path: str) -> dict:
                 features['is_executable'] = True
                 features['has_version_info'] = hasattr(pe, 'VS_FIXEDFILEINFO') and getattr(pe, 'VS_FIXEDFILEINFO') is not None
 
-                # Capstone analysis - Fixed to handle None return
+                # capstone analysis (best-effort)
                 try:
                     cap_analysis = analyze_with_capstone_pe(pe)
-                    # Ensure we never store None in features
                     if cap_analysis is None:
                         cap_analysis = {
                             "overall_analysis": {
@@ -929,6 +629,160 @@ def analyze_single_file(path: str) -> dict:
                         "sections": {},
                         "error": f"Capstone analysis exception: {e}"
                     }
+
+                # --- PE-specific checks ---
+                pe_checks: List[Tuple[str, str]] = []
+
+                # Optional Header LoaderFlags non-zero
+                try:
+                    lf = getattr(pe.OPTIONAL_HEADER, 'LoaderFlags', None)
+                    if lf is not None and int(lf) != 0:
+                        msg = "Optional Header LoaderFlags field is valued illegal"
+                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                except Exception:
+                    pass
+
+                # Non-ascii or empty section names
+                try:
+                    found_bad_name = False
+                    for sec in pe.sections:
+                        try:
+                            name = sec.Name.decode(errors='ignore').strip(b'\x00')
+                        except Exception:
+                            name = ""
+                        if not name or any(ord(c) < 32 or ord(c) > 126 for c in name):
+                            found_bad_name = True
+                            break
+                    if found_bad_name:
+                        msg = "Non-ascii or empty section names detected"
+                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                except Exception:
+                    pass
+
+                # Illegal SizeOfOptionalHeader
+                try:
+                    soh = getattr(getattr(pe, 'FILE_HEADER', None), 'SizeOfOptionalHeader', None)
+                    if soh is not None and (soh < 0x60 or soh > 0x1000):
+                        msg = "Illegal size of optional Header"
+                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                except Exception:
+                    pass
+
+                # Sections entropy -> possibly packed
+                try:
+                    for sec in pe.sections:
+                        data = sec.get_data() or b''
+                        if not data:
+                            continue
+                        freq = [0] * 256
+                        total = 0
+                        for b in data:
+                            total += 1
+                            freq[b] += 1
+                        ent = 0.0
+                        if total > 0:
+                            for f in freq:
+                                if f > 0:
+                                    p = f / total
+                                    ent -= p * math.log2(p)
+                        if ent > 7.5:
+                            msg = "Based on the sections entropy check! file is possibly packed"
+                            pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                            break
+                except Exception:
+                    pass
+
+                # Timestamp suspicious
+                try:
+                    ts = getattr(getattr(pe, 'FILE_HEADER', None), 'TimeDateStamp', 0)
+                    if ts == 0 or ts > int(time.time()) + 365*24*3600:
+                        msg = "Timestamp value suspicious"
+                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                except Exception:
+                    pass
+
+                # Header Checksum zero
+                try:
+                    chksum = getattr(pe.OPTIONAL_HEADER, 'CheckSum', None)
+                    if chksum is not None and int(chksum) == 0:
+                        msg = "Header Checksum is zero!"
+                        pe_checks.append((msg, verdict_map.get(msg, 'Suspicious')))
+                except Exception:
+                    pass
+
+                # Entry point outside first .text/.code section
+                try:
+                    ep = int(getattr(pe, 'OPTIONAL_HEADER').AddressOfEntryPoint)
+                    first_code_section = None
+                    for s in pe.sections:
+                        name = s.Name.decode(errors='ignore').strip(b'\x00').lower()
+                        if name in ('.text', '.code'):
+                            first_code_section = s
+                            break
+                    if first_code_section is not None:
+                        va = int(first_code_section.VirtualAddress)
+                        size = int(first_code_section.Misc_VirtualSize)
+                        if not (va <= ep < va + size):
+                            msg = "Entry point is outside the 1st(.code) section! Binary is possibly packed"
+                            pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                except Exception:
+                    pass
+
+                # NumberOfRvaAndSizes abnormal
+                try:
+                    nrva = getattr(pe.OPTIONAL_HEADER, 'NumberOfRvaAndSizes', None)
+                    if nrva is not None and (nrva < 10 or nrva > 64):
+                        msg = "Optional Header NumberOfRvaAndSizes field is valued illegal"
+                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                except Exception:
+                    pass
+
+                # Simple anti-VM detection via import names
+                try:
+                    imports = []
+                    if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+                        for imp in getattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
+                            if imp.dll:
+                                imports.append(imp.dll.decode(errors='ignore').lower())
+                    anti_vm_found = any(x for x in ('vbox', 'vmware', 'vmwareuser', 'xen') if any(x in i for i in imports))
+                    if anti_vm_found:
+                        msg = "Anti-vm present"
+                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                except Exception:
+                    pass
+
+                # SizeOfRawData irregularities
+                try:
+                    for sec in pe.sections:
+                        if hasattr(sec, 'SizeOfRawData') and hasattr(sec, 'Misc_VirtualSize'):
+                            if sec.SizeOfRawData == 0 and sec.Misc_VirtualSize > 0:
+                                msg = "The Size Of Raw data is valued illegal! Binary might crash your disassembler/debugger"
+                                pe_checks.append((msg, verdict_map.get(msg, 'Suspicious')))
+                                break
+                except Exception:
+                    pass
+
+                # TLS callbacks presence -> now marked Clean per your requested table
+                try:
+                    if hasattr(pe, 'DIRECTORY_ENTRY_TLS') and getattr(pe, 'DIRECTORY_ENTRY_TLS') is not None:
+                        msg = "TLS callback functions array detected"
+                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                except Exception:
+                    pass
+
+                # Packer detection via imphash/signature database
+                try:
+                    imphash, exports = get_pe_info(file_bytes)
+                    if imphash:
+                        name = KNOWN_IMPHASHES.get(imphash.lower())
+                        if name:
+                            msg = "Packer detection on signature database"
+                            pe_checks.append((f"{msg}: {name}", verdict_map.get(msg, 'Unknown')))
+                except Exception:
+                    pass
+
+                features['pe_checks'] = pe_checks
+
         except Exception as e:
             logging.debug("PE parsing failed for %s: %s", path, e)
         finally:
@@ -938,7 +792,7 @@ def analyze_single_file(path: str) -> dict:
                 except Exception:
                     pass
 
-        # Ensure capstone_analysis is never None at this point
+        # Ensure capstone_analysis is always present
         if features['capstone_analysis'] is None:
             features['capstone_analysis'] = {
                 "overall_analysis": {
@@ -951,7 +805,6 @@ def analyze_single_file(path: str) -> dict:
                 "error": "No PE file or capstone not available"
             }
 
-        # Signature check
         try:
             sig = check_valid_signature(path)
             features['signature_valid'] = sig.get('is_valid', False)
@@ -959,24 +812,10 @@ def analyze_single_file(path: str) -> dict:
         except Exception:
             pass
 
-        # Ensure capstone_analysis is never None before Phase 1 scoring
-        if features['capstone_analysis'] is None:
-            features['capstone_analysis'] = {
-                "overall_analysis": {
-                    "is_likely_packed": False,
-                    "add_count": 0,
-                    "mov_count": 0,
-                    "total_instructions": 0
-                },
-                "sections": {},
-                "error": "No PE file or capstone not available"
-            }
-
         # --------------------
         # Phase 1 scoring
         # --------------------
         phase1 = 0
-        # Safe access to capstone data - now guaranteed to be a dict
         cap = features['capstone_analysis'].get('overall_analysis', {})
 
         if cap.get('is_likely_packed'):
@@ -1001,65 +840,12 @@ def analyze_single_file(path: str) -> dict:
         if features['signature_valid']:
             phase1 = max(phase1 - 3, 0)
 
-        # --------------------
-        # Opcode scoring
-        # --------------------
-        if USE_OPCODES and features['is_executable']:
-            try:
-                with open(path, "rb") as fh:
-                    file_bytes = fh.read()
-                opcodes = extract_opcodes_from_bytes(file_bytes)
-                for op in opcodes:
-                    if op in good_opcodes_db:
-                        phase1 -= 1
-                    else:
-                        phase1 += 1
-            except Exception:
-                pass
-
         features['phase1_score'] = phase1
         features['suspicious_score'] = phase1
         features['suspicious'] = phase1 >= SUSPICIOUS_THRESHOLD
 
         if features['suspicious']:
             logging.info(f"[Phase 1] Suspicious detected: {path} | Score: {phase1}")
-
-            # If ML model for Phase2 is enabled and loaded, use it and SKIP heavy YarGen
-            if USE_ML_PHASE2 and ML_REGRESSOR is not None:
-                try:
-                    fv = extract_feature_vector(features)
-                    pred = float(ML_REGRESSOR.predict([fv])[0])
-                    pred = max(0.0, min(100.0, pred))  # clamp
-                    features['phase2_percentage'] = pred
-                    features['phase2_summary'] = {"unknown_percentage": pred, "total_strings": 0, "top_unknowns": []}
-                    combined_score = phase1 + (pred / 10.0)
-                    features['suspicious_score'] = combined_score
-                    features['suspicious'] = combined_score >= SUSPICIOUS_THRESHOLD
-                    logging.info(f"[Phase 2 - ML] Predicted Phase2% for {path}: {pred:.2f}% (combined score {combined_score:.2f})")
-                except Exception as e:
-                    logging.warning(f"[Phase 2 - ML] Prediction failed for {path}: {e}")
-                    # fallback to real YarGen if prediction fails
-                    USE_LOCAL_YARGEN = True
-                else:
-                    USE_LOCAL_YARGEN = False
-            else:
-                USE_LOCAL_YARGEN = True
-
-            if USE_LOCAL_YARGEN:
-                try:
-                    with open(path, "rb") as fh:
-                        file_data = fh.read()
-                    strings = extract_strings(file_data)
-                    yargen_summary = score_strings_yargen_style(strings)
-                    features['phase2_summary'] = yargen_summary
-                    features['phase2_percentage'] = yargen_summary.get('unknown_percentage', 0.0)
-                    combined_score = phase1 + (features['phase2_percentage'] / 10)
-                    features['suspicious_score'] = combined_score
-                    features['suspicious'] = combined_score >= SUSPICIOUS_THRESHOLD
-                    logging.info(f"[Phase 2] YarGen summary for {path}: {yargen_summary}")
-                    logging.info(f"[Phase 2] Phase2 % used in score: {features['phase2_percentage']:.2f}%")
-                except Exception as e:
-                    logging.warning(f"[Phase 2] Failed for {path}: {e}")
 
     except Exception as e:
         logging.error(f"Failed to analyze {path}: {e}")
@@ -1068,7 +854,7 @@ def analyze_single_file(path: str) -> dict:
     return features
 
 # --------------------
-# Directory scanning (parallel) - updated signature
+# Directory scanning (parallel)
 # --------------------
 def scan_directory_parallel(directory: str, max_workers: Optional[int] = None):
     results = []
@@ -1094,166 +880,28 @@ def scan_directory_parallel(directory: str, max_workers: Optional[int] = None):
     return results
 
 # --------------------
-# ML training utilities for Phase2 regressor
-# --------------------
-def gather_phase2_training_data(directory: str, limit: Optional[int] = None, max_workers: Optional[int] = None):
-    """
-    Run analyze_single_file over directory with progress tracking
-    """
-    file_paths = []
-    for root, _, files in os.walk(directory):
-        for f in files:
-            file_paths.append(os.path.join(root, f))
-    if limit:
-        file_paths = file_paths[:limit]
-
-    print(f"Found {len(file_paths)} files to process...")
-    
-    X = []
-    y = []
-    workers = max_workers or (os.cpu_count() or 1)
-    
-    # Use ProcessPoolExecutor for better progress tracking
-    with ProcessPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(analyze_single_file, p): p for p in file_paths}
-        
-        # Add progress bar with tqdm
-        for fut in tqdm(as_completed(futures), total=len(file_paths), 
-                       desc="Processing training files", unit="file"):
-            p = futures[fut]
-            try:
-                res = fut.result()
-                if res and 'error' not in res:
-                    fv = extract_feature_vector(res)
-                    X.append(fv)
-                    y.append(float(res.get('phase2_percentage') or 0.0))
-                else:
-                    print(f"Skipped {p}: {res.get('error', 'unknown error')}")
-            except Exception as e:
-                print(f"Failed processing {p}: {e}")
-                logging.debug("Training gather failed for %s: %s", p, e)
-    
-    print(f"Collected {len(X)} valid training samples")
-    return X, y
-
-def train_phase2_regressor(benign_dir: str, malicious_dir: str, model_out: str = "phase2_reg.joblib", limit_per_class: Optional[int] = None):
-    if not SKLEARN_AVAILABLE:
-        raise RuntimeError("scikit-learn + joblib are required for training. Install scikit-learn and joblib.")
-
-    print("Gathering benign data...", benign_dir)
-    Xb, yb = gather_phase2_training_data(benign_dir, limit=limit_per_class)
-    print(f"Benign samples: {len(Xb)}")
-    print("Gathering malicious data...", malicious_dir)
-    Xm, ym = gather_phase2_training_data(malicious_dir, limit=limit_per_class)
-    print(f"Malicious samples: {len(Xm)}")
-
-    X = Xb + Xm
-    y = yb + ym
-
-    if not X:
-        raise RuntimeError("No training data collected. Make sure directories are correct and analyzer computed Phase2.")
-
-    # Train regressor
-    print("Training Phase2 regressor (RandomForest)...")
-    reg = RandomForestRegressor(n_estimators=150, n_jobs=-1, random_state=42)
-    reg.fit(X, y)
-    # Save
-    joblib.dump({'reg': reg, 'meta': {'feature_order': FEATURE_ORDER}}, model_out)
-    print(f"Saved Phase2 regressor to {model_out}")
-    return model_out
-
-def load_phase2_model(path: str):
-    if not SKLEARN_AVAILABLE:
-        raise RuntimeError("scikit-learn + joblib required to load model.")
-    if not os.path.exists(path):
-        raise FileNotFoundError(path)
-    obj = joblib.load(path)
-    reg = obj.get('reg') if isinstance(obj, dict) and 'reg' in obj else obj
-    return reg
-
-# --------------------
-# CLI / main
+# CLI / main (update-db option removed)
 # --------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Suspicious file scanner with Phase2 ML (only Phase2 is ML-driven)")
+    parser = argparse.ArgumentParser(description="Suspicious file scanner (YarGen/opcode/update-db removed)")
     parser.add_argument("-m", "--malware-path", dest="scan_path", default=SCAN_FOLDER, help="Directory to scan")
-    parser.add_argument("--update-db", action="store_true", help="Download DBs before scanning")
-    parser.add_argument("--use-opcodes", action="store_true", help="Enable opcode DB checks (cpu-heavy)")
     parser.add_argument("-t", "--threshold", type=int, default=SUSPICIOUS_THRESHOLD, help="Suspicion threshold")
-
-    # Phase2 regressor training
-    parser.add_argument('--train-phase2', action='store_true', help='Train Phase2 regressor from two directories')
-    parser.add_argument('--benign-dir', help='Directory with benign files for training')
-    parser.add_argument('--malicious-dir', help='Directory with malicious files for training')
-    parser.add_argument('--model-out', default='phase2_reg.joblib', help='Output path for phase2 regressor')
-    parser.add_argument('--limit', type=int, default=None, help='Limit per-class while training')
-
-    # Scan-time ML model (only Phase2 used)
-    parser.add_argument('--ml-model', help='Path to Phase2 regressor to use during scan (only YarGen percentage will be ML-predicted)')
-
-    # pestudio whitelist xml path
     parser.add_argument('--whitelist-xml', dest='whitelist_xml', default=PE_STRINGS_FILE, help='Path to pestudio strings.xml (whitelist)')
 
     args = parser.parse_args()
 
-    USE_OPCODES = bool(args.use_opcodes)
     SUSPICIOUS_THRESHOLD = int(args.threshold)
     SCAN_FOLDER = args.scan_path
 
-    # Train mode for Phase2 regressor
-    if args.train_phase2:
-        if not args.benign_dir or not args.malicious_dir:
-            parser.error("--train-phase2 requires --benign-dir and --malicious-dir")
-        if not SKLEARN_AVAILABLE:
-            print("scikit-learn and joblib are required to train. Install them and retry.")
-            sys.exit(1)
-        # Note: training will run analyze_single_file (which computes Phase2 ground truth)
-        train_phase2_regressor(args.benign_dir, args.malicious_dir, model_out=args.model_out, limit_per_class=args.limit)
-        sys.exit(0)
+    print("--- Suspicious file scanner (YarGen/opcode/update-db removed) ---")
 
-    # Scan mode
-    print("--- Suspicious file scanner (Phase2 ML optional) ---")
-    if args.update_db:
-        try:
-            update_databases(force=True, use_opcodes=USE_OPCODES)
-        except Exception as e:
-            logging.warning("update_databases failed: %s", e)
+    # Load DBs (local ./dbs only)
 
-    # Load DBs
-    load_good_dbs(use_opcodes=USE_OPCODES)
-
-    # Load pestudio whitelist XML and add entries to good_strings_db
+    # Load pestudio whitelist XML (no local good_* DBs used)
     try:
         pestudio_strings_global = initialize_pestudio_strings(args.whitelist_xml)
-        # flatten all pestudio strings into the good_strings_db as whitelisted tokens
-        flatten = []
-        for k, lst in pestudio_strings_global.items():
-            for it in lst:
-                if it:
-                    flatten.append(it)
-                    flatten.append(it.lower())
-        if flatten:
-            good_strings_db.update({s: 1 for s in set(flatten)})
-            logging.info("Injected %d pestudio whitelist entries into good_strings_db", len(set(flatten)))
     except Exception as e:
-        logging.warning("Failed to load or inject pestudio whitelist: %s", e)
-
-    # If an ML model is provided, load it and enable ML Phase2
-    if args.ml_model:
-        if not SKLEARN_AVAILABLE:
-            print("scikit-learn/joblib not available; cannot load ml model. Running without ML.")
-            USE_ML_PHASE2 = False
-            ML_REGRESSOR = None
-        else:
-            try:
-                ML_REGRESSOR = load_phase2_model(args.ml_model)
-                USE_ML_PHASE2 = ML_REGRESSOR is not None
-                print(f"Loaded Phase2 model: {args.ml_model}  (USE_ML_PHASE2={USE_ML_PHASE2})")
-            except Exception as e:
-                print(f"Failed to load ML model {args.ml_model}: {e}. Running without ML.")
-                logging.warning("Failed to load ML model %s: %s", args.ml_model, e)
-                USE_ML_PHASE2 = False
-                ML_REGRESSOR = None
+        logging.warning("Failed to load pestudio whitelist: %s", e)
 
     print(f"Starting scan: {SCAN_FOLDER}")
     start = time.time()
@@ -1263,17 +911,9 @@ if __name__ == "__main__":
     suspicious = [r for r in results if r and r.get("suspicious")]
     print("\n--- Scan Summary ---")
     print(f"Completed in {dur:.2f}s. Files scanned: {len(results)} Suspicious: {len(suspicious)}")
-    # Top suspicious files
     if suspicious:
         suspicious.sort(key=lambda x: x.get("suspicious_score", 0), reverse=True)
         print("\nTop suspicious files:")
         for r in suspicious[:20]:
-            ysum = r.get("phase2_summary") or {}  # <- Use empty dict if None
-            print(f"{r['path']}\n  Score: {r['suspicious_score']}  Sig: {r.get('signature_status','N/A')}  Strings suspicious: {ysum.get('unknown_percentage',0):.1f}% ({ysum.get('total_strings',0)})")
-            top = ysum.get("top_unknowns") or []  # <- Use empty list if None
-            if top:
-                for ts in top[:3]:
-                    disp = ts['string'].replace("\n","\\n").replace("\r","\\r")
-                    if len(disp) > 80: disp = disp[:77] + "..."
-                    print(f"    - ({ts['score']:.1f}) \"{disp}\"")
+            print(f"{r['path']}\n  Phase1 Score: {r.get('phase1_score', 0)}  Sig: {r.get('signature_status','N/A')}")
     print("Done. See log for details.")
