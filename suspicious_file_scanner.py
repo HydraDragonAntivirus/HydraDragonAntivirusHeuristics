@@ -55,6 +55,9 @@ except Exception:
     words = None  # type: ignore
     nltk_words = set()
 
+# default: don't run opcode extraction (very CPU / IO heavy)
+USE_OPCODES = False
+
 # Basic configuration
 SCAN_FOLDER = "D:\\datas2\\data2"
 SUSPICIOUS_THRESHOLD = 11
@@ -408,20 +411,40 @@ def calculate_entropy(path: str) -> float:
         logging.debug("Entropy calc failed for %s", path, exc_info=True)
         return 0.0
 
-def load(filename):
-    file = gzip.GzipFile(filename, 'rb')
-    object = json.loads(file.read())
-    file.close()
-    return object
+def stream_load_gzip_json(path):
+    """
+    Stream-load large gzip JSON DBs to avoid memory issues.
+    Returns a dict of keys -> 1.
+    """
+    try:
+        with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as f:
+            # Instead of json.loads(file.read()), we parse line by line if it's a list/dict dump
+            content = f.read(1)
+            f.seek(0)
+            if content == "[":
+                # JSON list -> convert to dict
+                items = json.load(f)
+                return {str(i): 1 for i in items}
+            elif content == "{":
+                # JSON dict -> just load
+                return json.load(f)
+            else:
+                # Plain lines inside gzip
+                f.seek(0)
+                return {ln.strip(): 1 for ln in f if ln.strip()}
+    except Exception:
+        return None
 
 def load_good_dbs(dbs_dir: str = "./dbs"):
     """
-    Load good-* DBs from a directory into memory sets.
-    - Uses the provided gzip+json `load()` function first.
-    - Falls back to plaintext newline parsing if gzip/json fails.
-    - No timeouts; will attempt to read each file fully.
+    Load yarGen good-* DBs safely, optimized for massive DB files.
+    - Streams gzip JSON instead of reading fully into memory.
+    - Skips opcodes DBs unless USE_OPCODES is True.
     """
-    global good_opcodes_db, base64strings, hexEncStrings, reversedStrings, KNOWN_IMPHASHES, KNOWN_EXPORTS
+    global good_opcodes_db, base64strings, hexEncStrings, reversedStrings
+    global KNOWN_IMPHASHES, KNOWN_EXPORTS
+
+    USE_OPCODES = globals().get("USE_OPCODES", False)
 
     good_opcodes_db = set()
     base64strings = set()
@@ -431,12 +454,12 @@ def load_good_dbs(dbs_dir: str = "./dbs"):
     KNOWN_EXPORTS = set()
 
     if not os.path.isdir(dbs_dir):
-        logging.info("DBs directory not found: %s", dbs_dir)
+        logging.warning("DB directory not found: %s", dbs_dir)
         return
 
     files = sorted(glob.glob(os.path.join(dbs_dir, "*")))
     if not files:
-        logging.info("No DB files found in %s", dbs_dir)
+        logging.warning("No DB files found in %s", dbs_dir)
         return
 
     loaded_files = 0
@@ -444,92 +467,63 @@ def load_good_dbs(dbs_dir: str = "./dbs"):
 
     for p in files:
         bn = os.path.basename(p).lower()
-        logging.info("Attempting to load DB file: %s (size=%d bytes)", p, os.path.getsize(p))
-        loaded_obj = None
 
-        # Try gzip+json using the exact loader you provided
-        try:
-            loaded_obj = load(p)
-            logging.info("Loaded gzip+json DB: %s", p)
-        except Exception as ex_gz:
-            logging.warning("gzip+json load failed for %s: %s - attempting plaintext fallback", p, ex_gz)
-            loaded_obj = None
-
-        # Plaintext fallback: newline-separated entries
-        if loaded_obj is None:
-            try:
-                lines = []
-                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
-                    for ln in fh:
-                        ln = ln.strip()
-                        if ln:
-                            lines.append(ln)
-                if lines:
-                    loaded_obj = {ln: 1 for ln in lines}
-                    logging.info("Loaded plaintext DB: %s (lines=%d)", p, len(lines))
-                else:
-                    logging.info("Plaintext DB %s had no entries", p)
-                    loaded_obj = None
-            except Exception as ex_plain:
-                logging.exception("Plaintext fallback failed for %s: %s", p, ex_plain)
-                loaded_obj = None
-
-        if not loaded_obj:
-            logging.warning("Skipping DB file (could not parse): %s", p)
-            skipped.append(p)
+        # Skip opcode DBs unless enabled
+        if "opcodes" in bn and not USE_OPCODES:
             continue
 
-        # Normalize loaded object into keys and dispatch to sets
-        try:
-            if isinstance(loaded_obj, list):
-                loaded_dict = {str(k): 1 for k in loaded_obj}
-            elif isinstance(loaded_obj, dict):
-                loaded_dict = {str(k): loaded_obj[k] for k in loaded_obj.keys()}
-            else:
-                # try to coerce iterables
-                try:
-                    loaded_dict = {str(k): 1 for k in loaded_obj}
-                except Exception:
-                    loaded_dict = {}
+        logging.info("Attempting to load DB file: %s (size=%d bytes)", p, os.path.getsize(p))
 
+        db = stream_load_gzip_json(p)
+        if db is None:
+            # Fallback: try plain text open if gzip/json fails
+            try:
+                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
+                    db = {ln.strip(): 1 for ln in fh if ln.strip()}
+            except:
+                skipped.append(p)
+                continue
+
+        # Normalize into dict
+        if isinstance(db, list):
+            db = {str(k): 1 for k in db}
+        elif not isinstance(db, dict):
+            db = {str(k): 1 for k in db}
+
+        # Distribute data into correct sets
+        try:
             if "opcodes" in bn:
-                for key in loaded_dict.keys():
-                    k = str(key).replace(" ", "").lower()
-                    if k:
-                        good_opcodes_db.add(k)
+                for k in db:
+                    good_opcodes_db.add(str(k).replace(" ", "").lower())
 
             elif "strings" in bn:
-                for key in loaded_dict.keys():
-                    s = str(key)
+                for s in db:
                     s_l = s.lower()
                     if is_base_64(s):
-                        base64strings.add(s); base64strings.add(s_l)
+                        base64strings.add(s)
+                        base64strings.add(s_l)
                     elif is_hex_encoded(re.sub(r'[^0-9a-fA-F]', '', s), check_length=False):
-                        hexEncStrings.add(s); hexEncStrings.add(s_l)
+                        hexEncStrings.add(s)
+                        hexEncStrings.add(s_l)
                     else:
-                        reversedStrings.add(s); reversedStrings.add(s_l)
+                        reversedStrings.add(s)
+                        reversedStrings.add(s_l)
 
             elif "imphash" in bn or "imphashes" in bn:
-                for key in loaded_dict.keys():
-                    h = str(key).lower()
-                    if h:
-                        KNOWN_IMPHASHES[h] = bn
+                KNOWN_IMPHASHES.update({str(k).lower(): bn for k in db})
 
             elif "exports" in bn:
-                for key in loaded_dict.keys():
-                    k = str(key).lower()
-                    if k:
-                        KNOWN_EXPORTS.add(k)
+                KNOWN_EXPORTS.update(str(k).lower() for k in db)
 
             loaded_files += 1
 
         except Exception:
-            logging.exception("Error processing DB contents from %s", p)
             skipped.append(p)
             continue
 
     logging.info(
-        "Loaded good DBs: opcodes=%d base64=%d hexEnc=%d strings=%d imphashes=%d exports=%d (files_loaded=%d skipped=%d)",
+        "Loaded good DBs: opcodes=%d base64=%d hexEnc=%d strings=%d imphashes=%d exports=%d "
+        "(files_loaded=%d skipped=%d)",
         len(good_opcodes_db),
         len(base64strings),
         len(hexEncStrings),
@@ -539,9 +533,6 @@ def load_good_dbs(dbs_dir: str = "./dbs"):
         loaded_files,
         len(skipped),
     )
-
-    if skipped:
-        logging.warning("Skipped DB files: %s", skipped)
 
 def is_likely_word(s: str) -> bool:
     """Return True if string is at least 3 chars and exists in NLTK words."""
@@ -592,15 +583,17 @@ def check_against_good_dbs_percentage(path: str, file_data: Optional[bytes] = No
 
     # --- OPCODES ---
     try:
-        if good_opcodes_db:
+        if USE_OPCODES and good_opcodes_db:
             opcodes = extract_opcodes(file_data)
-            # if we couldn't extract opcodes, don't add to denominator
             if opcodes:
                 total_markers += len(opcodes)
                 for op in opcodes:
                     op_l = op.replace(" ", "").lower()
                     if op_l in good_opcodes_db:
                         matches += 1
+    except Exception:
+        logging.debug("opcode check failed for %s", path, exc_info=True)
+
     except Exception:
         logging.debug("opcode check failed for %s", path, exc_info=True)
 
@@ -1401,6 +1394,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Download/update DB files from REPO_URLS into ./dbs before scanning (no other flags).",
     )
+    parser.add_argument(
+    "--use-opcodes",
+    action="store_true",
+    help="Enable opcode extraction and good-opcodes DB checks (CPU heavy). Default: OFF",
+    )
+
     args = parser.parse_args()
 
     logging.info("Starting file scan with Capstone analysis (parallel)...")
@@ -1419,6 +1418,9 @@ if __name__ == "__main__":
             load_good_dbs("./dbs")
         except Exception:
             logging.exception("Failed to load good DBs")
+
+    # enable opcodes only if user explicitly asked
+    USE_OPCODES = getattr(args, "use_opcodes", False)
 
     # Run scan (always uses configured SCAN_FOLDER)
     try:
