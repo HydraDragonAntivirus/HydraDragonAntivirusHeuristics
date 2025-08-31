@@ -386,55 +386,86 @@ def extract_opcodes_from_bytes(file_bytes: bytes) -> List[str]:
         return []
 
 def analyze_with_capstone_pe(pe_obj) -> Dict[str, Any]:
-    analysis = {"overall_analysis": {"is_likely_packed": False, "add_count": 0, "mov_count": 0, "total_instructions": 0}, "sections": {}, "error": None}
+    """
+    Analyze a PE object using Capstone and return per-section and overall instruction stats.
+    Detects potential packing heuristically via ADD vs MOV counts.
+    """
+    analysis = {
+        "overall_analysis": {
+            "is_likely_packed": False,
+            "add_count": 0,
+            "mov_count": 0,
+            "total_instructions": 0
+        },
+        "sections": {},
+        "error": None
+    }
+
     if not capstone or not pe_obj or not pefile:
         return analysis
+
     try:
-        machine = getattr(pe_obj, "FILE_HEADER", None)
-        if machine and getattr(pe_obj.FILE_HEADER, "Machine", None) == pefile.MACHINE_TYPE.get('IMAGE_FILE_MACHINE_I386', 0x014c):
+        # Determine architecture
+        machine_type = getattr(getattr(pe_obj, "FILE_HEADER", None), "Machine", None)
+        if machine_type == pefile.MACHINE_TYPE.get('IMAGE_FILE_MACHINE_I386', 0x014c):
             md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
-        elif machine and getattr(pe_obj.FILE_HEADER, "Machine", None) == pefile.MACHINE_TYPE.get('IMAGE_FILE_MACHINE_AMD64', 0x8664):
+        elif machine_type == pefile.MACHINE_TYPE.get('IMAGE_FILE_MACHINE_AMD64', 0x8664):
             md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
         else:
             return analysis
 
         total_add = 0
         total_mov = 0
-        total_instr = 0
+        total_instructions = 0
 
         for section in pe_obj.sections:
             try:
                 code = section.get_data()
                 if not code:
                     continue
-                base = pe_obj.OPTIONAL_HEADER.ImageBase + section.VirtualAddress
-                insts = md.disasm(code, base)
+
+                base_addr = pe_obj.OPTIONAL_HEADER.ImageBase + section.VirtualAddress
+                instructions = md.disasm(code, base_addr)
+
                 counts = {}
-                c_add = 0
-                c_mov = 0
-                c_total = 0
-                for i in insts:
-                    m = i.mnemonic
-                    counts[m] = counts.get(m, 0) + 1
-                    c_total += 1
-                    if m == "add": c_add += 1
-                    if m == "mov": c_mov += 1
-                analysis["sections"][section.Name.decode(errors='ignore').strip('\x00')] = {
-                    "instruction_counts": counts, "add_count": c_add, "mov_count": c_mov, "total_instructions": c_total,
-                    "is_likely_packed": (c_add > c_mov) if c_total > 0 else False
+                add_count = 0
+                mov_count = 0
+                section_total = 0
+
+                for instr in instructions:
+                    mnem = instr.mnemonic
+                    counts[mnem] = counts.get(mnem, 0) + 1
+                    section_total += 1
+                    if mnem == "add":
+                        add_count += 1
+                    elif mnem == "mov":
+                        mov_count += 1
+
+                section_name = section.Name.decode(errors='ignore').strip('\x00')
+                analysis["sections"][section_name] = {
+                    "instruction_counts": counts,
+                    "add_count": add_count,
+                    "mov_count": mov_count,
+                    "total_instructions": section_total,
+                    "is_likely_packed": (add_count > mov_count) if section_total > 0 else False
                 }
-                total_add += c_add
-                total_mov += c_mov
-                total_instr += c_total
+
+                total_add += add_count
+                total_mov += mov_count
+                total_instructions += section_total
+
             except Exception:
                 continue
 
+        # Overall aggregation
         analysis["overall_analysis"]["add_count"] = total_add
         analysis["overall_analysis"]["mov_count"] = total_mov
-        analysis["overall_analysis"]["total_instructions"] = total_instr
-        analysis["overall_analysis"]["is_likely_packed"] = (total_add > total_mov) if total_instr > 0 else False
+        analysis["overall_analysis"]["total_instructions"] = total_instructions
+        analysis["overall_analysis"]["is_likely_packed"] = (total_add > total_mov) if total_instructions > 0 else False
+
     except Exception as e:
         analysis["error"] = str(e)
+
     return analysis
 
 # --------------------
@@ -647,170 +678,101 @@ def is_in_suspicious_location_pe(path: str) -> bool:
 # --------------------
 # Single-file analysis (no known-extension/filename lookups)
 # --------------------
-def analyze_single_file(path: str) -> Dict[str, Any]:
+def analyze_single_file(path: str) -> dict:
     features = {
-        "path": path,
-        "size": 0,
-        "is_executable": False,
-        "suspicious": False,
-        "suspicious_score": 0,
-        "yargen_summary": {"status": "Not analyzed", "total_strings": 0},
-        "capstone_analysis": None,
-        "signature_status": "N/A",
-        "is_running": False,
-        "in_suspicious_location": False,
-        "entropy": 0.0,
-        "error": None
+        'path': path,
+        'entropy': 0.0,
+        'size': 0,
+        'is_executable': False,
+        'has_version_info': False,
+        'signature_valid': False,
+        'signature_status': "N/A",
+        'capstone_analysis': None,
+        'is_running': False,
+        'in_suspicious_location': False,
+        'age_days': 0,
+        'suspicious_score': 0,
+        'suspicious': False
     }
+
     try:
+        # Phase 1: basic file info
         stats = os.stat(path)
-        features["size"] = stats.st_size
-        if features["size"] < 100 or features["size"] > 50 * 1024 * 1024:
+        features['size'] = stats.st_size
+        features['age_days'] = (time.time() - stats.st_ctime) / (24 * 3600)
+        features['entropy'] = calculate_entropy(path)
+
+        # Temporary Phase 1 suspicion score (simple heuristics)
+        phase1_score = 0
+        if features['entropy'] > 7.5:
+            phase1_score += 5
+        if features['age_days'] < 1:
+            phase1_score += 2
+        if 'temp' in path.lower() or 'cache' in path.lower():
+            phase1_score += 2
+
+        # Log Phase 1 only if suspicious
+        if phase1_score >= 3:
+            logging.info(f"[Phase 1] Suspicious detected: {path} | entropy={features['entropy']:.2f} | age_days={features['age_days']:.2f} | score={phase1_score}")
+
+        # Only process valid PEs
+        pe = None
+        try:
+            pe = pefile.PE(path)
+            features['is_executable'] = True
+            features['has_version_info'] = hasattr(pe, 'VS_FIXEDFILEINFO') and getattr(pe, 'VS_FIXEDFILEINFO') is not None
+        except pefile.PEFormatError:
             return features
-
-        # Basic header check
-        try:
-            with open(path, "rb") as fh:
-                header = fh.read(2)
-        except Exception:
-            header = b""
-        is_exe = header == b"MZ"
-        features["is_executable"] = bool(is_exe)
-
-        prelim_score = 0
-        sig_valid = False
-
-        # Signature check (Windows only)
-        if features["is_executable"] and sys.platform == "win32":
-            sig = check_valid_signature(path)
-            sig_valid = sig.get("is_valid", False)
-            features["signature_status"] = sig.get("status", "N/A")
-            if not sig_valid:
-                if "no signature" in sig.get("status", "").lower():
-                    prelim_score += 2
-                elif "untrusted root" in sig.get("status", "").lower():
-                    prelim_score += 4
-                else:
-                    prelim_score += 4
-
-        # Entropy
-        ent = calculate_entropy(path)
-        features["entropy"] = ent
-        if ent > 7.5:
-            prelim_score += 5 if not sig_valid else 2
-
-        # If executable, try pefile & capstone analysis
-        pe_obj = None
-        try:
-            if features["is_executable"] and pefile:
-                pe_obj = pefile.PE(path, fast_load=True)
-                cap_analysis = analyze_with_capstone_pe(pe_obj)
-                features["capstone_analysis"] = cap_analysis
-                if cap_analysis.get("overall_analysis", {}).get("is_likely_packed"):
-                    prelim_score += 3
-        except Exception:
-            logging.debug("PE/capstone analyze failed for %s", path)
         finally:
-            try:
-                if pe_obj:
-                    pe_obj.close()
-            except Exception:
-                pass
+            if pe:
+                try:
+                    pe.close()
+                except Exception:
+                    pass
 
-        # ---------- NEW LOGIC ----------
-        # Only log PHASE 1 if prelim_score >= threshold
-        if prelim_score >= SUSPICIOUS_THRESHOLD:
-            logging.debug("[PHASE 1] %s prelim_score=%d", path, prelim_score)
-        else:
-            # Skip Yara/Yargen if below threshold
-            features["yargen_summary"]["status"] = "Skipped (below threshold)"
-            features["suspicious_score"] = int(prelim_score)
-            return features
-        # --------------------------------
-
-        # Deep analysis: read file bytes
+        # Phase 2: full analysis
         try:
-            with open(path, "rb") as fh:
-                file_bytes = fh.read()
-        except Exception as e:
-            features["error"] = f"read error: {e}"
-            return features
-
-        extracted_strings = extract_strings(file_bytes)
-        features["yargen_summary"] = score_strings_yargen_style(extracted_strings)
-
-        # PE info & goodware DB adjustments
-        imphash, exports = get_pe_info(file_bytes)
-        score_adjustment = 0
-        if imphash and imphash in good_imphashes_db:
-            score_adjustment -= 10
-        if exports and any(e in good_exports_db for e in exports):
-            score_adjustment -= 5
-
-        # Additional heuristics
-        is_running = is_running_pe(path)
-        in_suspicious_location = is_in_suspicious_location_pe(path)
-        features["is_running"] = is_running
-        features["in_suspicious_location"] = in_suspicious_location
-
-        # Opcode checks (optional)
-        opcode_penalty = 0
-        if USE_OPCODES and features["is_executable"]:
-            opcodes = extract_opcodes_from_bytes(file_bytes)
-            if opcodes:
-                unique_ops = set(opcodes)
-                bad_ops = len(unique_ops - good_opcodes_db)
-                if bad_ops > len(unique_ops) / 2:
-                    opcode_penalty += 3
-
-        # Combine scores:
-        final_score = int(prelim_score + score_adjustment)
-        # Add string analysis influence
-        spct = features["yargen_summary"].get("suspicious_percentage", 0.0)
-        if spct > 30:
-            final_score += 5
-        elif spct > 10:
-            final_score += 2
-
-        # Add other heuristics
-        if features.get("capstone_analysis", {}).get("overall_analysis", {}).get("is_likely_packed"):
-            final_score += 3
-        if features["entropy"] > 7.5:
-            final_score += 2 if sig_valid else 5
-        if is_running:
-            final_score += 3
-        if in_suspicious_location:
-            final_score += 2
-        final_score += opcode_penalty
-
-        # Age-based heuristics
-        try:
-            age_days = (time.time() - os.stat(path).st_ctime) / (24 * 3600)
-            if age_days < 1:
-                final_score += 2
+            features['capstone_analysis'] = analyze_with_capstone_pe(pe)
         except Exception:
             pass
+        try:
+            sig = check_valid_signature(path)
+            features['signature_valid'] = sig.get('is_valid', False)
+            features['signature_status'] = sig.get('status', "N/A")
+        except Exception:
+            pass
+        features['is_running'] = is_running_pe(path)
+        features['in_suspicious_location'] = is_in_suspicious_location_pe(path)
 
-        features["suspicious_score"] = max(0, final_score)
-        features["suspicious"] = features["suspicious_score"] >= SUSPICIOUS_THRESHOLD
+        # Suspicious score calculation (Phase 2)
+        score = 0
+        if (features.get('capstone_analysis') and 
+            features['capstone_analysis'].get('overall_analysis', {}).get('is_likely_packed')):
+            score += 3
+        if features.get('entropy', 0) > 7.5:
+            score += 5 if not features.get('signature_valid') else 2
+        if features.get('age_days', 0) < 1:
+            score += 2
+        if 'temp' in path.lower() or 'cache' in path.lower():
+            score += 2
+        if features.get('is_executable') and not features.get('has_version_info') and not features.get('signature_valid'):
+            score += 1
+        if features.get('is_executable') and not features.get('signature_valid'):
+            score += 4 if features.get('signature_status') == "Untrusted root" else 2
+        if features.get('signature_valid'):
+            score = max(score - 3, 0)
+        if features.get('in_suspicious_location'):
+            score += 2
+        if features.get('is_running'):
+            score += 3
 
-        # Debug output only if suspicious
-        if features["suspicious"]:
-            logging.info("[SUSPICIOUS] %s", path)
-            logging.debug("  size=%d, exe=%s, entropy=%.2f",
-                          features["size"], features["is_executable"], features["entropy"])
-            logging.debug("  signature_status=%s", features["signature_status"])
-            logging.debug("  capstone_analysis=%s", features["capstone_analysis"])
-            logging.debug("  yargen_summary=%s", features["yargen_summary"])
-            logging.debug("  imphash/exports adjustment applied: %d", score_adjustment)
-            logging.debug("  running=%s, suspicious_location=%s",
-                          features["is_running"], features["in_suspicious_location"])
-            logging.debug("  opcode_penalty=%d", opcode_penalty)
-            logging.debug("  final suspicious_score=%d", features["suspicious_score"])
+        features['suspicious_score'] = score
+        features['suspicious'] = score >= SUSPICIOUS_THRESHOLD
 
     except Exception as e:
-        logging.error("Failed to analyze %s: %s", path, e, exc_info=True)
-        features["error"] = str(e)
+        logging.error(f"Failed to analyze {path}: {e}")
+        features['error'] = str(e)
+
     return features
 
 # --------------------
