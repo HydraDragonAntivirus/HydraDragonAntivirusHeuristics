@@ -565,7 +565,10 @@ def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
     global stringScores, base64strings, hexEncStrings, reversedStrings, good_strings_db
     stringScores, base64strings, hexEncStrings, reversedStrings = {}, {}, {}, {}
     local_scores = {}
-    unknown_count = 0
+    total_unknown_weight = 0.0
+
+    # Maximum possible score per string (adjust if you change scoring rules)
+    max_score_per_string = 9  # base 1 + english 1 + base64 2 + hex 2 + decode 2 + reversed 1
 
     for s_orig in strings:
         s = s_orig
@@ -574,62 +577,63 @@ def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
 
         # Known in whitelist DB?
         known = s_orig in good_strings_db or s in good_strings_db
-        known_count = good_strings_db.get(s_orig, 0) or good_strings_db.get(s, 0) if known else 0
-        score = -known_count if known else 1  # baseline unknown score
+        score = 0 if known else 1  # baseline
 
         if not known:
-            # Likely English word but unknown to DB
+            # English word
             if is_likely_word(s):
-                score += 1  # extra weight for real word
+                score += 1
 
-            # Extra unknownity weight for encoding/obfuscation
+            # Base64
             if re.fullmatch(r'(?:[A-Za-z0-9+/]{4}){2,}(?:==|=)?', s) and is_base_64(s):
                 score += 2
+
+            # Hex
             hex_candidate = re.sub(r'[^0-9a-fA-F]', '', s)
             if len(hex_candidate) > 8 and is_hex_encoded(hex_candidate, False):
                 score += 2
-            if s[::-1] in good_strings_db:
-                score += 2
-                reversedStrings[s_orig] = s[::-1]
 
-            # Attempt decoding
+            # Base64 decode attempt
             try:
                 for m_string in (s, s[1:], s[:-1], s + "=", s + "=="):
                     if is_base_64(m_string):
-                        try:
-                            decoded = base64.b64decode(m_string, validate=True)
-                            if is_ascii_string(decoded, padding_allowed=True):
-                                score += 2
-                                base64strings[s_orig] = decoded
-                                break
-                        except Exception:
-                            pass
-                if is_hex_encoded(s):
-                    try:
-                        decoded = bytes.fromhex(s)
+                        decoded = base64.b64decode(m_string, validate=True)
                         if is_ascii_string(decoded, padding_allowed=True):
                             score += 2
-                            hexEncStrings[s_orig] = decoded
-                    except Exception:
-                        pass
+                            base64strings[s_orig] = decoded
+                            break
+            except Exception:
+                pass
+
+            # Hex decode attempt
+            try:
+                if is_hex_encoded(s):
+                    decoded = bytes.fromhex(s)
+                    if is_ascii_string(decoded, padding_allowed=True):
+                        score += 2
+                        hexEncStrings[s_orig] = decoded
             except Exception:
                 pass
 
             # Reversed string detection
-            if s[::-1] in good_strings_db:
+            rev = s[::-1]
+            if rev in good_strings_db:
                 score += 2
-                reversedStrings[s_orig] = s[::-1]
+                reversedStrings[s_orig] = rev
 
         local_scores[s_orig] = score
         stringScores[s_orig] = score
-        if score > 0:
-            unknown_count += 1
+
+        # Add normalized unknown weight (0–1) per string
+        total_unknown_weight += min(score / max_score_per_string, 1.0)
 
     total_strings = len(strings)
-    unknown_percentage = (unknown_count / total_strings) * 100 if total_strings else 0.0
+    unknown_percentage = (total_unknown_weight / total_strings) * 100 if total_strings else 0.0
+
     sorted_scores = sorted(local_scores.items(), key=lambda kv: kv[1], reverse=True)
     top_unknowns = [{"string": s, "score": sc} for s, sc in sorted_scores if sc > 0][:50]
 
+    # Status based on unknown percentage
     status = "Mostly Known"
     if unknown_percentage > 50:
         status = "Mostly Unknown"
@@ -784,15 +788,34 @@ def analyze_single_file(path: str) -> dict:
             # --------------------
             # Phase 2: YarGen string scoring
             # --------------------
-            try:
-                with open(path, "rb") as fh:
-                    file_data = fh.read()
-                strings = extract_strings(file_data)
-                yargen_summary = score_strings_yargen_style(strings)  # uses global good_strings_db
-                features['phase2_summary'] = yargen_summary
-                logging.info(f"[Phase 2] YarGen summary for {path}: {yargen_summary}")
-            except Exception as e:
-                logging.warning(f"[Phase 2] Failed for {path}: {e}")
+            if features['suspicious']:
+                try:
+                    with open(path, "rb") as fh:
+                        file_data = fh.read()
+                    strings = extract_strings(file_data)
+                    yargen_summary = score_strings_yargen_style(strings)  # uses global good_strings_db
+                    features['phase2_summary'] = yargen_summary
+                    logging.info(f"[Phase 2] YarGen summary for {path}: {yargen_summary}")
+
+                    # --------------------
+                    # Adjust suspicious score using unknown percentage
+                    # --------------------
+                    unknown_pct = yargen_summary.get("unknown_percentage", 0.0)
+                    if unknown_pct < 20.0:
+                        # Mostly known, reduce phase1_score to avoid false positives
+                        features['suspicious_score'] = max(features['phase1_score'] // 2, 0)
+                        features['suspicious'] = features['suspicious_score'] >= SUSPICIOUS_THRESHOLD
+                    elif unknown_pct < 50.0:
+                        # Partially unknown, slightly reduce
+                        features['suspicious_score'] = max(int(features['phase1_score'] * 0.75), 0)
+                        features['suspicious'] = features['suspicious_score'] >= SUSPICIOUS_THRESHOLD
+                    else:
+                        # Mostly unknown, keep full score
+                        features['suspicious_score'] = features['phase1_score']
+                        features['suspicious'] = features['suspicious_score'] >= SUSPICIOUS_THRESHOLD
+
+                except Exception as e:
+                    logging.warning(f"[Phase 2] Failed for {path}: {e}")
 
     except Exception as e:
         logging.error(f"Failed to analyze {path}: {e}")
