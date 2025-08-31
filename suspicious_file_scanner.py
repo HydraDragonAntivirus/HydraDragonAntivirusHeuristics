@@ -574,36 +574,40 @@ def check_valid_signature(file_path: str) -> dict:
 # --------------------
 # yarGen-style string scoring
 # --------------------
+# --------------------
+# yarGen-style string scoring (Unknownity only)
+# --------------------
 def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
     global stringScores, base64strings, hexEncStrings, reversedStrings
     stringScores, base64strings, hexEncStrings, reversedStrings = {}, {}, {}, {}
     local_scores = {}
-    suspicious_count = 0
+    unknown_count = 0
 
     for s_orig in strings:
         s = s_orig
         if s.startswith("UTF16LE:"):
             s = s[8:]
-        goodstring = False
-        goodcount = 0
+
+        # Check if known (from whitelist DB)
+        known = False
+        known_count = 0
         if s_orig in good_strings_db or s in good_strings_db:
-            goodstring = True
-            goodcount = good_strings_db.get(s_orig, 0) or good_strings_db.get(s, 0)
-        score = (goodcount * -1) + 5 if goodstring else 0
+            known = True
+            known_count = good_strings_db.get(s_orig, 0) or good_strings_db.get(s, 0)
 
-        if not goodstring:
-            if re.search(r'(shell|powershell|invoke|download|execute|payload|encrypt|inject|credential)', s, re.I): score += 4
-            if re.search(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b', s): score += 5
-            if re.search(r'([A-Za-z]:\\|%appdata%|/tmp/|/var/|system32)', s, re.I): score += 3
-            if re.search(r'\.(exe|dll|scr|bat|ps1|vbs)\b', s, re.I): score += 2
-            if re.search(r'(rat\b|meterpreter|metasploit|katz|mimikatz|backdoor|implant)', s, re.I): score += 5
-            if re.search(r'^(?:[A-Za-z0-9+/]{4}){10,}', s) and is_base_64(s): score += 6
-            if len(s) > 20 and is_hex_encoded(re.sub(r'[^0-9a-fA-F]', '', s), False): score += 4
+        # Base score = penalty for being known, bonus for unknown
+        score = (known_count * -1) if known else 1
+
+        # Extra "unknownity" weight for encodings/obfuscations
+        if not known:
+            if re.search(r'^(?:[A-Za-z0-9+/]{4}){10,}', s) and is_base_64(s):
+                score += 2   # looks like base64
+            if len(s) > 20 and is_hex_encoded(re.sub(r'[^0-9a-fA-F]', '', s), False):
+                score += 2   # looks like hex
             if s[::-1] in good_strings_db:
-                score += 10
-                reversedStrings[s_orig] = s[::-1]
+                score += 2   # reversed known string
 
-        # Encoding detection
+        # Try decoding to see if hidden unknowns
         try:
             if len(s) > 8:
                 for m_string in (s, s[1:], s[:-1], s + "=", s + "=="):
@@ -611,7 +615,7 @@ def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
                         try:
                             decoded = base64.b64decode(m_string, validate=True)
                             if is_ascii_string(decoded, padding_allowed=True):
-                                score += 10
+                                score += 2
                                 base64strings[s_orig] = decoded
                                 break
                         except Exception:
@@ -620,7 +624,7 @@ def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
                     try:
                         decoded = bytes.fromhex(s)
                         if is_ascii_string(decoded, padding_allowed=True):
-                            score += 8
+                            score += 2
                             hexEncStrings[s_orig] = decoded
                     except Exception:
                         pass
@@ -629,21 +633,24 @@ def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
 
         local_scores[s_orig] = score
         stringScores[s_orig] = score
-        if score >= SUSPICIOUS_THRESHOLD:
-            suspicious_count += 1
+        if score > 0:
+            unknown_count += 1
 
     total_strings = len(strings)
-    suspicious_percentage = (suspicious_count / total_strings) * 100.0 if total_strings > 0 else 0.0
+    unknown_percentage = (unknown_count / total_strings) * 100.0 if total_strings > 0 else 0.0
+
     sorted_scores = sorted(local_scores.items(), key=lambda kv: kv[1], reverse=True)
-    top_strings = [{"string": s, "score": sc} for s, sc in sorted_scores if sc >= SUSPICIOUS_THRESHOLD][:50]
-    status = "Unknown/Generic"
-    if suspicious_percentage < 1 and total_strings > 100:
-        status = "Likely Clean (very low suspicious string ratio)"
-    elif suspicious_percentage > 30:
-        status = "Potentially Malicious (high ratio of suspicious strings)"
+    top_unknowns = [{"string": s, "score": sc} for s, sc in sorted_scores if sc > 0][:50]
+
+    status = "Mostly Known"
+    if unknown_percentage > 50:
+        status = "Mostly Unknown"
+    elif unknown_percentage > 20:
+        status = "Partially Unknown"
+
     return {
-        "top_strings": top_strings,
-        "suspicious_percentage": suspicious_percentage,
+        "top_unknowns": top_unknowns,
+        "unknown_percentage": unknown_percentage,
         "total_strings": total_strings,
         "status": status
     }
