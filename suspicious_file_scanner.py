@@ -836,7 +836,10 @@ FEATURE_ORDER = [
 ]
 
 def extract_feature_vector(features: dict) -> List[float]:
-    cap = features.get('capstone_analysis', {}).get('overall_analysis', {}) if features.get('capstone_analysis') else {}
+    # Safe access to nested capstone data
+    capstone_analysis = features.get('capstone_analysis') or {}
+    cap = capstone_analysis.get('overall_analysis') or {}
+    
     vals = {
         'size': features.get('size', 0),
         'entropy': features.get('entropy', 0.0),
@@ -898,16 +901,55 @@ def analyze_single_file(path: str) -> dict:
                 features['is_executable'] = True
                 features['has_version_info'] = hasattr(pe, 'VS_FIXEDFILEINFO') and getattr(pe, 'VS_FIXEDFILEINFO') is not None
 
-                # Capstone analysis
-                features['capstone_analysis'] = analyze_with_capstone_pe(pe)
-        except Exception:
-            pass
+                # Capstone analysis - Fixed to handle None return
+                try:
+                    cap_analysis = analyze_with_capstone_pe(pe)
+                    # Ensure we never store None in features
+                    if cap_analysis is None:
+                        cap_analysis = {
+                            "overall_analysis": {
+                                "is_likely_packed": False,
+                                "add_count": 0,
+                                "mov_count": 0,
+                                "total_instructions": 0
+                            },
+                            "sections": {},
+                            "error": "Capstone analysis returned None"
+                        }
+                    features['capstone_analysis'] = cap_analysis
+                except Exception as e:
+                    logging.debug("Capstone analysis failed for %s: %s", path, e)
+                    features['capstone_analysis'] = {
+                        "overall_analysis": {
+                            "is_likely_packed": False,
+                            "add_count": 0,
+                            "mov_count": 0,
+                            "total_instructions": 0
+                        },
+                        "sections": {},
+                        "error": f"Capstone analysis exception: {e}"
+                    }
+        except Exception as e:
+            logging.debug("PE parsing failed for %s: %s", path, e)
         finally:
             if pe:
                 try:
                     pe.close()
                 except Exception:
                     pass
+
+        # Ensure capstone_analysis is never None at this point
+        if features['capstone_analysis'] is None:
+            features['capstone_analysis'] = {
+                "overall_analysis": {
+                    "is_likely_packed": False,
+                    "add_count": 0,
+                    "mov_count": 0,
+                    "total_instructions": 0
+                },
+                "sections": {},
+                "error": "No PE file or capstone not available"
+            }
 
         # Signature check
         try:
@@ -917,15 +959,25 @@ def analyze_single_file(path: str) -> dict:
         except Exception:
             pass
 
-        # Runtime/location checks
-        features['is_running'] = is_running_pe(path)
-        features['in_suspicious_location'] = is_in_suspicious_location_pe(path)
+        # Ensure capstone_analysis is never None before Phase 1 scoring
+        if features['capstone_analysis'] is None:
+            features['capstone_analysis'] = {
+                "overall_analysis": {
+                    "is_likely_packed": False,
+                    "add_count": 0,
+                    "mov_count": 0,
+                    "total_instructions": 0
+                },
+                "sections": {},
+                "error": "No PE file or capstone not available"
+            }
 
         # --------------------
         # Phase 1 scoring
         # --------------------
         phase1 = 0
-        cap = features.get('capstone_analysis', {}).get('overall_analysis', {})
+        # Safe access to capstone data - now guaranteed to be a dict
+        cap = features['capstone_analysis'].get('overall_analysis', {})
 
         if cap.get('is_likely_packed'):
             phase1 += 3
@@ -1046,8 +1098,7 @@ def scan_directory_parallel(directory: str, max_workers: Optional[int] = None):
 # --------------------
 def gather_phase2_training_data(directory: str, limit: Optional[int] = None, max_workers: Optional[int] = None):
     """
-    Run analyze_single_file over directory (YarGen will be computed inside analyze_single_file)
-    and return X (feature vectors) and y (phase2 percentage) lists.
+    Run analyze_single_file over directory with progress tracking
     """
     file_paths = []
     for root, _, files in os.walk(directory):
@@ -1056,12 +1107,19 @@ def gather_phase2_training_data(directory: str, limit: Optional[int] = None, max
     if limit:
         file_paths = file_paths[:limit]
 
+    print(f"Found {len(file_paths)} files to process...")
+    
     X = []
     y = []
     workers = max_workers or (os.cpu_count() or 1)
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    
+    # Use ProcessPoolExecutor for better progress tracking
+    with ProcessPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(analyze_single_file, p): p for p in file_paths}
-        for fut in as_completed(futures):
+        
+        # Add progress bar with tqdm
+        for fut in tqdm(as_completed(futures), total=len(file_paths), 
+                       desc="Processing training files", unit="file"):
             p = futures[fut]
             try:
                 res = fut.result()
@@ -1069,8 +1127,13 @@ def gather_phase2_training_data(directory: str, limit: Optional[int] = None, max
                     fv = extract_feature_vector(res)
                     X.append(fv)
                     y.append(float(res.get('phase2_percentage') or 0.0))
+                else:
+                    print(f"Skipped {p}: {res.get('error', 'unknown error')}")
             except Exception as e:
+                print(f"Failed processing {p}: {e}")
                 logging.debug("Training gather failed for %s: %s", p, e)
+    
+    print(f"Collected {len(X)} valid training samples")
     return X, y
 
 def train_phase2_regressor(benign_dir: str, malicious_dir: str, model_out: str = "phase2_reg.joblib", limit_per_class: Optional[int] = None):
