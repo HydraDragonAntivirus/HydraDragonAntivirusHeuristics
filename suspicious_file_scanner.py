@@ -13,8 +13,7 @@ import math
 import time
 import logging
 import argparse
-from collections import Counter
-from typing import Any, Dict, List, Set, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import ctypes
