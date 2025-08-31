@@ -16,7 +16,7 @@ import logging
 import argparse
 import binascii
 from collections import Counter
-from typing import Any, Dict, List, Set, Optional
+from typing import Any, Dict, List, Set, Optional, Tuple
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import psutil 
 import pefile
@@ -312,7 +312,7 @@ def extract_strings(file_data: bytes) -> List[str]:
 # --------------------
 # PE/Capstone utilities
 # --------------------
-def get_pe_info(file_bytes: bytes) -> (str, List[str]):
+def get_pe_info(file_bytes: bytes) -> Tuple[str, List[str]]:
     imphash, exports = "", []
     if not file_bytes or file_bytes[:2] != b'MZ':
         return imphash, exports
@@ -321,12 +321,13 @@ def get_pe_info(file_bytes: bytes) -> (str, List[str]):
             binary = lief.parse(io.BytesIO(file_bytes))
             if isinstance(binary, lief.PE.Binary):
                 try:
-                    imphash = lief.PE.get_imphash(binary, lief.PE.IMPHASH_MODE.PEFILE)
+                    imphash = lief.PE.get_imphash(binary, lief.PE.PE.IMPHASH_MODE.PEFILE)
                 except Exception:
                     imphash = ""
                 if binary.has_exports:
                     for e in binary.exported_functions:
-                        if e.name: exports.append(e.name)
+                        if e.name:
+                            exports.append(e.name)
         except Exception:
             pass
     else:
