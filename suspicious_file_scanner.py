@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Suspicious file scanner (YarGen & opcode DB & update-db removed) + PEStudio XML whitelist preserved.
+Suspicious file scanner + PEStudio XML whitelist preserved.
 
 This version:
  - Keeps Phase1 heuristics (entropy, age, signature, capstone packing analysis).
  - Loads PEStudio-style strings XML (whitelist) and injects entries into good_strings_db.
- - Removes YarGen string extraction/scoring, Phase2 ML training/prediction, opcode-related logic/DB flags, and the --update-db downloader.
 """
 from __future__ import annotations
 
@@ -877,7 +876,7 @@ def scan_directory_parallel(directory: str, max_workers: Optional[int] = None):
 # CLI / main (update-db option removed)
 # --------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Suspicious file scanner (YarGen/opcode/update-db removed)")
+    parser = argparse.ArgumentParser(description="Suspicious file scanner")
     parser.add_argument("-m", "--malware-path", dest="scan_path", default=SCAN_FOLDER, help="Directory to scan")
     parser.add_argument("-t", "--threshold", type=int, default=SUSPICIOUS_THRESHOLD, help="Suspicion threshold")
     parser.add_argument('--whitelist-xml', dest='whitelist_xml', default=PE_STRINGS_FILE, help='Path to pestudio strings.xml (whitelist)')
@@ -887,7 +886,7 @@ if __name__ == "__main__":
     SUSPICIOUS_THRESHOLD = int(args.threshold)
     SCAN_FOLDER = args.scan_path
 
-    print("--- Suspicious file scanner (YarGen/opcode/update-db removed) ---")
+    print("--- Suspicious file scanner ---")
 
     # Load DBs (local ./dbs only)
 
