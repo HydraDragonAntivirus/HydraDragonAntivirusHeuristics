@@ -543,11 +543,12 @@ def check_valid_signature(file_path: str) -> dict:
 # --------------------
 # yarGen-style string scoring
 # --------------------
-def score_strings_yargen_style(strings: List[str], min_score_threshold: int = 0) -> Dict[str, Any]:
+def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
     global stringScores, base64strings, hexEncStrings, reversedStrings
     stringScores, base64strings, hexEncStrings, reversedStrings = {}, {}, {}, {}
     local_scores = {}
     suspicious_count = 0
+
     for s_orig in strings:
         s = s_orig
         if s.startswith("UTF16LE:"):
@@ -597,13 +598,13 @@ def score_strings_yargen_style(strings: List[str], min_score_threshold: int = 0)
 
         local_scores[s_orig] = score
         stringScores[s_orig] = score
-        if score >= min_score_threshold:
+        if score >= SUSPICIOUS_THRESHOLD:
             suspicious_count += 1
 
     total_strings = len(strings)
     suspicious_percentage = (suspicious_count / total_strings) * 100.0 if total_strings > 0 else 0.0
     sorted_scores = sorted(local_scores.items(), key=lambda kv: kv[1], reverse=True)
-    top_strings = [{"string": s, "score": sc} for s, sc in sorted_scores if sc > min_score_threshold][:50]
+    top_strings = [{"string": s, "score": sc} for s, sc in sorted_scores if sc >= SUSPICIOUS_THRESHOLD][:50]
     status = "Unknown/Generic"
     if suspicious_percentage < 1 and total_strings > 100:
         status = "Likely Clean (very low suspicious string ratio)"
@@ -643,6 +644,9 @@ def is_in_suspicious_location_pe(path: str) -> bool:
             return True
     return False
 
+# --------------------
+# Single-file analysis (no known-extension/filename lookups)
+# --------------------
 # --------------------
 # Single-file analysis (no known-extension/filename lookups)
 # --------------------
@@ -716,12 +720,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
             except Exception:
                 pass
 
-        LIGHT_ANALYSIS_THRESHOLD = max(1, int(SUSPICIOUS_THRESHOLD / 2))
-        if prelim_score < LIGHT_ANALYSIS_THRESHOLD:
-            features["yargen_summary"]["status"] = "Skipped (low triage score)"
-            features["suspicious_score"] = int(prelim_score)
-            return features
-
+        # ===== FIX: Remove LIGHT_ANALYSIS_THRESHOLD skip =====
         # Deep analysis: read file bytes
         try:
             with open(path, "rb") as fh:
@@ -741,7 +740,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         if exports and any(e in good_exports_db for e in exports):
             score_adjustment -= 5
 
-        # Additional heuristics (from capstone-only script)
+        # Additional heuristics
         is_running = is_running_pe(path)
         in_suspicious_location = is_in_suspicious_location_pe(path)
         features["is_running"] = is_running
@@ -787,6 +786,20 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
 
         features["suspicious_score"] = max(0, final_score)
         features["suspicious"] = features["suspicious_score"] >= SUSPICIOUS_THRESHOLD
+
+        # Debug output only if suspicious
+        if features["suspicious"]:
+            logging.info("[SUSPICIOUS] %s", path)
+            logging.debug("  size=%d, exe=%s, entropy=%.2f",
+                          features["size"], features["is_executable"], features["entropy"])
+            logging.debug("  signature_status=%s", features["signature_status"])
+            logging.debug("  capstone_analysis=%s", features["capstone_analysis"])
+            logging.debug("  yargen_summary=%s", features["yargen_summary"])
+            logging.debug("  imphash/exports adjustment applied: %d", score_adjustment)
+            logging.debug("  running=%s, suspicious_location=%s",
+                          features["is_running"], features["in_suspicious_location"])
+            logging.debug("  opcode_penalty=%d", opcode_penalty)
+            logging.debug("  final suspicious_score=%d", features["suspicious_score"])
 
     except Exception as e:
         logging.error("Failed to analyze %s: %s", path, e, exc_info=True)
