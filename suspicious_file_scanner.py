@@ -3,23 +3,22 @@
 """
 Suspicious file scanner (original) + Phase2 (YarGen unknown_percentage) ML regressor.
 
+This updated version integrates a PEStudio-style strings XML (whitelist) loader and
+a simple pestudio scoring helper. Place your XML at ./3rdparty/strings.xml or change
+PE_STRINGS_FILE accordingly.
+
 Behavior:
- - All scoring/heuristics remain hardcoded exactly as before.
- - If you provide --ml-model <file>, the scanner will load the saved regressor and
-   use it to predict the Phase2 YarGen `unknown_percentage` for suspicious files
-   instead of computing YarGen at runtime.
- - You can train the Phase2 regressor with --train-phase2 --benign-dir <path> --malicious-dir <path>.
-
-Usage:
-  # Train regressor (will compute ground-truth Phase2 on training files)
-  python suspicious_full_scanner_phase2ml.py --train-phase2 --benign-dir "D:\datas\data2" --malicious-dir "D:\datas\datamaliciousorder" --model-out phase2_reg.joblib
-
-  # Scan and use ML-predicted Phase2 values
-  python suspicious_full_scanner_phase2ml.py -m "C:\path\to\scan" --ml-model phase2_reg.joblib
-
-  # Scan without ML (original behavior)
-  python suspicious_full_scanner_phase2ml.py -m "C:\path\to\scan"
+ - All original heuristics remain hardcoded.
+ - If you provide --ml-model <file>, the scanner will use the regressor to predict
+   the Phase2 YarGen `unknown_percentage` for suspicious files (skipping expensive
+   string extraction for those files). If the regressor prediction fails, it
+   falls back to running YarGen locally.
+ - You can train the Phase2 regressor via --train-phase2 --benign-dir ... --malicious-dir ...
+ - The pestudio strings XML is loaded at startup and its entries are added to
+   the good_strings_db whitelist so YarGen treats them as known.
 """
+from __future__ import annotations
+
 import os
 import sys
 import io
@@ -36,12 +35,44 @@ import argparse
 import binascii
 from collections import Counter
 from typing import Any, Dict, List, Set, Optional, Tuple
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import psutil 
-import pefile
-import capstone
-import lief
-from tqdm import tqdm
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
+
+import ctypes
+from ctypes import wintypes
+
+# Optional heavy deps
+try:
+    import psutil
+except Exception:
+    psutil = None
+
+try:
+    import pefile
+except Exception:
+    pefile = None
+
+try:
+    import capstone
+except Exception:
+    capstone = None
+
+try:
+    import lief
+except Exception:
+    lief = None
+
+try:
+    from tqdm import tqdm
+except Exception:
+    def tqdm(it, **kwargs): return it
+
+# lxml preferred for robust XML parsing; fallback to ElementTree
+try:
+    from lxml import etree as lxml_etree
+    etree = lxml_etree
+except Exception:
+    import xml.etree.ElementTree as lxml_etree  # type: ignore
+    etree = lxml_etree
 
 # NLTK optional for "is_likely_word"
 try:
@@ -70,9 +101,9 @@ try:
     import joblib
 except Exception:
     SKLEARN_AVAILABLE = False
-    # keep names to avoid NameError later; training/prediction code will check flag
+    # training/prediction code will check flag at runtime
 
-# Logging (same file)
+# Logging
 logging.basicConfig(
     filename="suspicious_file_scanner.log",
     filemode="a",
@@ -165,6 +196,20 @@ STARTUP_DIRS = [
 ]
 
 # --------------------
+# PEStudio whitelist file (user requested location)
+# --------------------
+PE_STRINGS_FILE = "./3rdparty/strings.xml"
+
+# Known imphashes mapping (example)
+KNOWN_IMPHASHES = {
+    'a04dd9f5ee88d7774203e0a0cfa1b941': 'PsExec',
+    '2b8c9d9ab6fefc247adaf927e83dcea6': 'RAR SFX variant'
+}
+
+# pestudio strings global store (populated at startup)
+pestudio_strings_global: Dict[str, List[str]] = {}
+
+# --------------------
 # Utility functions
 # --------------------
 def is_ascii_char(b: bytes, padding_allowed: bool = False) -> int:
@@ -217,6 +262,82 @@ def is_likely_word(s: str) -> bool:
     if not nltk_words:
         return False
     return len(s) >= 3 and s.lower() in nltk_words
+
+# --------------------
+# PEStudio strings loader & scorer
+# --------------------
+def initialize_pestudio_strings(xml_path: str = PE_STRINGS_FILE) -> Dict[str, List[str]]:
+    """
+    Parse the pestudio strings XML and return a dict mapping types to lists of strings.
+    We look for tags: string, av, folder, os, reg, guid, ssdl, ext, agent, oid, priv
+    """
+    keys = ["strings", "av", "folder", "os", "reg", "guid", "ssdl", "ext", "agent", "oid", "priv"]
+    pestudio: Dict[str, List[str]] = {k: [] for k in keys}
+    try:
+        if not xml_path or not os.path.exists(xml_path):
+            logging.info("PEStudio strings XML not found: %s", xml_path)
+            return pestudio
+
+        tree = etree.parse(xml_path)
+        root = tree.getroot()
+        # Some files use <strings><string>...</string></strings>
+        # Others may use <strings><item>...</item></strings> — handle both.
+        for k in keys:
+            nodes = root.findall(".//" + k)
+            # if nodes found, dig children (string/item)
+            for node in nodes:
+                # prefer child tags named 'string' or 'item'; otherwise take node.text
+                for child_tag in ("string", "item"):
+                    for child in node.findall(".//" + child_tag):
+                        if child is None or child.text is None:
+                            continue
+                        s = child.text.strip()
+                        if s:
+                            pestudio[k].append(s)
+                # if node has direct text and wasn't captured by children
+                if (node.text is not None) and node.text.strip():
+                    pestudio[k].append(node.text.strip())
+
+        # Normalize: remove duplicates while preserving simple list
+        for k in keys:
+            seen = set()
+            cleaned = []
+            for it in pestudio[k]:
+                if not it:
+                    continue
+                if it in seen:
+                    continue
+                seen.add(it)
+                cleaned.append(it)
+            pestudio[k] = cleaned
+
+        logging.info("Loaded pestudio strings from %s: %s", xml_path, {k: len(v) for k, v in pestudio.items()})
+        return pestudio
+    except Exception as e:
+        logging.exception("Failed to initialize pestudio strings from %s: %s", xml_path, e)
+        return pestudio
+
+def get_pestudio_score(string: str, pestudio_strings: Optional[Dict[str, List[str]]] = None) -> Tuple[int, str]:
+    """
+    Return (score:int, matched_type:str).
+    Score 5 for exact full match found in pestudio lists (excluding 'ext' type).
+    """
+    if pestudio_strings is None:
+        pestudio_strings = pestudio_strings_global
+    if not string or not pestudio_strings:
+        return 0, ""
+    s_lower = string.strip().lower()
+    for typ, lst in pestudio_strings.items():
+        if not lst:
+            continue
+        if typ == "ext":
+            continue  # skip extensions as per original code
+        for item in lst:
+            if not item:
+                continue
+            if item.strip().lower() == s_lower:
+                return 5, typ
+    return 0, ""
 
 # --------------------
 # DB Management
@@ -487,8 +608,6 @@ def analyze_with_capstone_pe(pe_obj) -> Dict[str, Any]:
 # --------------------
 # WinVerifyTrust signature checking (robust handling)
 # --------------------
-import ctypes
-from ctypes import wintypes
 
 class WinVerifyTrust_GUID(ctypes.Structure):
     _fields_ = [
@@ -605,50 +724,57 @@ def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
             s = s[8:]
 
         # Known in whitelist DB?
-        known = s_orig in good_strings_db or s in good_strings_db
+        known = s_orig in good_strings_db or s in good_strings_db or s.lower() in good_strings_db
         score = 0 if known else 1  # baseline
 
         if not known:
-            # English word
-            if is_likely_word(s):
-                score += 1
+            # Pestudio check: if pestudio lists contain exact match, reduce score (treat as known)
+            pscore, ptype = get_pestudio_score(s)
+            if pscore > 0:
+                score = 0
+                # still record the match in reversedStrings? no - we treat as known
 
-            # Base64
-            if re.fullmatch(r'(?:[A-Za-z0-9+/]{4}){2,}(?:==|=)?', s) and is_base_64(s):
-                score += 2
+            else:
+                # English word
+                if is_likely_word(s):
+                    score += 1
 
-            # Hex
-            hex_candidate = re.sub(r'[^0-9a-fA-F]', '', s)
-            if len(hex_candidate) > 8 and is_hex_encoded(hex_candidate, False):
-                score += 2
+                # Base64
+                if re.fullmatch(r'(?:[A-Za-z0-9+/]{4}){2,}(?:==|=)?', s) and is_base_64(s):
+                    score += 2
 
-            # Base64 decode attempt
-            try:
-                for m_string in (s, s[1:], s[:-1], s + "=", s + "=="):
-                    if is_base_64(m_string):
-                        decoded = base64.b64decode(m_string, validate=True)
+                # Hex
+                hex_candidate = re.sub(r'[^0-9a-fA-F]', '', s)
+                if len(hex_candidate) > 8 and is_hex_encoded(hex_candidate, False):
+                    score += 2
+
+                # Base64 decode attempt
+                try:
+                    for m_string in (s, s[1:], s[:-1], s + "=", s + "=="):
+                        if is_base_64(m_string):
+                            decoded = base64.b64decode(m_string, validate=True)
+                            if is_ascii_string(decoded, padding_allowed=True):
+                                score += 2
+                                base64strings[s_orig] = decoded
+                                break
+                except Exception:
+                    pass
+
+                # Hex decode attempt
+                try:
+                    if is_hex_encoded(s):
+                        decoded = bytes.fromhex(s)
                         if is_ascii_string(decoded, padding_allowed=True):
                             score += 2
-                            base64strings[s_orig] = decoded
-                            break
-            except Exception:
-                pass
+                            hexEncStrings[s_orig] = decoded
+                except Exception:
+                    pass
 
-            # Hex decode attempt
-            try:
-                if is_hex_encoded(s):
-                    decoded = bytes.fromhex(s)
-                    if is_ascii_string(decoded, padding_allowed=True):
-                        score += 2
-                        hexEncStrings[s_orig] = decoded
-            except Exception:
-                pass
-
-            # Reversed string detection
-            rev = s[::-1]
-            if rev in good_strings_db:
-                score += 2
-                reversedStrings[s_orig] = rev
+                # Reversed string detection
+                rev = s[::-1]
+                if rev in good_strings_db:
+                    score += 2
+                    reversedStrings[s_orig] = rev
 
         local_scores[s_orig] = score
         stringScores[s_orig] = score
@@ -735,7 +861,7 @@ USE_ML_PHASE2 = False
 
 def analyze_single_file(path: str) -> dict:
     """
-    Same logic as your original analyze_single_file, but:
+    Same logic as original analyze_single_file, but:
      - If file is flagged suspicious and USE_ML_PHASE2 and ML_REGRESSOR is set,
        skip YarGen string scoring and use ML_REGRESSOR to set phase2_percentage.
      - Otherwise compute YarGen exactly as before.
@@ -767,12 +893,13 @@ def analyze_single_file(path: str) -> dict:
 
         pe = None
         try:
-            pe = pefile.PE(path)
-            features['is_executable'] = True
-            features['has_version_info'] = hasattr(pe, 'VS_FIXEDFILEINFO') and getattr(pe, 'VS_FIXEDFILEINFO') is not None
+            if pefile:
+                pe = pefile.PE(path)
+                features['is_executable'] = True
+                features['has_version_info'] = hasattr(pe, 'VS_FIXEDFILEINFO') and getattr(pe, 'VS_FIXEDFILEINFO') is not None
 
-            # Capstone analysis
-            features['capstone_analysis'] = analyze_with_capstone_pe(pe)
+                # Capstone analysis
+                features['capstone_analysis'] = analyze_with_capstone_pe(pe)
         except Exception:
             pass
         finally:
@@ -964,7 +1091,6 @@ def train_phase2_regressor(benign_dir: str, malicious_dir: str, model_out: str =
         raise RuntimeError("No training data collected. Make sure directories are correct and analyzer computed Phase2.")
 
     # Train regressor
-    from sklearn.ensemble import RandomForestRegressor
     print("Training Phase2 regressor (RandomForest)...")
     reg = RandomForestRegressor(n_estimators=150, n_jobs=-1, random_state=42)
     reg.fit(X, y)
@@ -1002,6 +1128,9 @@ if __name__ == "__main__":
     # Scan-time ML model (only Phase2 used)
     parser.add_argument('--ml-model', help='Path to Phase2 regressor to use during scan (only YarGen percentage will be ML-predicted)')
 
+    # pestudio whitelist xml path
+    parser.add_argument('--whitelist-xml', dest='whitelist_xml', default=PE_STRINGS_FILE, help='Path to pestudio strings.xml (whitelist)')
+
     args = parser.parse_args()
 
     USE_OPCODES = bool(args.use_opcodes)
@@ -1026,7 +1155,25 @@ if __name__ == "__main__":
             update_databases(force=True, use_opcodes=USE_OPCODES)
         except Exception as e:
             logging.warning("update_databases failed: %s", e)
+
+    # Load DBs
     load_good_dbs(use_opcodes=USE_OPCODES)
+
+    # Load pestudio whitelist XML and add entries to good_strings_db
+    try:
+        pestudio_strings_global = initialize_pestudio_strings(args.whitelist_xml)
+        # flatten all pestudio strings into the good_strings_db as whitelisted tokens
+        flatten = []
+        for k, lst in pestudio_strings_global.items():
+            for it in lst:
+                if it:
+                    flatten.append(it)
+                    flatten.append(it.lower())
+        if flatten:
+            good_strings_db.update({s: 1 for s in set(flatten)})
+            logging.info("Injected %d pestudio whitelist entries into good_strings_db", len(set(flatten)))
+    except Exception as e:
+        logging.warning("Failed to load or inject pestudio whitelist: %s", e)
 
     # If an ML model is provided, load it and enable ML Phase2
     if args.ml_model:

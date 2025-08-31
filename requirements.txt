@@ -4,3 +4,5 @@ pefile
 capstone 
 lief 
 nltk
+lxml
+joblib
