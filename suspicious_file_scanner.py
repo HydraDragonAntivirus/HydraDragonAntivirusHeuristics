@@ -55,8 +55,16 @@ except Exception:
     words = None  # type: ignore
     nltk_words = set()
 
-# default: don't run opcode extraction (very CPU / IO heavy)
-USE_OPCODES = False
+# ------------------------------
+# Global Known-Good DB Containers
+# ------------------------------
+good_opcodes_db = {}
+base64strings = set()
+hexEncStrings = set()
+reversedStrings = set()
+KNOWN_IMPHASHES = {}
+KNOWN_EXPORTS = {}
+USE_OPCODES = False  # Set True if opcode matching is required
 
 # Basic configuration
 SCAN_FOLDER = "D:\\datas2\\data2"
@@ -435,102 +443,83 @@ def stream_load_gzip_json(path):
     except Exception:
         return None
 
-def load_good_dbs(dbs_dir: str = "./dbs"):
+def load_good_dbs(db_path="./dbs"):
     """
-    Load yarGen good-* DBs safely, optimized for massive DB files.
-    - Streams gzip JSON instead of reading fully into memory.
-    - Skips opcodes DBs unless USE_OPCODES is True.
+    Loads all known-good DBs safely and normalizes them for matching.
+    Automatically initializes globals if missing.
     """
+
     global good_opcodes_db, base64strings, hexEncStrings, reversedStrings
-    global KNOWN_IMPHASHES, KNOWN_EXPORTS
+    global KNOWN_IMPHASHES, KNOWN_EXPORTS, USE_OPCODES
 
-    USE_OPCODES = globals().get("USE_OPCODES", False)
+    # Auto-initialize if missing
+    if "good_opcodes_db" not in globals():
+        good_opcodes_db = {}
+    if "base64strings" not in globals():
+        base64strings = set()
+    if "hexEncStrings" not in globals():
+        hexEncStrings = set()
+    if "reversedStrings" not in globals():
+        reversedStrings = set()
+    if "KNOWN_IMPHASHES" not in globals():
+        KNOWN_IMPHASHES = {}
+    if "KNOWN_EXPORTS" not in globals():
+        KNOWN_EXPORTS = {}
 
-    good_opcodes_db = set()
-    base64strings = set()
-    hexEncStrings = set()
-    reversedStrings = set()
-    KNOWN_IMPHASHES = {}
-    KNOWN_EXPORTS = set()
-
-    if not os.path.isdir(dbs_dir):
-        logging.warning("DB directory not found: %s", dbs_dir)
-        return
-
-    files = sorted(glob.glob(os.path.join(dbs_dir, "*")))
-    if not files:
-        logging.warning("No DB files found in %s", dbs_dir)
-        return
-
-    loaded_files = 0
+    files = sorted(glob.glob(os.path.join(db_path, "*.db")))
     skipped = []
+
+    logging.info("Attempting to load good DBs...")
 
     for p in files:
         bn = os.path.basename(p).lower()
 
-        # Skip opcode DBs unless enabled
+        # Skip opcode DBs unless explicitly requested
         if "opcodes" in bn and not USE_OPCODES:
-            continue
-
-        logging.info("Attempting to load DB file: %s (size=%d bytes)", p, os.path.getsize(p))
-
-        db = stream_load_gzip_json(p)
-        if db is None:
-            # Fallback: try plain text open if gzip/json fails
-            try:
-                with open(p, "r", encoding="utf-8", errors="ignore") as fh:
-                    db = {ln.strip(): 1 for ln in fh if ln.strip()}
-            except:
-                skipped.append(p)
-                continue
-
-        # Normalize into dict
-        if isinstance(db, list):
-            db = {str(k): 1 for k in db}
-        elif not isinstance(db, dict):
-            db = {str(k): 1 for k in db}
-
-        # Distribute data into correct sets
-        try:
-            if "opcodes" in bn:
-                for k in db:
-                    good_opcodes_db.add(str(k).replace(" ", "").lower())
-
-            elif "strings" in bn:
-                for s in db:
-                    s_l = s.lower()
-                    if is_base_64(s):
-                        base64strings.add(s)
-                        base64strings.add(s_l)
-                    elif is_hex_encoded(re.sub(r'[^0-9a-fA-F]', '', s), check_length=False):
-                        hexEncStrings.add(s)
-                        hexEncStrings.add(s_l)
-                    else:
-                        reversedStrings.add(s)
-                        reversedStrings.add(s_l)
-
-            elif "imphash" in bn or "imphashes" in bn:
-                KNOWN_IMPHASHES.update({str(k).lower(): bn for k in db})
-
-            elif "exports" in bn:
-                KNOWN_EXPORTS.update(str(k).lower() for k in db)
-
-            loaded_files += 1
-
-        except Exception:
             skipped.append(p)
             continue
 
+        try:
+            with gzip.open(p, "rt", encoding="utf-8") as f:
+                db = json.load(f)
+        except Exception as e:
+            logging.error("Failed to load DB file %s: %s", p, e)
+            skipped.append(p)
+            continue
+
+        # Normalize DB contents based on type
+        if "opcodes" in bn:
+            good_opcodes_db.update({op.lower(): 1 for op in db})
+
+        elif "imphashes" in bn:
+            KNOWN_IMPHASHES.update({imp.lower(): 1 for imp in db})
+
+        elif "exports" in bn:
+            KNOWN_EXPORTS.update({exp.lower(): 1 for exp in db})
+
+        elif "strings" in bn:
+            for s in db:
+                s_l = s.lower()
+                if is_base_64(s):
+                    base64strings.add(s)
+                    base64strings.add(s_l)
+                elif is_hex_encoded(re.sub(r"[^0-9a-fA-F]", "", s), check_length=False):
+                    hexEncStrings.add(s)
+                    hexEncStrings.add(s_l)
+                else:
+                    # DB stores reversed known-good strings
+                    reversedStrings.add(s[::-1])
+                    reversedStrings.add(s_l[::-1])
+
     logging.info(
-        "Loaded good DBs: opcodes=%d base64=%d hexEnc=%d strings=%d imphashes=%d exports=%d "
-        "(files_loaded=%d skipped=%d)",
+        "Loaded good DBs: opcodes=%d base64=%d hexEnc=%d strings=%d imphashes=%d exports=%d (files_loaded=%d skipped=%d)",
         len(good_opcodes_db),
         len(base64strings),
         len(hexEncStrings),
         len(reversedStrings),
         len(KNOWN_IMPHASHES),
         len(KNOWN_EXPORTS),
-        loaded_files,
+        len(files) - len(skipped),
         len(skipped),
     )
 
@@ -540,12 +529,8 @@ def is_likely_word(s: str) -> bool:
 
 def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=None):
     """
-    Calculate the percentage of known-good matches for the given file.
-
-    Improvements:
-    - Auto-detects missing or empty DBs and excludes them from scoring.
-    - Skips markers from disabled DBs (like opcodes).
-    - Handles partially loaded DBs without forcing 0.0%.
+    Calculates how much of this file matches known-good DBs.
+    Fixes reversed string matching and adds per-DB match debug logging.
     """
 
     global good_opcodes_db, base64strings, hexEncStrings, reversedStrings
@@ -553,43 +538,46 @@ def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=
 
     matches = 0
     total_markers = 0
+    db_hits = {"opcodes": 0, "imphashes": 0, "exports": 0, "strings": 0}
 
     # --- OPCODES ---
     try:
-        if USE_OPCODES and good_opcodes_db and len(good_opcodes_db) > 0:
+        if USE_OPCODES and good_opcodes_db:
             opcodes = extract_opcodes(file_data)
-            if opcodes:
-                total_markers += len(opcodes)
-                for op in opcodes:
-                    if op.replace(" ", "").lower() in good_opcodes_db:
-                        matches += 1
+            total_markers += len(opcodes)
+            for op in opcodes:
+                if op.replace(" ", "").lower() in good_opcodes_db:
+                    matches += 1
+                    db_hits["opcodes"] += 1
     except Exception:
         logging.debug("Opcode check failed for %s", path, exc_info=True)
 
     # --- IMPORT HASHES ---
     try:
         imphash, exports = get_pe_info(file_data)
-        if KNOWN_IMPHASHES and len(KNOWN_IMPHASHES) > 0:
+        if KNOWN_IMPHASHES:
             total_markers += 1
             if imphash and imphash.lower() in KNOWN_IMPHASHES:
                 matches += 1
+                db_hits["imphashes"] += 1
     except Exception:
         imphash, exports = None, []
 
     # --- EXPORTS ---
     try:
-        if KNOWN_EXPORTS and len(KNOWN_EXPORTS) > 0:
+        if KNOWN_EXPORTS:
             total_markers += len(exports)
             for e in exports:
                 if e and e.lower() in KNOWN_EXPORTS:
                     matches += 1
+                    db_hits["exports"] += 1
     except Exception:
         pass
 
     # --- STRINGS ---
     try:
         strings = precomputed_strings or extract_strings(file_data)
-        if strings and (base64strings or hexEncStrings or reversedStrings):
+        if strings:
             total_markers += len(strings)
             for s in strings:
                 s_l = s.lower()
@@ -598,19 +586,25 @@ def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=
                     or s_l in base64strings
                     or s in hexEncStrings
                     or s_l in hexEncStrings
-                    or s in reversedStrings
-                    or s_l in reversedStrings
+                    or s[::-1] in reversedStrings
+                    or s_l[::-1] in reversedStrings
                 ):
                     matches += 1
+                    db_hits["strings"] += 1
     except Exception:
         pass
 
     # --- Final percentage ---
-    if total_markers == 0:
-        return 0.0
+    percent = 0.0 if total_markers == 0 else round((matches / total_markers) * 100.0, 2)
 
-    percent = (matches / total_markers) * 100.0
-    return round(percent, 2)
+    # Debug logging: show matches per DB
+    logging.debug(
+        "Goodware match stats for %s: opcodes=%d, imphashes=%d, exports=%d, strings=%d, total=%d, percent=%.2f%%",
+        path, db_hits["opcodes"], db_hits["imphashes"], db_hits["exports"], db_hits["strings"],
+        matches, percent
+    )
+
+    return percent
 
 def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
     analysis = {
