@@ -7,8 +7,6 @@ This version:
  - Keeps Phase1 heuristics (entropy, age, signature, capstone packing analysis).
  - Loads PEStudio-style strings XML (whitelist).
 """
-from __future__ import annotations
-
 import os
 import io
 import math
@@ -853,7 +851,13 @@ def analyze_single_file(path: str) -> dict:
         features['flagging_reasons'] = flagging_reasons
 
         if features['suspicious']:
-            logging.info(f"[Phase 1] Suspicious detected: {path} | Score: {phase1}")
+            logging.info(
+                "[Phase 1] Suspicious detected: %s | Score: %d | Reasons: %s | PE Checks: %s",
+                features['path'],
+                features['phase1_score'],
+                features['flagging_reasons'],
+                [desc for desc, verdict in features['pe_checks'] if verdict == "Suspicious"]
+            )
 
     except Exception as e:
         logging.error(f"Failed to analyze {path}: {e}")
@@ -917,23 +921,3 @@ if __name__ == "__main__":
     suspicious = [r for r in results if r and r.get("suspicious")]
     print("\n--- Scan Summary ---")
     print(f"Completed in {dur:.2f}s. Files scanned: {len(results)} Suspicious: {len(suspicious)}")
-    
-    if suspicious:
-        suspicious.sort(key=lambda x: x.get("suspicious_score", 0), reverse=True)
-        print(f"\n=== FLAGGED FILES (Score >= {SUSPICIOUS_THRESHOLD}) ===")
-        
-        for i, r in enumerate(suspicious[:20]):
-            print(f"\n[{i+1}] {os.path.basename(r['path'])}")
-            print(f"    Full Path: {r['path']}")
-            print(f"    Total Score: {r.get('phase1_score', 0)} | Signature: {r.get('signature_status','N/A')}")
-            print("    Flagging Breakdown:")
-            
-            if 'flagging_reasons' in r and r['flagging_reasons']:
-                for reason in r['flagging_reasons']:
-                    print(f"      * {reason}")
-            else:
-                print("      * No flagging reasons recorded - check debug logs")
-                print(f"      * File details: entropy={r.get('entropy', 0):.2f}, age={r.get('age_days', 0):.2f} days")
-                print(f"      * PE checks found: {len(r.get('pe_checks', []))}")
-                    
-    print("Done. See log for details.")
