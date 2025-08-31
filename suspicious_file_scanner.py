@@ -5,7 +5,7 @@ Suspicious file scanner + PEStudio XML whitelist preserved.
 
 This version:
  - Keeps Phase1 heuristics (entropy, age, signature, capstone packing analysis).
- - Loads PEStudio-style strings XML (whitelist) and injects entries into good_strings_db.
+ - Loads PEStudio-style strings XML (whitelist).
 """
 from __future__ import annotations
 
@@ -111,11 +111,6 @@ if not hasattr(ctypes, "BYTE"):
 # --------------------
 SUSPICIOUS_THRESHOLD = 15
 SCAN_FOLDER = "."
-
-# DB containers (opcode DB removed)
-good_strings_db: Counter = Counter()
-good_imphashes_db: Set[str] = set()
-good_exports_db: Set[str] = set()
 
 # Suspicious / system directories (used by capstone scanner)
 SUSPICIOUS_DIRS = [
@@ -311,9 +306,6 @@ def get_pestudio_score(string: str) -> Tuple[int, str]:
                 return 5, typ
     return 0, ""
 
-# --------------------
-# DB Management (keeps local db loading from ./dbs, downloader removed)
-# --------------------
 # --------------------
 # PE/Capstone utilities (kept)
 # --------------------
@@ -587,6 +579,7 @@ def analyze_single_file(path: str) -> dict:
     Phase1 heuristics + PE-specific checks.
     All PE detectors produce verdict 'Suspicious' when triggered.
     Returns features dict including `pe_checks` and updated phase1_score.
+    MODIFIED: Now tracks what caused the file to be flagged.
     """
     features: Dict[str, Any] = {
         'path': path,
@@ -605,7 +598,8 @@ def analyze_single_file(path: str) -> dict:
         'phase1_score': 0,
         'phase2_summary': None,
         'phase2_percentage': 0.0,
-        'pe_checks': []
+        'pe_checks': [],
+        'flagging_reasons': []  # NEW: Track what caused flagging
     }
 
     try:
@@ -622,16 +616,15 @@ def analyze_single_file(path: str) -> dict:
 
         # Additional check: SYSTEM file at unusual location
         try:
-            if os.name == "nt":
-                import ctypes
-                FILE_ATTRIBUTE_SYSTEM = 0x4
-                attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-                if attrs != -1 and (attrs & FILE_ATTRIBUTE_SYSTEM):
-                    # SYSTEM file outside Windows/System32/SysWOW64 is suspicious
-                    norm_path = os.path.normcase(os.path.abspath(path))
-                    allowed_dirs = [os.path.normcase(d) for d in SYSTEM_DIRS if d]
-                    if not any(norm_path.startswith(d) for d in allowed_dirs):
-                        features['pe_checks'].append(("SYSTEM file at unusual location", "Suspicious"))
+            import ctypes
+            FILE_ATTRIBUTE_SYSTEM = 0x4
+            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+            if attrs != -1 and (attrs & FILE_ATTRIBUTE_SYSTEM):
+                # SYSTEM file outside Windows/System32/SysWOW64 is suspicious
+                norm_path = os.path.normcase(os.path.abspath(path))
+                allowed_dirs = [os.path.normcase(d) for d in SYSTEM_DIRS if d]
+                if not any(norm_path.startswith(d) for d in allowed_dirs):
+                    features['pe_checks'].append(("SYSTEM file at unusual location", "Suspicious"))
         except Exception:
             pass
 
@@ -805,37 +798,59 @@ def analyze_single_file(path: str) -> dict:
 
         # --------------------
         # Phase1 scoring: every Suspicious check adds +2
+        # MODIFIED: Track what caused each point addition
         # --------------------
         phase1 = 0
+        flagging_reasons = []
+        
         cap = features['capstone_analysis'].get('overall_analysis', {})
         if cap.get('is_likely_packed'):
             phase1 += 3
+            flagging_reasons.append(f"Capstone packing detection (+3 points)")
+            
         if features['entropy'] > 7.5:
-            phase1 += 5 if not features['signature_valid'] else 2
+            points = 5 if not features['signature_valid'] else 2
+            phase1 += points
+            flagging_reasons.append(f"High entropy {features['entropy']:.2f} (+{points} points)")
+            
         if features['age_days'] < 1:
             phase1 += 2
+            flagging_reasons.append(f"Recent file {features['age_days']:.2f} days old (+2 points)")
+            
         if 'temp' in path.lower() or 'cache' in path.lower():
             phase1 += 2
+            flagging_reasons.append(f"File in temp/cache directory (+2 points)")
+            
         if features['is_executable'] and not features['has_version_info'] and not features['signature_valid']:
             phase1 += 1
+            flagging_reasons.append(f"Executable without version info or signature (+1 point)")
+            
         if features['is_executable'] and not features['signature_valid']:
             if features['signature_status'] == "Untrusted root":
                 phase1 += 4
+                flagging_reasons.append(f"Untrusted root certificate (+4 points)")
             else:
                 phase1 += 2
+                flagging_reasons.append(f"No valid signature: {features['signature_status']} (+2 points)")
+                
         if features['in_suspicious_location']:
             phase1 += 2
+            flagging_reasons.append(f"File in suspicious location (+2 points)")
+            
         if features['is_running']:
             phase1 += 3
+            flagging_reasons.append(f"File is currently running (+3 points)")
 
         # Add +2 per Suspicious PE check
-        for _, verdict in features['pe_checks']:
+        for check_desc, verdict in features['pe_checks']:
             if verdict == "Suspicious":
                 phase1 += 2
+                flagging_reasons.append(f"PE check: {check_desc} (+2 points)")
 
         features['phase1_score'] = phase1
         features['suspicious_score'] = phase1
         features['suspicious'] = phase1 >= SUSPICIOUS_THRESHOLD
+        features['flagging_reasons'] = flagging_reasons
 
         if features['suspicious']:
             logging.info(f"[Phase 1] Suspicious detected: {path} | Score: {phase1}")
@@ -873,7 +888,7 @@ def scan_directory_parallel(directory: str, max_workers: Optional[int] = None):
     return results
 
 # --------------------
-# CLI / main (update-db option removed)
+# CLI / main
 # --------------------
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Suspicious file scanner")
@@ -887,8 +902,6 @@ if __name__ == "__main__":
     SCAN_FOLDER = args.scan_path
 
     print("--- Suspicious file scanner ---")
-
-    # Load DBs (local ./dbs only)
 
     # Load pestudio whitelist XML (no local good_* DBs used)
     try:
@@ -904,9 +917,23 @@ if __name__ == "__main__":
     suspicious = [r for r in results if r and r.get("suspicious")]
     print("\n--- Scan Summary ---")
     print(f"Completed in {dur:.2f}s. Files scanned: {len(results)} Suspicious: {len(suspicious)}")
+    
     if suspicious:
         suspicious.sort(key=lambda x: x.get("suspicious_score", 0), reverse=True)
-        print("\nTop suspicious files:")
-        for r in suspicious[:20]:
-            print(f"{r['path']}\n  Phase1 Score: {r.get('phase1_score', 0)}  Sig: {r.get('signature_status','N/A')}")
+        print(f"\n=== FLAGGED FILES (Score >= {SUSPICIOUS_THRESHOLD}) ===")
+        
+        for i, r in enumerate(suspicious[:20]):
+            print(f"\n[{i+1}] {os.path.basename(r['path'])}")
+            print(f"    Full Path: {r['path']}")
+            print(f"    Total Score: {r.get('phase1_score', 0)} | Signature: {r.get('signature_status','N/A')}")
+            print("    Flagging Breakdown:")
+            
+            if 'flagging_reasons' in r and r['flagging_reasons']:
+                for reason in r['flagging_reasons']:
+                    print(f"      * {reason}")
+            else:
+                print("      * No flagging reasons recorded - check debug logs")
+                print(f"      * File details: entropy={r.get('entropy', 0):.2f}, age={r.get('age_days', 0):.2f} days")
+                print(f"      * PE checks found: {len(r.get('pe_checks', []))}")
+                    
     print("Done. See log for details.")
