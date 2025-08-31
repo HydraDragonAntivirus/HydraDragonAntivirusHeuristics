@@ -1,5 +1,6 @@
-lief
-lxml
+tqdm 
+psutil 
+pefile 
+capstone 
+lief 
 nltk
-capstone
-pefile
