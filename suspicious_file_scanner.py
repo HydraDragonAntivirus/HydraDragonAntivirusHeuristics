@@ -538,102 +538,78 @@ def is_likely_word(s: str) -> bool:
     """Return True if string is at least 3 chars and exists in NLTK words."""
     return len(s) >= 3 and s.lower() in nltk_words
 
-def check_against_good_dbs_percentage(path: str, file_data: Optional[bytes] = None, precomputed_strings: Optional[List[str]] = None) -> float:
+def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=None):
     """
-    Returns the percentage (0-100) of known-good markers the file matches.
-    New approach (more like yarGen): compare *extracted items* from the file
-    (strings, opcodes, exports, imphash) against the loaded good-* DBs and compute:
+    Calculate the percentage of known-good matches for the given file.
 
-        percent = (matched_items / total_items_checked) * 100
-
-    This gives a readable ratio: e.g. if 10 extracted strings and 2 are known-good -> 20.0
+    Improvements:
+    - Auto-detects missing or empty DBs and excludes them from scoring.
+    - Skips markers from disabled DBs (like opcodes).
+    - Handles partially loaded DBs without forcing 0.0%.
     """
-    try:
-        if file_data is None:
-            with open(path, "rb") as fh:
-                file_data = fh.read()
-    except Exception:
-        logging.debug("Failed to open for good-db check: %s", path, exc_info=True)
-        return 0.0
 
-    total_markers = 0
+    global good_opcodes_db, base64strings, hexEncStrings, reversedStrings
+    global KNOWN_IMPHASHES, KNOWN_EXPORTS, USE_OPCODES
+
     matches = 0
-
-    # --- IMPHASH ---
-    try:
-        imphash, exports = get_pe_info(file_data)
-        if KNOWN_IMPHASHES:
-            total_markers += 1
-            if imphash and imphash.lower() in KNOWN_IMPHASHES:
-                matches += 1
-    except Exception:
-        logging.debug("imphash check failed for %s", path, exc_info=True)
-
-    # --- EXPORTS ---
-    try:
-        if KNOWN_EXPORTS:
-            # each export in the file is a potential match
-            total_markers += len(exports)
-            for exp in exports:
-                exp_l = exp.lower().strip()
-                if exp_l in KNOWN_EXPORTS:
-                    matches += 1
-    except Exception:
-        logging.debug("exports check failed for %s", path, exc_info=True)
+    total_markers = 0
 
     # --- OPCODES ---
     try:
-        if USE_OPCODES and good_opcodes_db:
+        if USE_OPCODES and good_opcodes_db and len(good_opcodes_db) > 0:
             opcodes = extract_opcodes(file_data)
             if opcodes:
                 total_markers += len(opcodes)
                 for op in opcodes:
-                    op_l = op.replace(" ", "").lower()
-                    if op_l in good_opcodes_db:
+                    if op.replace(" ", "").lower() in good_opcodes_db:
                         matches += 1
     except Exception:
-        logging.debug("opcode check failed for %s", path, exc_info=True)
+        logging.debug("Opcode check failed for %s", path, exc_info=True)
 
+    # --- IMPORT HASHES ---
+    try:
+        imphash, exports = get_pe_info(file_data)
+        if KNOWN_IMPHASHES and len(KNOWN_IMPHASHES) > 0:
+            total_markers += 1
+            if imphash and imphash.lower() in KNOWN_IMPHASHES:
+                matches += 1
     except Exception:
-        logging.debug("opcode check failed for %s", path, exc_info=True)
+        imphash, exports = None, []
+
+    # --- EXPORTS ---
+    try:
+        if KNOWN_EXPORTS and len(KNOWN_EXPORTS) > 0:
+            total_markers += len(exports)
+            for e in exports:
+                if e and e.lower() in KNOWN_EXPORTS:
+                    matches += 1
+    except Exception:
+        pass
 
     # --- STRINGS ---
     try:
-        string_dbs_present = bool(base64strings or hexEncStrings or reversedStrings)
-        if string_dbs_present:
-            if precomputed_strings is None:
-                strings = extract_strings(file_data)
-            else:
-                strings = precomputed_strings
-
-            # Only consider strings that look like words or are long enough; keep behavior similar to existing code
-            filtered_strings = [s for s in strings if len(s) >= 3]
-
-            total_markers += len(filtered_strings)
-            for s in filtered_strings:
+        strings = precomputed_strings or extract_strings(file_data)
+        if strings and (base64strings or hexEncStrings or reversedStrings):
+            total_markers += len(strings)
+            for s in strings:
                 s_l = s.lower()
-                # check against any string DB
-                if s in base64strings or s_l in base64strings:
+                if (
+                    s in base64strings
+                    or s_l in base64strings
+                    or s in hexEncStrings
+                    or s_l in hexEncStrings
+                    or s in reversedStrings
+                    or s_l in reversedStrings
+                ):
                     matches += 1
-                    continue
-                if s in hexEncStrings or s_l in hexEncStrings:
-                    matches += 1
-                    continue
-                if s in reversedStrings or s_l in reversedStrings:
-                    matches += 1
-                    continue
     except Exception:
-        logging.debug("string DB check failed for %s", path, exc_info=True)
+        pass
 
+    # --- Final percentage ---
     if total_markers == 0:
         return 0.0
 
     percent = (matches / total_markers) * 100.0
-    # bound and round for readability
-    if percent < 0:
-        percent = 0.0
-    if percent > 100:
-        percent = 100.0
     return round(percent, 2)
 
 def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
