@@ -1,6 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""
+Suspicious file scanner (original) + Phase2 (YarGen unknown_percentage) ML regressor.
 
+Behavior:
+ - All scoring/heuristics remain hardcoded exactly as before.
+ - If you provide --ml-model <file>, the scanner will load the saved regressor and
+   use it to predict the Phase2 YarGen `unknown_percentage` for suspicious files
+   instead of computing YarGen at runtime.
+ - You can train the Phase2 regressor with --train-phase2 --benign-dir <path> --malicious-dir <path>.
+
+Usage:
+  # Train regressor (will compute ground-truth Phase2 on training files)
+  python suspicious_full_scanner_phase2ml.py --train-phase2 --benign-dir "D:\datas\data2" --malicious-dir "D:\datas\datamaliciousorder" --model-out phase2_reg.joblib
+
+  # Scan and use ML-predicted Phase2 values
+  python suspicious_full_scanner_phase2ml.py -m "C:\path\to\scan" --ml-model phase2_reg.joblib
+
+  # Scan without ML (original behavior)
+  python suspicious_full_scanner_phase2ml.py -m "C:\path\to\scan"
+"""
 import os
 import sys
 import io
@@ -44,7 +63,16 @@ except Exception:
     nltk = None
     nltk_words = set()
 
-# Logging
+# ML deps (for training / regressor). If not installed, training will fail with a clear message.
+SKLEARN_AVAILABLE = True
+try:
+    from sklearn.ensemble import RandomForestRegressor
+    import joblib
+except Exception:
+    SKLEARN_AVAILABLE = False
+    # keep names to avoid NameError later; training/prediction code will check flag
+
+# Logging (same file)
 logging.basicConfig(
     filename="suspicious_file_scanner.log",
     filemode="a",
@@ -672,13 +700,45 @@ def is_in_suspicious_location_pe(path: str) -> bool:
     return False
 
 # --------------------
-# Single-file analysis (no known-extension/filename lookups)
+# ML feature vector for Phase2 regressor
 # --------------------
+FEATURE_ORDER = [
+    'size', 'entropy', 'age_days',
+    'is_executable', 'has_version_info', 'signature_valid',
+    'in_suspicious_location', 'is_running',
+    'cap_add_count', 'cap_mov_count', 'cap_total_instructions',
+]
+
+def extract_feature_vector(features: dict) -> List[float]:
+    cap = features.get('capstone_analysis', {}).get('overall_analysis', {}) if features.get('capstone_analysis') else {}
+    vals = {
+        'size': features.get('size', 0),
+        'entropy': features.get('entropy', 0.0),
+        'age_days': features.get('age_days', 0.0),
+        'is_executable': 1.0 if features.get('is_executable') else 0.0,
+        'has_version_info': 1.0 if features.get('has_version_info') else 0.0,
+        'signature_valid': 1.0 if features.get('signature_valid') else 0.0,
+        'in_suspicious_location': 1.0 if features.get('in_suspicious_location') else 0.0,
+        'is_running': 1.0 if features.get('is_running') else 0.0,
+        'cap_add_count': float(cap.get('add_count', 0)),
+        'cap_mov_count': float(cap.get('mov_count', 0)),
+        'cap_total_instructions': float(cap.get('total_instructions', 0)),
+    }
+    return [float(vals.get(k, 0.0)) for k in FEATURE_ORDER]
+
+# --------------------
+# Single-file analysis (modified to allow ML-predicted Phase2)
+# --------------------
+# Global pointers for runtime ML usage (set when loading model)
+ML_REGRESSOR = None  # if set, used to predict phase2_percentage (only value predicted by ML)
+USE_ML_PHASE2 = False
+
 def analyze_single_file(path: str) -> dict:
     """
-    Analyze a single file with PE, Capstone, entropy, runtime, signature checks.
-    Phase 1: basic heuristics (entropy, packing, location, running, signature, opcodes)
-    Phase 2: YarGen-style string scoring (only if phase1_score >= threshold)
+    Same logic as your original analyze_single_file, but:
+     - If file is flagged suspicious and USE_ML_PHASE2 and ML_REGRESSOR is set,
+       skip YarGen string scoring and use ML_REGRESSOR to set phase2_percentage.
+     - Otherwise compute YarGen exactly as before.
     """
     features = {
         'path': path,
@@ -713,9 +773,7 @@ def analyze_single_file(path: str) -> dict:
 
             # Capstone analysis
             features['capstone_analysis'] = analyze_with_capstone_pe(pe)
-
-        except pefile.PEFormatError:
-            # Not a valid PE, skip executable-specific
+        except Exception:
             pass
         finally:
             if pe:
@@ -787,27 +845,42 @@ def analyze_single_file(path: str) -> dict:
         if features['suspicious']:
             logging.info(f"[Phase 1] Suspicious detected: {path} | Score: {phase1}")
 
-            # --------------------
-            # Phase 2: YarGen string scoring
-            # --------------------
-            try:
-                with open(path, "rb") as fh:
-                    file_data = fh.read()
-                strings = extract_strings(file_data)
-                yargen_summary = score_strings_yargen_style(strings)  # uses global good_strings_db
-                features['phase2_summary'] = yargen_summary
-                features['phase2_percentage'] = yargen_summary.get('unknown_percentage', 0.0)
+            # If ML model for Phase2 is enabled and loaded, use it and SKIP heavy YarGen
+            if USE_ML_PHASE2 and ML_REGRESSOR is not None:
+                try:
+                    fv = extract_feature_vector(features)
+                    pred = float(ML_REGRESSOR.predict([fv])[0])
+                    pred = max(0.0, min(100.0, pred))  # clamp
+                    features['phase2_percentage'] = pred
+                    features['phase2_summary'] = {"unknown_percentage": pred, "total_strings": 0, "top_unknowns": []}
+                    combined_score = phase1 + (pred / 10.0)
+                    features['suspicious_score'] = combined_score
+                    features['suspicious'] = combined_score >= SUSPICIOUS_THRESHOLD
+                    logging.info(f"[Phase 2 - ML] Predicted Phase2% for {path}: {pred:.2f}% (combined score {combined_score:.2f})")
+                except Exception as e:
+                    logging.warning(f"[Phase 2 - ML] Prediction failed for {path}: {e}")
+                    # fallback to real YarGen if prediction fails
+                    USE_LOCAL_YARGEN = True
+                else:
+                    USE_LOCAL_YARGEN = False
+            else:
+                USE_LOCAL_YARGEN = True
 
-                # Optionally combine Phase 1 + Phase 2 into final suspicious score
-                combined_score = phase1 + (features['phase2_percentage'] / 10)  # scale 0–100% into small weight
-                features['suspicious_score'] = combined_score
-                features['suspicious'] = combined_score >= SUSPICIOUS_THRESHOLD
-
-                logging.info(f"[Phase 2] YarGen summary for {path}: {yargen_summary}")
-                logging.info(f"[Phase 2] Phase2 % used in score: {features['phase2_percentage']:.2f}%")
-
-            except Exception as e:
-                logging.warning(f"[Phase 2] Failed for {path}: {e}")
+            if USE_LOCAL_YARGEN:
+                try:
+                    with open(path, "rb") as fh:
+                        file_data = fh.read()
+                    strings = extract_strings(file_data)
+                    yargen_summary = score_strings_yargen_style(strings)
+                    features['phase2_summary'] = yargen_summary
+                    features['phase2_percentage'] = yargen_summary.get('unknown_percentage', 0.0)
+                    combined_score = phase1 + (features['phase2_percentage'] / 10)
+                    features['suspicious_score'] = combined_score
+                    features['suspicious'] = combined_score >= SUSPICIOUS_THRESHOLD
+                    logging.info(f"[Phase 2] YarGen summary for {path}: {yargen_summary}")
+                    logging.info(f"[Phase 2] Phase2 % used in score: {features['phase2_percentage']:.2f}%")
+                except Exception as e:
+                    logging.warning(f"[Phase 2] Failed for {path}: {e}")
 
     except Exception as e:
         logging.error(f"Failed to analyze {path}: {e}")
@@ -842,31 +915,142 @@ def scan_directory_parallel(directory: str, max_workers: Optional[int] = None):
     return results
 
 # --------------------
+# ML training utilities for Phase2 regressor
+# --------------------
+def gather_phase2_training_data(directory: str, limit: Optional[int] = None, max_workers: Optional[int] = None):
+    """
+    Run analyze_single_file over directory (YarGen will be computed inside analyze_single_file)
+    and return X (feature vectors) and y (phase2 percentage) lists.
+    """
+    file_paths = []
+    for root, _, files in os.walk(directory):
+        for f in files:
+            file_paths.append(os.path.join(root, f))
+    if limit:
+        file_paths = file_paths[:limit]
+
+    X = []
+    y = []
+    workers = max_workers or (os.cpu_count() or 1)
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(analyze_single_file, p): p for p in file_paths}
+        for fut in as_completed(futures):
+            p = futures[fut]
+            try:
+                res = fut.result()
+                if res and 'error' not in res:
+                    fv = extract_feature_vector(res)
+                    X.append(fv)
+                    y.append(float(res.get('phase2_percentage') or 0.0))
+            except Exception as e:
+                logging.debug("Training gather failed for %s: %s", p, e)
+    return X, y
+
+def train_phase2_regressor(benign_dir: str, malicious_dir: str, model_out: str = "phase2_reg.joblib", limit_per_class: Optional[int] = None):
+    if not SKLEARN_AVAILABLE:
+        raise RuntimeError("scikit-learn + joblib are required for training. Install scikit-learn and joblib.")
+
+    print("Gathering benign data...", benign_dir)
+    Xb, yb = gather_phase2_training_data(benign_dir, limit=limit_per_class)
+    print(f"Benign samples: {len(Xb)}")
+    print("Gathering malicious data...", malicious_dir)
+    Xm, ym = gather_phase2_training_data(malicious_dir, limit=limit_per_class)
+    print(f"Malicious samples: {len(Xm)}")
+
+    X = Xb + Xm
+    y = yb + ym
+
+    if not X:
+        raise RuntimeError("No training data collected. Make sure directories are correct and analyzer computed Phase2.")
+
+    # Train regressor
+    from sklearn.ensemble import RandomForestRegressor
+    print("Training Phase2 regressor (RandomForest)...")
+    reg = RandomForestRegressor(n_estimators=150, n_jobs=-1, random_state=42)
+    reg.fit(X, y)
+    # Save
+    joblib.dump({'reg': reg, 'meta': {'feature_order': FEATURE_ORDER}}, model_out)
+    print(f"Saved Phase2 regressor to {model_out}")
+    return model_out
+
+def load_phase2_model(path: str):
+    if not SKLEARN_AVAILABLE:
+        raise RuntimeError("scikit-learn + joblib required to load model.")
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    obj = joblib.load(path)
+    reg = obj.get('reg') if isinstance(obj, dict) and 'reg' in obj else obj
+    return reg
+
+# --------------------
 # CLI / main
 # --------------------
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Suspicious file scanner")
+    parser = argparse.ArgumentParser(description="Suspicious file scanner with Phase2 ML (only Phase2 is ML-driven)")
     parser.add_argument("-m", "--malware-path", dest="scan_path", default=SCAN_FOLDER, help="Directory to scan")
     parser.add_argument("--update-db", action="store_true", help="Download DBs before scanning")
     parser.add_argument("--use-opcodes", action="store_true", help="Enable opcode DB checks (cpu-heavy)")
     parser.add_argument("-t", "--threshold", type=int, default=SUSPICIOUS_THRESHOLD, help="Suspicion threshold")
+
+    # Phase2 regressor training
+    parser.add_argument('--train-phase2', action='store_true', help='Train Phase2 regressor from two directories')
+    parser.add_argument('--benign-dir', help='Directory with benign files for training')
+    parser.add_argument('--malicious-dir', help='Directory with malicious files for training')
+    parser.add_argument('--model-out', default='phase2_reg.joblib', help='Output path for phase2 regressor')
+    parser.add_argument('--limit', type=int, default=None, help='Limit per-class while training')
+
+    # Scan-time ML model (only Phase2 used)
+    parser.add_argument('--ml-model', help='Path to Phase2 regressor to use during scan (only YarGen percentage will be ML-predicted)')
+
     args = parser.parse_args()
 
     USE_OPCODES = bool(args.use_opcodes)
     SUSPICIOUS_THRESHOLD = int(args.threshold)
     SCAN_FOLDER = args.scan_path
 
-    print("--- Suspicious file scanner ---")
-    if args.update_db:
-        update_databases(force=True, use_opcodes=USE_OPCODES)
-    load_good_dbs(use_opcodes=USE_OPCODES)
-    print(f"Starting scan: {SCAN_FOLDER}")
+    # Train mode for Phase2 regressor
+    if args.train_phase2:
+        if not args.benign_dir or not args.malicious_dir:
+            parser.error("--train-phase2 requires --benign-dir and --malicious-dir")
+        if not SKLEARN_AVAILABLE:
+            print("scikit-learn and joblib are required to train. Install them and retry.")
+            sys.exit(1)
+        # Note: training will run analyze_single_file (which computes Phase2 ground truth)
+        train_phase2_regressor(args.benign_dir, args.malicious_dir, model_out=args.model_out, limit_per_class=args.limit)
+        sys.exit(0)
 
+    # Scan mode
+    print("--- Suspicious file scanner (Phase2 ML optional) ---")
+    if args.update_db:
+        try:
+            update_databases(force=True, use_opcodes=USE_OPCODES)
+        except Exception as e:
+            logging.warning("update_databases failed: %s", e)
+    load_good_dbs(use_opcodes=USE_OPCODES)
+
+    # If an ML model is provided, load it and enable ML Phase2
+    if args.ml_model:
+        if not SKLEARN_AVAILABLE:
+            print("scikit-learn/joblib not available; cannot load ml model. Running without ML.")
+            USE_ML_PHASE2 = False
+            ML_REGRESSOR = None
+        else:
+            try:
+                ML_REGRESSOR = load_phase2_model(args.ml_model)
+                USE_ML_PHASE2 = ML_REGRESSOR is not None
+                print(f"Loaded Phase2 model: {args.ml_model}  (USE_ML_PHASE2={USE_ML_PHASE2})")
+            except Exception as e:
+                print(f"Failed to load ML model {args.ml_model}: {e}. Running without ML.")
+                logging.warning("Failed to load ML model %s: %s", args.ml_model, e)
+                USE_ML_PHASE2 = False
+                ML_REGRESSOR = None
+
+    print(f"Starting scan: {SCAN_FOLDER}")
     start = time.time()
     results = scan_directory_parallel(SCAN_FOLDER)
     dur = time.time() - start
 
-    suspicious = [r for r in results if r.get("suspicious")]
+    suspicious = [r for r in results if r and r.get("suspicious")]
     print("\n--- Scan Summary ---")
     print(f"Completed in {dur:.2f}s. Files scanned: {len(results)} Suspicious: {len(suspicious)}")
     # Top suspicious files
