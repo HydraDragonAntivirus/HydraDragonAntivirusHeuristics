@@ -647,9 +647,6 @@ def is_in_suspicious_location_pe(path: str) -> bool:
 # --------------------
 # Single-file analysis (no known-extension/filename lookups)
 # --------------------
-# --------------------
-# Single-file analysis (no known-extension/filename lookups)
-# --------------------
 def analyze_single_file(path: str) -> Dict[str, Any]:
     features = {
         "path": path,
@@ -665,13 +662,14 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         "entropy": 0.0,
         "error": None
     }
+
     try:
         stats = os.stat(path)
         features["size"] = stats.st_size
         if features["size"] < 100 or features["size"] > 50 * 1024 * 1024:
             return features
 
-        # Basic header check
+        # Header check
         try:
             with open(path, "rb") as fh:
                 header = fh.read(2)
@@ -683,7 +681,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         prelim_score = 0
         sig_valid = False
 
-        # Signature check (Windows only)
+        # Signature check (Windows)
         if features["is_executable"] and sys.platform == "win32":
             sig = check_valid_signature(path)
             sig_valid = sig.get("is_valid", False)
@@ -702,7 +700,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         if ent > 7.5:
             prelim_score += 5 if not sig_valid else 2
 
-        # If executable, try pefile & capstone analysis
+        # Capstone / PE analysis
         pe_obj = None
         try:
             if features["is_executable"] and pefile:
@@ -720,8 +718,16 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
             except Exception:
                 pass
 
-        # ===== FIX: Remove LIGHT_ANALYSIS_THRESHOLD skip =====
-        # Deep analysis: read file bytes
+        # Phase 1 logging: preliminary score
+        logging.debug("[PHASE 1] %s prelim_score=%d", path, prelim_score)
+
+        # Only proceed to Yara/Yargen if preliminary score reaches threshold
+        if prelim_score < SUSPICIOUS_THRESHOLD:
+            features["yargen_summary"]["status"] = "Skipped (low triage score)"
+            features["suspicious_score"] = int(prelim_score)
+            return features
+
+        # Phase 2: read full file bytes for string extraction
         try:
             with open(path, "rb") as fh:
                 file_bytes = fh.read()
@@ -729,6 +735,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
             features["error"] = f"read error: {e}"
             return features
 
+        # Yara/Yargen string analysis
         extracted_strings = extract_strings(file_bytes)
         features["yargen_summary"] = score_strings_yargen_style(extracted_strings)
 
@@ -746,7 +753,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         features["is_running"] = is_running
         features["in_suspicious_location"] = in_suspicious_location
 
-        # Opcode checks (optional)
+        # Opcodes check (optional)
         opcode_penalty = 0
         if USE_OPCODES and features["is_executable"]:
             opcodes = extract_opcodes_from_bytes(file_bytes)
@@ -756,16 +763,14 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
                 if bad_ops > len(unique_ops) / 2:
                     opcode_penalty += 3
 
-        # Combine scores:
+        # Final score combination
         final_score = int(prelim_score + score_adjustment)
-        # Add string analysis influence
         spct = features["yargen_summary"].get("suspicious_percentage", 0.0)
         if spct > 30:
             final_score += 5
         elif spct > 10:
             final_score += 2
 
-        # Add other heuristics
         if features.get("capstone_analysis", {}).get("overall_analysis", {}).get("is_likely_packed"):
             final_score += 3
         if features["entropy"] > 7.5:
@@ -787,7 +792,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
         features["suspicious_score"] = max(0, final_score)
         features["suspicious"] = features["suspicious_score"] >= SUSPICIOUS_THRESHOLD
 
-        # Debug output only if suspicious
+        # Phase 2 logging: suspicious result
         if features["suspicious"]:
             logging.info("[SUSPICIOUS] %s", path)
             logging.debug("  size=%d, exe=%s, entropy=%.2f",
@@ -795,7 +800,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
             logging.debug("  signature_status=%s", features["signature_status"])
             logging.debug("  capstone_analysis=%s", features["capstone_analysis"])
             logging.debug("  yargen_summary=%s", features["yargen_summary"])
-            logging.debug("  imphash/exports adjustment applied: %d", score_adjustment)
+            logging.debug("  imphash/exports adjustment=%d", score_adjustment)
             logging.debug("  running=%s, suspicious_location=%s",
                           features["is_running"], features["in_suspicious_location"])
             logging.debug("  opcode_penalty=%d", opcode_penalty)
@@ -804,6 +809,7 @@ def analyze_single_file(path: str) -> Dict[str, Any]:
     except Exception as e:
         logging.error("Failed to analyze %s: %s", path, e, exc_info=True)
         features["error"] = str(e)
+
     return features
 
 # --------------------
@@ -847,7 +853,7 @@ if __name__ == "__main__":
     SUSPICIOUS_THRESHOLD = int(args.threshold)
     SCAN_FOLDER = args.scan_path
 
-    print("--- Suspicious file scanner")
+    print("--- Suspicious file scanner ---")
     if args.update_db:
         update_databases(force=True, use_opcodes=USE_OPCODES)
     load_good_dbs(use_opcodes=USE_OPCODES)
