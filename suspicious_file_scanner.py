@@ -559,9 +559,6 @@ def check_valid_signature(file_path: str) -> dict:
         return {"is_valid": False, "status": str(e)}
 
 # --------------------
-# yarGen-style string scoring (Unknownity only)
-# --------------------
-# --------------------
 # YarGen-style string scoring (fixed)
 # --------------------
 def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
