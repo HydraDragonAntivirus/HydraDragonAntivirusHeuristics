@@ -574,7 +574,7 @@ def check_valid_signature(file_path: str) -> dict:
 # --------------------
 # yarGen-style string scoring (Unknownity only)
 # --------------------
-def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
+def score_strings_yargen_style(strings: List[str], good_strings_db: Dict[str, int]) -> Dict[str, Any]:
     global stringScores, base64strings, hexEncStrings, reversedStrings
     stringScores, base64strings, hexEncStrings, reversedStrings = {}, {}, {}, {}
     local_scores = {}
@@ -585,28 +585,28 @@ def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
         if s.startswith("UTF16LE:"):
             s = s[8:]
 
-        # Check if known (from whitelist DB)
-        known = False
-        known_count = 0
-        if s_orig in good_strings_db or s in good_strings_db:
-            known = True
-            known_count = good_strings_db.get(s_orig, 0) or good_strings_db.get(s, 0)
+        # Known in whitelist DB?
+        known = s_orig in good_strings_db or s in good_strings_db
+        known_count = good_strings_db.get(s_orig, 0) or good_strings_db.get(s, 0) if known else 0
+        score = -known_count if known else 1  # baseline unknown score
 
-        # Base score = penalty for being known, bonus for unknown
-        score = (known_count * -1) if known else 1
-
-        # Extra "unknownity" weight for encodings/obfuscations
         if not known:
-            if re.search(r'^(?:[A-Za-z0-9+/]{4}){10,}', s) and is_base_64(s):
-                score += 2   # looks like base64
-            if len(s) > 20 and is_hex_encoded(re.sub(r'[^0-9a-fA-F]', '', s), False):
-                score += 2   # looks like hex
-            if s[::-1] in good_strings_db:
-                score += 2   # reversed known string
+            # Likely English word but unknown to DB
+            if is_likely_known_word(s):
+                score += 1  # extra weight for real word
 
-        # Try decoding to see if hidden unknowns
-        try:
-            if len(s) > 8:
+            # Extra unknownity weight for encoding/obfuscation
+            if re.fullmatch(r'(?:[A-Za-z0-9+/]{4}){2,}(?:==|=)?', s) and is_base_64(s):
+                score += 2
+            hex_candidate = re.sub(r'[^0-9a-fA-F]', '', s)
+            if len(hex_candidate) > 8 and is_hex_encoded(hex_candidate, False):
+                score += 2
+            if s[::-1] in good_strings_db:
+                score += 2
+                reversedStrings[s_orig] = s[::-1]
+
+            # Attempt decoding
+            try:
                 for m_string in (s, s[1:], s[:-1], s + "=", s + "=="):
                     if is_base_64(m_string):
                         try:
@@ -625,8 +625,8 @@ def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
                             hexEncStrings[s_orig] = decoded
                     except Exception:
                         pass
-        except Exception:
-            pass
+            except Exception:
+                pass
 
         local_scores[s_orig] = score
         stringScores[s_orig] = score
@@ -634,8 +634,7 @@ def score_strings_yargen_style(strings: List[str]) -> Dict[str, Any]:
             unknown_count += 1
 
     total_strings = len(strings)
-    unknown_percentage = (unknown_count / total_strings) * 100.0 if total_strings > 0 else 0.0
-
+    unknown_percentage = (unknown_count / total_strings) * 100 if total_strings else 0.0
     sorted_scores = sorted(local_scores.items(), key=lambda kv: kv[1], reverse=True)
     top_unknowns = [{"string": s, "score": sc} for s, sc in sorted_scores if sc > 0][:50]
 
