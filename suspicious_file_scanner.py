@@ -281,7 +281,7 @@ def initialize_pestudio_strings(xml_path: str = PE_STRINGS_FILE) -> Dict[str, Li
         tree = etree.parse(xml_path)
         root = tree.getroot()
         # Some files use <strings><string>...</string></strings>
-        # Others may use <strings><item>...</item></strings> — handle both.
+        # Others may use <strings><item>...</item></strings> - handle both.
         for k in keys:
             nodes = root.findall(".//" + k)
             # if nodes found, dig children (string/item)
