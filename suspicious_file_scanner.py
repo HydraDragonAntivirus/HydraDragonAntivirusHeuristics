@@ -111,7 +111,7 @@ if not hasattr(ctypes, "BYTE"):
 # --------------------
 # Config / Globals
 # --------------------
-SUSPICIOUS_THRESHOLD = 11
+SUSPICIOUS_THRESHOLD = 13
 SCAN_FOLDER = "."
 
 # DB containers (opcode DB removed)
@@ -168,6 +168,28 @@ def calculate_entropy(path: str) -> float:
     except Exception as e:
         logging.debug("Entropy calc failed for %s: %s", path, e, exc_info=True)
         return 0.0
+
+def get_section_entropy(data: bytes) -> float:
+    """
+    Calculate the Shannon entropy of a section or byte array.
+    Returns 0.0 if data is empty.
+    """
+    if not data:
+        return 0.0
+
+    freq = [0] * 256  # count occurrences of each byte value
+    for b in data:
+        freq[b] += 1
+
+    entropy = 0.0
+    data_len = len(data)
+    for f in freq:
+        if f == 0:
+            continue
+        p = f / data_len
+        entropy -= p * math.log2(p)
+
+    return entropy
 
 # --------------------
 # PEStudio strings loader & scorer (kept)
@@ -529,19 +551,44 @@ def is_running_pe(path: str) -> bool:
 
 def is_in_suspicious_location_pe(path: str) -> bool:
     path_norm = os.path.normcase(path)
-    for d in SUSPICIOUS_DIRS + SYSTEM_DIRS + STARTUP_DIRS:
+    for d in SUSPICIOUS_DIRS + STARTUP_DIRS:
         if d and os.path.normcase(d) in path_norm:
             return True
     return False
 
+def is_system_file(path: str) -> bool:
+    """
+    Returns True if the file has the Windows SYSTEM attribute.
+    """
+    FILE_ATTRIBUTE_SYSTEM = 0x4
+    try:
+        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+        if attrs == -1:
+            return False
+        return bool(attrs & FILE_ATTRIBUTE_SYSTEM)
+    except Exception:
+        return False
+
+def is_system_file_unusual(path: str) -> bool:
+    """
+    Return True if the file has SYSTEM attribute and is NOT in standard SYSTEM dirs.
+    """
+    if not is_system_file(path):
+        return False
+    path_norm = os.path.normcase(path)
+    for sys_dir in SYSTEM_DIRS:
+        if sys_dir and os.path.normcase(sys_dir) in path_norm:
+            return False  # file is in a normal system location
+    return True
+
 # --------------------
-# Single-file analysis (Phase1 only)
+# Single-file analysis (Phase1 only, all detectors Suspicious)
 # --------------------
 def analyze_single_file(path: str) -> dict:
     """
-    Phase1 heuristics + PE-specific checks. Returns features dict including `pe_checks`.
-    Each entry in `pe_checks` is a tuple: (message, verdict) where verdict is one of
-    'Clean', 'Suspicious', or 'Unknown'.
+    Phase1 heuristics + PE-specific checks.
+    All PE detectors produce verdict 'Suspicious' when triggered.
+    Returns features dict including `pe_checks` and updated phase1_score.
     """
     features: Dict[str, Any] = {
         'path': path,
@@ -558,26 +605,9 @@ def analyze_single_file(path: str) -> dict:
         'suspicious_score': 0,
         'suspicious': False,
         'phase1_score': 0,
-        # phase2 placeholders (removed/unused but keep for compatibility)
         'phase2_summary': None,
         'phase2_percentage': 0.0,
-        # new: detailed checks
         'pe_checks': []
-    }
-
-    # verdict defaults following your table
-    verdict_map = {
-        "Optional Header LoaderFlags field is valued illegal": "Clean",
-        "Non-ascii or empty section names detected": "Clean",
-        "Illegal size of optional Header": "Clean",
-        "Based on the sections entropy check! file is possibly packed": "Clean",
-        "Timestamp value suspicious": "Clean",
-        "Header Checksum is zero!": "Suspicious",
-        "Entry point is outside the 1st(.code) section! Binary is possibly packed": "Clean",
-        "Optional Header NumberOfRvaAndSizes field is valued illegal": "Clean",
-        "Anti-vm present": "Clean",
-        "The Size Of Raw data is valued illegal! Binary might crash your disassembler/debugger": "Suspicious",
-        "TLS callback functions array detected": "Clean"
     }
 
     try:
@@ -586,13 +616,26 @@ def analyze_single_file(path: str) -> dict:
         features['age_days'] = (time.time() - stats.st_ctime) / (24 * 3600)
         features['entropy'] = calculate_entropy(path)
 
-        # read file bytes once (used for imphash/signature checks)
-        file_bytes = b''
+        # Check if the file is running
+        features['is_running'] = is_running_pe(path)
+
+        # Check if file is in suspicious location
+        features['in_suspicious_location'] = is_in_suspicious_location_pe(path)
+
+        # Additional check: SYSTEM file at unusual location
         try:
-            with open(path, 'rb') as fh:
-                file_bytes = fh.read()
+            if os.name == "nt":
+                import ctypes
+                FILE_ATTRIBUTE_SYSTEM = 0x4
+                attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+                if attrs != -1 and (attrs & FILE_ATTRIBUTE_SYSTEM):
+                    # SYSTEM file outside Windows/System32/SysWOW64 is suspicious
+                    norm_path = os.path.normcase(os.path.abspath(path))
+                    allowed_dirs = [os.path.normcase(d) for d in SYSTEM_DIRS if d]
+                    if not any(norm_path.startswith(d) for d in allowed_dirs):
+                        features['pe_checks'].append(("SYSTEM file at unusual location", "Suspicious"))
         except Exception:
-            file_bytes = b''
+            pass
 
         pe = None
         try:
@@ -601,7 +644,7 @@ def analyze_single_file(path: str) -> dict:
                 features['is_executable'] = True
                 features['has_version_info'] = hasattr(pe, 'VS_FIXEDFILEINFO') and getattr(pe, 'VS_FIXEDFILEINFO') is not None
 
-                # capstone analysis (best-effort)
+                # capstone analysis
                 try:
                     cap_analysis = analyze_with_capstone_pe(pe)
                     if cap_analysis is None:
@@ -617,7 +660,6 @@ def analyze_single_file(path: str) -> dict:
                         }
                     features['capstone_analysis'] = cap_analysis
                 except Exception as e:
-                    logging.debug("Capstone analysis failed for %s: %s", path, e)
                     features['capstone_analysis'] = {
                         "overall_analysis": {
                             "is_likely_packed": False,
@@ -629,92 +671,66 @@ def analyze_single_file(path: str) -> dict:
                         "error": f"Capstone analysis exception: {e}"
                     }
 
-                # --- PE-specific checks ---
+                # --- PE-specific checks (all Suspicious) ---
                 pe_checks: List[Tuple[str, str]] = []
 
-                # Optional Header LoaderFlags non-zero
                 try:
                     lf = getattr(pe.OPTIONAL_HEADER, 'LoaderFlags', None)
                     if lf is not None and int(lf) != 0:
-                        msg = "Optional Header LoaderFlags field is valued illegal"
-                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                        pe_checks.append(("Optional Header LoaderFlags field is valued illegal", "Suspicious"))
                 except Exception:
                     pass
 
-                # Non-ascii or empty section names
                 try:
-                    found_bad_name = False
                     for sec in pe.sections:
                         try:
-                            name = sec.Name.decode(errors='ignore').strip(b'\x00')
+                            name = sec.Name.decode(errors='ignore').rstrip('\x00')
                         except Exception:
                             name = ""
                         if not name or any(ord(c) < 32 or ord(c) > 126 for c in name):
-                            found_bad_name = True
+                            pe_checks.append(("Non-ascii or empty section names detected", "Suspicious"))
                             break
-                    if found_bad_name:
-                        msg = "Non-ascii or empty section names detected"
-                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
                 except Exception:
                     pass
 
-                # Illegal SizeOfOptionalHeader
                 try:
                     soh = getattr(getattr(pe, 'FILE_HEADER', None), 'SizeOfOptionalHeader', None)
                     if soh is not None and (soh < 0x60 or soh > 0x1000):
-                        msg = "Illegal size of optional Header"
-                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                        pe_checks.append(("Illegal size of optional Header", "Suspicious"))
                 except Exception:
                     pass
 
-                # Sections entropy -> possibly packed
                 try:
                     for sec in pe.sections:
                         data = sec.get_data() or b''
                         if not data:
                             continue
-                        freq = [0] * 256
-                        total = 0
-                        for b in data:
-                            total += 1
-                            freq[b] += 1
-                        ent = 0.0
-                        if total > 0:
-                            for f in freq:
-                                if f > 0:
-                                    p = f / total
-                                    ent -= p * math.log2(p)
+                        ent = get_section_entropy(data)
                         if ent > 7.5:
-                            msg = "Based on the sections entropy check! file is possibly packed"
-                            pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                            pe_checks.append(("Based on the sections entropy check! file is possibly packed", "Suspicious"))
                             break
                 except Exception:
                     pass
 
-                # Timestamp suspicious
                 try:
                     ts = getattr(getattr(pe, 'FILE_HEADER', None), 'TimeDateStamp', 0)
                     if ts == 0 or ts > int(time.time()) + 365*24*3600:
-                        msg = "Timestamp value suspicious"
-                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                        pe_checks.append(("Timestamp value suspicious", "Suspicious"))
                 except Exception:
                     pass
 
-                # Header Checksum zero
                 try:
                     chksum = getattr(pe.OPTIONAL_HEADER, 'CheckSum', None)
                     if chksum is not None and int(chksum) == 0:
-                        msg = "Header Checksum is zero!"
-                        pe_checks.append((msg, verdict_map.get(msg, 'Suspicious')))
+                        pe_checks.append(("Header Checksum is zero!", "Suspicious"))
                 except Exception:
                     pass
 
-                # Entry point outside first .text/.code section
                 try:
                     ep = int(getattr(pe, 'OPTIONAL_HEADER').AddressOfEntryPoint)
                     first_code_section = None
                     for s in pe.sections:
-                        name = s.Name.decode(errors='ignore').strip(b'\x00').lower()
+                        name = s.Name.decode(errors='ignore').rstrip('\x00').lower()
                         if name in ('.text', '.code'):
                             first_code_section = s
                             break
@@ -722,54 +738,44 @@ def analyze_single_file(path: str) -> dict:
                         va = int(first_code_section.VirtualAddress)
                         size = int(first_code_section.Misc_VirtualSize)
                         if not (va <= ep < va + size):
-                            msg = "Entry point is outside the 1st(.code) section! Binary is possibly packed"
-                            pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                            pe_checks.append(("Entry point is outside the 1st(.code) section! Binary is possibly packed", "Suspicious"))
                 except Exception:
                     pass
 
-                # NumberOfRvaAndSizes abnormal
                 try:
                     nrva = getattr(pe.OPTIONAL_HEADER, 'NumberOfRvaAndSizes', None)
                     if nrva is not None and (nrva < 10 or nrva > 64):
-                        msg = "Optional Header NumberOfRvaAndSizes field is valued illegal"
-                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                        pe_checks.append(("Optional Header NumberOfRvaAndSizes field is valued illegal", "Suspicious"))
                 except Exception:
                     pass
 
-                # Simple anti-VM detection via import names
                 try:
                     imports = []
                     if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
                         for imp in getattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
                             if imp.dll:
                                 imports.append(imp.dll.decode(errors='ignore').lower())
-                    anti_vm_found = any(x for x in ('vbox', 'vmware', 'vmwareuser', 'xen') if any(x in i for i in imports))
-                    if anti_vm_found:
-                        msg = "Anti-vm present"
-                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                    if any(x for x in ('vbox','vmware','vmwareuser','xen') if any(x in i for i in imports)):
+                        pe_checks.append(("Anti-vm present", "Suspicious"))
                 except Exception:
                     pass
 
-                # SizeOfRawData irregularities
                 try:
                     for sec in pe.sections:
                         if hasattr(sec, 'SizeOfRawData') and hasattr(sec, 'Misc_VirtualSize'):
                             if sec.SizeOfRawData == 0 and sec.Misc_VirtualSize > 0:
-                                msg = "The Size Of Raw data is valued illegal! Binary might crash your disassembler/debugger"
-                                pe_checks.append((msg, verdict_map.get(msg, 'Suspicious')))
+                                pe_checks.append(("The Size Of Raw data is valued illegal! Binary might crash your disassembler/debugger", "Suspicious"))
                                 break
                 except Exception:
                     pass
 
-                # TLS callbacks presence -> now marked Clean per your requested table
                 try:
                     if hasattr(pe, 'DIRECTORY_ENTRY_TLS') and getattr(pe, 'DIRECTORY_ENTRY_TLS') is not None:
-                        msg = "TLS callback functions array detected"
-                        pe_checks.append((msg, verdict_map.get(msg, 'Clean')))
+                        pe_checks.append(("TLS callback functions array detected", "Suspicious"))
                 except Exception:
                     pass
 
-                features['pe_checks'] = pe_checks
+                features['pe_checks'].extend(pe_checks)
 
         except Exception as e:
             logging.debug("PE parsing failed for %s: %s", path, e)
@@ -780,7 +786,6 @@ def analyze_single_file(path: str) -> dict:
                 except Exception:
                     pass
 
-        # Ensure capstone_analysis is always present
         if features['capstone_analysis'] is None:
             features['capstone_analysis'] = {
                 "overall_analysis": {
@@ -801,11 +806,10 @@ def analyze_single_file(path: str) -> dict:
             pass
 
         # --------------------
-        # Phase 1 scoring
+        # Phase1 scoring: every Suspicious check adds +2
         # --------------------
         phase1 = 0
         cap = features['capstone_analysis'].get('overall_analysis', {})
-
         if cap.get('is_likely_packed'):
             phase1 += 3
         if features['entropy'] > 7.5:
@@ -825,8 +829,11 @@ def analyze_single_file(path: str) -> dict:
             phase1 += 2
         if features['is_running']:
             phase1 += 3
-        if features['signature_valid']:
-            phase1 = max(phase1 - 3, 0)
+
+        # Add +2 per Suspicious PE check
+        for _, verdict in features['pe_checks']:
+            if verdict == "Suspicious":
+                phase1 += 2
 
         features['phase1_score'] = phase1
         features['suspicious_score'] = phase1
