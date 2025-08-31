@@ -59,12 +59,14 @@ except Exception:
 # Global Known-Good DB Containers
 # ------------------------------
 good_opcodes_db = {}
-base64strings = set()
-hexEncStrings = set()
-reversedStrings = set()
+# Small helper sets (populated by load_good_dbs)
+base64strings: Set[str] = set()
+hexEncStrings: Set[str] = set()
+reversedStrings: Set[str] = set()
+good_opcodes_db: Set[str] = set()
 KNOWN_IMPHASHES = {}
 KNOWN_EXPORTS = {}
-USE_OPCODES = False  # Set True if opcode matching is required
+USE_OPCODES = False
 
 # Basic configuration
 SCAN_FOLDER = "D:\\datas2\\data2"
@@ -132,12 +134,6 @@ RELEVANT_EXTENSIONS = [
     ".wsc", ".wsf", ".wsh", ".input", ".war", ".jsp", ".php", ".asp", ".aspx",
     ".psd1", ".psm1", ".py",
 ]
-
-# Small helper sets (populated by load_good_dbs)
-base64strings: Set[str] = set()
-hexEncStrings: Set[str] = set()
-reversedStrings: Set[str] = set()
-good_opcodes_db: Set[str] = set()
 
 # Logging setup
 logging.basicConfig(
@@ -419,97 +415,182 @@ def calculate_entropy(path: str) -> float:
         logging.debug("Entropy calc failed for %s", path, exc_info=True)
         return 0.0
 
-def stream_load_gzip_json(path):
-    """
-    Stream-load large gzip JSON DBs to avoid memory issues.
-    Returns a dict of keys -> 1.
-    """
-    try:
-        with gzip.open(path, "rt", encoding="utf-8", errors="ignore") as f:
-            # Instead of json.loads(file.read()), we parse line by line if it's a list/dict dump
-            content = f.read(1)
-            f.seek(0)
-            if content == "[":
-                # JSON list -> convert to dict
-                items = json.load(f)
-                return {str(i): 1 for i in items}
-            elif content == "{":
-                # JSON dict -> just load
-                return json.load(f)
-            else:
-                # Plain lines inside gzip
-                f.seek(0)
-                return {ln.strip(): 1 for ln in f if ln.strip()}
-    except Exception:
-        return None
-
 def load_good_dbs(db_path="./dbs"):
     """
-    Loads all known-good DBs safely and normalizes them for matching.
-    Automatically initializes globals if missing.
+    FIXED: Loads all known-good DBs safely and normalizes them for matching.
+    Fixed to properly populate global variables and handle different file formats.
     """
-
     global good_opcodes_db, base64strings, hexEncStrings, reversedStrings
     global KNOWN_IMPHASHES, KNOWN_EXPORTS, USE_OPCODES
 
-    # Auto-initialize if missing
-    if "good_opcodes_db" not in globals():
-        good_opcodes_db = {}
-    if "base64strings" not in globals():
-        base64strings = set()
-    if "hexEncStrings" not in globals():
-        hexEncStrings = set()
-    if "reversedStrings" not in globals():
-        reversedStrings = set()
-    if "KNOWN_IMPHASHES" not in globals():
-        KNOWN_IMPHASHES = {}
-    if "KNOWN_EXPORTS" not in globals():
-        KNOWN_EXPORTS = {}
+    # Clear and initialize globals
+    good_opcodes_db = set()
+    base64strings = set()
+    hexEncStrings = set()
+    reversedStrings = set()
+    KNOWN_IMPHASHES = set()
+    KNOWN_EXPORTS = set()
+
+    if not os.path.exists(db_path):
+        logging.warning("Database path does not exist: %s", db_path)
+        return
 
     files = sorted(glob.glob(os.path.join(db_path, "*.db")))
     skipped = []
+    loaded_count = 0
 
-    logging.info("Attempting to load good DBs...")
+    logging.info("Attempting to load good DBs from: %s", db_path)
+    print(f"Found {len(files)} database files in {db_path}")
 
     for p in files:
         bn = os.path.basename(p).lower()
+        logging.info("Processing DB file: %s", bn)
+        print(f"Loading: {bn}")
 
         # Skip opcode DBs unless explicitly requested
         if "opcodes" in bn and not USE_OPCODES:
             skipped.append(p)
+            logging.info("Skipping opcode DB (USE_OPCODES=False): %s", bn)
             continue
 
         try:
-            with gzip.open(p, "rt", encoding="utf-8") as f:
-                db = json.load(f)
+            # Try multiple loading strategies
+            db_data = None
+            load_method = "unknown"
+            
+            # Strategy 1: Gzipped JSON
+            try:
+                with gzip.open(p, "rt", encoding="utf-8", errors="ignore") as f:
+                    content = f.read().strip()
+                    if content.startswith('[') or content.startswith('{'):
+                        db_data = json.loads(content)
+                        load_method = "gzipped_json"
+                    else:
+                        # Plain text lines in gzip
+                        db_data = [line.strip() for line in content.split('\n') if line.strip()]
+                        load_method = "gzipped_lines"
+                print(f"  -> Loaded as {load_method}")
+            except Exception:
+                # Strategy 2: Regular JSON
+                try:
+                    with open(p, "r", encoding="utf-8", errors="ignore") as f:
+                        content = f.read().strip()
+                        if content.startswith('[') or content.startswith('{'):
+                            db_data = json.loads(content)
+                            load_method = "regular_json"
+                        else:
+                            # Plain text lines
+                            db_data = [line.strip() for line in content.split('\n') if line.strip()]
+                            load_method = "plain_lines"
+                    print(f"  -> Loaded as {load_method}")
+                except Exception:
+                    # Strategy 3: Binary read and try to decode
+                    try:
+                        with open(p, "rb") as f:
+                            raw_data = f.read()
+                            try:
+                                # Try UTF-8
+                                content = raw_data.decode('utf-8', errors='ignore').strip()
+                            except:
+                                # Try latin-1 as fallback
+                                content = raw_data.decode('latin-1', errors='ignore').strip()
+                            
+                            if content.startswith('[') or content.startswith('{'):
+                                db_data = json.loads(content)
+                                load_method = "binary_json"
+                            else:
+                                db_data = [line.strip() for line in content.split('\n') if line.strip()]
+                                load_method = "binary_lines"
+                        print(f"  -> Loaded as {load_method}")
+                    except Exception as e:
+                        logging.error("All load methods failed for %s: %s", p, e)
+                        print(f"  -> FAILED to load: {e}")
+                        skipped.append(p)
+                        continue
+
+            if not db_data:
+                logging.warning("No data loaded from %s", p)
+                print(f"  -> WARNING: No data found")
+                skipped.append(p)
+                continue
+
+            # Handle different data structures
+            if isinstance(db_data, dict):
+                items = list(db_data.keys())
+            elif isinstance(db_data, list):
+                items = db_data
+            else:
+                logging.error("Unexpected data type in %s: %s", p, type(db_data))
+                print(f"  -> ERROR: Unexpected data type: {type(db_data)}")
+                skipped.append(p)
+                continue
+
+            items_processed = 0
+
+            # Normalize DB contents based on type
+            if "opcodes" in bn:
+                for op in items:
+                    if isinstance(op, str) and op.strip():
+                        good_opcodes_db.add(op.lower().strip())
+                        items_processed += 1
+
+            elif "imphashes" in bn:
+                for imp in items:
+                    if isinstance(imp, str) and imp.strip():
+                        KNOWN_IMPHASHES.add(imp.lower().strip())
+                        items_processed += 1
+
+            elif "exports" in bn:
+                for exp in items:
+                    if isinstance(exp, str) and exp.strip():
+                        KNOWN_EXPORTS.add(exp.lower().strip())
+                        items_processed += 1
+
+            elif "strings" in bn:
+                for s in items:
+                    if not isinstance(s, str) or not s.strip():
+                        continue
+                    
+                    s = s.strip()
+                    s_l = s.lower()
+                    
+                    # Classify and store strings
+                    if len(s) >= 6:  # Only process strings of reasonable length
+                        if is_base_64(s):
+                            base64strings.add(s)
+                            base64strings.add(s_l)
+                            items_processed += 1
+                        elif is_hex_encoded(re.sub(r"[^0-9a-fA-F]", "", s), check_length=False):
+                            hexEncStrings.add(s)
+                            hexEncStrings.add(s_l)
+                            items_processed += 1
+                        else:
+                            # Store as reversed strings (normal strings stored in reverse for matching)
+                            reversedStrings.add(s[::-1])
+                            reversedStrings.add(s_l[::-1])
+                            items_processed += 1
+
+            loaded_count += 1
+            print(f"  -> Successfully processed: {items_processed} items")
+            logging.info("Successfully processed %s: %d items loaded", bn, items_processed)
+
         except Exception as e:
-            logging.error("Failed to load DB file %s: %s", p, e)
+            logging.error("Failed to process DB file %s: %s", p, e)
+            print(f"  -> ERROR processing file: {e}")
             skipped.append(p)
             continue
 
-        # Normalize DB contents based on type
-        if "opcodes" in bn:
-            good_opcodes_db.update({op.lower(): 1 for op in db})
-
-        elif "imphashes" in bn:
-            KNOWN_IMPHASHES.update({imp.lower(): 1 for imp in db})
-
-        elif "exports" in bn:
-            KNOWN_EXPORTS.update({exp.lower(): 1 for exp in db})
-
-        elif "strings" in bn:
-            for s in db:
-                s_l = s.lower()
-                if is_base_64(s):
-                    base64strings.add(s)
-                    base64strings.add(s_l)
-                elif is_hex_encoded(re.sub(r"[^0-9a-fA-F]", "", s), check_length=False):
-                    hexEncStrings.add(s)
-                    hexEncStrings.add(s_l)
-                else:
-                    # DB stores reversed known-good strings
-                    reversedStrings.add(s[::-1])
-                    reversedStrings.add(s_l[::-1])
+    # Final summary
+    print(f"\n=== DATABASE LOADING SUMMARY ===")
+    print(f"Files processed: {loaded_count}")
+    print(f"Files skipped: {len(skipped)}")
+    print(f"Opcodes loaded: {len(good_opcodes_db)}")
+    print(f"Base64 strings loaded: {len(base64strings)}")
+    print(f"Hex strings loaded: {len(hexEncStrings)}")
+    print(f"Regular strings loaded: {len(reversedStrings)}")
+    print(f"Import hashes loaded: {len(KNOWN_IMPHASHES)}")
+    print(f"Exports loaded: {len(KNOWN_EXPORTS)}")
+    print("=" * 35)
 
     logging.info(
         "Loaded good DBs: opcodes=%d base64=%d hexEnc=%d strings=%d imphashes=%d exports=%d (files_loaded=%d skipped=%d)",
@@ -519,20 +600,27 @@ def load_good_dbs(db_path="./dbs"):
         len(reversedStrings),
         len(KNOWN_IMPHASHES),
         len(KNOWN_EXPORTS),
-        len(files) - len(skipped),
+        loaded_count,
         len(skipped),
     )
+
+    # Diagnostic output
+    if loaded_count == 0:
+        logging.error("No database files were successfully loaded!")
+        print("ERROR: No database files were successfully loaded!")
+    elif len(base64strings) == 0 and len(hexEncStrings) == 0 and len(reversedStrings) == 0:
+        logging.warning("String databases appear to be empty - check file formats and content")
+        print("WARNING: String databases appear to be empty")
 
 def is_likely_word(s: str) -> bool:
     """Return True if string is at least 3 chars and exists in NLTK words."""
     return len(s) >= 3 and s.lower() in nltk_words
 
-def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=None):
+def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=None, debug=False):
     """
-    Calculates how much of this file matches known-good DBs.
-    Fixes reversed string matching and adds per-DB match debug logging.
+    FIXED: Calculates how much of this file matches known-good DBs.
+    Fixed debugging and removed excessive debug output.
     """
-
     global good_opcodes_db, base64strings, hexEncStrings, reversedStrings
     global KNOWN_IMPHASHES, KNOWN_EXPORTS, USE_OPCODES
 
@@ -545,66 +633,85 @@ def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=
         if USE_OPCODES and good_opcodes_db:
             opcodes = extract_opcodes(file_data)
             total_markers += len(opcodes)
+            
             for op in opcodes:
-                if op.replace(" ", "").lower() in good_opcodes_db:
+                op_normalized = op.replace(" ", "").lower()
+                if op_normalized in good_opcodes_db:
                     matches += 1
                     db_hits["opcodes"] += 1
-    except Exception:
-        logging.debug("Opcode check failed for %s", path, exc_info=True)
+    except Exception as e:
+        logging.debug("Opcode check failed for %s: %s", path, e)
 
     # --- IMPORT HASHES ---
     try:
         imphash, exports = get_pe_info(file_data)
-        if KNOWN_IMPHASHES:
+        
+        if KNOWN_IMPHASHES and imphash:
             total_markers += 1
-            if imphash and imphash.lower() in KNOWN_IMPHASHES:
+            if imphash.lower() in KNOWN_IMPHASHES:
                 matches += 1
                 db_hits["imphashes"] += 1
-    except Exception:
+    except Exception as e:
+        logging.debug("PE info extraction failed for %s: %s", path, e)
         imphash, exports = None, []
 
     # --- EXPORTS ---
     try:
-        if KNOWN_EXPORTS:
+        if KNOWN_EXPORTS and exports:
             total_markers += len(exports)
+            
             for e in exports:
                 if e and e.lower() in KNOWN_EXPORTS:
                     matches += 1
                     db_hits["exports"] += 1
-    except Exception:
-        pass
+    except Exception as e:
+        logging.debug("Export check failed for %s: %s", path, e)
 
     # --- STRINGS ---
     try:
         strings = precomputed_strings or extract_strings(file_data)
+        
         if strings:
             total_markers += len(strings)
+            
             for s in strings:
                 s_l = s.lower()
-                if (
-                    s in base64strings
-                    or s_l in base64strings
-                    or s in hexEncStrings
-                    or s_l in hexEncStrings
-                    or s[::-1] in reversedStrings
-                    or s_l[::-1] in reversedStrings
-                ):
+                match_found = False
+                
+                # Check base64 database
+                if s in base64strings or s_l in base64strings:
                     matches += 1
                     db_hits["strings"] += 1
-    except Exception:
-        pass
+                    match_found = True
+                
+                # Check hex encoded database (only if not already matched)
+                if not match_found and (s in hexEncStrings or s_l in hexEncStrings):
+                    matches += 1
+                    db_hits["strings"] += 1
+                    match_found = True
+                
+                # Check reversed strings database (only if not already matched)
+                if not match_found and (s[::-1] in reversedStrings or s_l[::-1] in reversedStrings):
+                    matches += 1
+                    db_hits["strings"] += 1
+                    match_found = True
+                    
+    except Exception as e:
+        logging.debug("String check failed for %s: %s", path, e)
 
-    # --- Final percentage ---
+    # Final percentage
     percent = 0.0 if total_markers == 0 else round((matches / total_markers) * 100.0, 2)
 
-    # Debug logging: show matches per DB
-    logging.debug(
-        "Goodware match stats for %s: opcodes=%d, imphashes=%d, exports=%d, strings=%d, total=%d, percent=%.2f%%",
-        path, db_hits["opcodes"], db_hits["imphashes"], db_hits["exports"], db_hits["strings"],
-        matches, percent
-    )
+    # Logging (only if debug or significant result)
+    if debug or percent > 1.0 or db_hits["strings"] > 0:
+        logging.debug(
+            "Goodware match stats for %s: opcodes=%d, imphashes=%d, exports=%d, strings=%d, total=%d, percent=%.2f%%",
+            path, db_hits["opcodes"], db_hits["imphashes"], db_hits["exports"], db_hits["strings"],
+            matches, percent
+        )
 
     return percent
+
 
 def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
     analysis = {
@@ -843,138 +950,131 @@ def is_running_pe(path: str) -> bool:
         pass
     return False
 
-
 def _simple_yargen_scores(strings: List[str]) -> Dict[str, Any]:
     """
-    A yarGen-inspired scoring function.
-    Returns:
-      {
-        "yargen_strings": [top suspicious strings...],
-        "yargen_suspicious_percentage": float,
-        "total_strings": int,
-        "status": "Likely Clean"|"Potentially Malicious"|...,
-        "scores": { string: score, ... }
-      }
-    This is intentionally conservative and fast.
+    YarGen-inspired scoring with integration of filtering heuristics.
     """
     analysis = {
         "yargen_strings": [],
         "yargen_suspicious_percentage": 0.0,
-        "total_strings": 0,
+        "total_strings": len(strings),
         "status": "Not Analyzed",
         "scores": {},
     }
+
     try:
-        total = len(strings)
-        analysis["total_strings"] = total
-        if total == 0:
+        if not strings:
             analysis["status"] = "No strings found"
             return analysis
 
         scores = {}
         suspicious_count = 0
+        utfstrings = []
 
-        # Precompile few regexes used often
+        # Precompile frequently used regexes
         ip_re = re.compile(r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d?\d)\b')
         base64_re = re.compile(r'^(?:[A-Za-z0-9+/]{4}){10,}(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$')
         hexhash_re = re.compile(r'\b([a-fA-F0-9]{32}|[a-fA-F0-9]{40}|[a-fA-F0-9]{64})\b')
+        suspicious_keywords = re.compile(
+            r'(shell|powershell|invoke|download|execute|payload|encrypt|inject|token|credential|creds|net use|schtasks|rundll32|cmd\.exe|whoami|bitsadmin|Invoke-Expression)',
+            re.IGNORECASE
+        )
 
         for s in strings:
-            s_l = s.lower()
+            original_string = s
             score = 0.0
 
-            # quick length filter
+            # UTF16LE handling
+            if s.startswith("UTF16LE:"):
+                s = s[8:]
+                utfstrings.append(s)
+
+            # Skip very short strings
             if len(s) < 6:
-                scores[s] = score
+                scores[original_string] = score
                 continue
 
-            # Penalize very common-looking noise
-            if re.search(r'^[\-\_\.0-9]+$', s) or len(set(s)) == 1:
+            # Noise penalty
+            if re.fullmatch(r'[\-\_\.0-9]+', s) or len(set(s)) == 1:
                 score -= 5
 
-            # suspicious keywords (like yarGen)
-            if re.search(r'(shell|powershell|invoke|download|execute|payload|encrypt|inject|token|credential|creds|net use|schtasks|rundll32|cmd\.exe|whoami|bitsadmin|Invoke-Expression)', s, re.IGNORECASE):
+            # Keyword scoring
+            if suspicious_keywords.search(s):
                 score += 4
 
-            # suspicious phrases that often appear in malware
+            # Common malware phrases
             if re.search(r'(bypass|encodedcommand|frombase64string|memoryloadlibrary|downloadfile|wget|curl|base64decode|execv|system32|appdata|%appdata%)', s, re.IGNORECASE):
                 score += 3
 
-            # IP addresses / ports
+            # IP address
             if ip_re.search(s):
                 score += 5
 
-            # base64 blobs
+            # Base64 / Hex detection
             if base64_re.match(s) or is_base_64(s):
                 score += 6
-
-            # Hex-encoded or big hex string
             if is_hex_encoded(re.sub(r'[^0-9a-fA-F]', '', s), check_length=False):
                 score += 4
-
-            # common hash indicators
             if hexhash_re.search(s):
                 score += 2
 
-            # file paths, registry, temp
+            # File paths, registry, temp
             if re.search(r'([A-Za-z]:\\|%appdata%|/tmp/|/var/)', s, re.IGNORECASE):
                 score += 3
 
-            # commands and script markers
-            if re.search(r'(\bwget\b|\bcurl\b|powershell -|invoke-expression|EncodedCommand|-nop\b|-w hidden\b|-command\b|iex\b)', s, re.IGNORECASE):
-                score += 4
-
-            # suspicious extensions or exe references
+            # Executable references
             if re.search(r'\.(exe|dll|scr|bat|ps1)\b', s, re.IGNORECASE):
                 score += 2
 
-            # RAT / malware keywords
-            if re.search(r'(rat\b|meterpreter|metasploit|katz|katz|payload|reverse shell|bind shell|backdoor|implant)', s, re.IGNORECASE):
+            # RAT/malware keywords
+            if re.search(r'(rat\b|meterpreter|metasploit|katz|payload|reverse shell|bind shell|backdoor|implant)', s, re.IGNORECASE):
                 score += 5
 
-            # tokens, credentials, passwords
+            # Credentials
             if re.search(r'(password|passwd|token|auth|cookie|credential|creds|username|user|pass)', s, re.IGNORECASE):
                 score += 3
 
-            # suspicious punctuation combos (e.g. arrows, ! marks used in logs)
+            # Suspicious punctuation
             if re.search(r'(-->|!!!|<<<|>>>)', s):
                 score += 2
 
-            # prefer strings that contain dictionary words (reduce false positives)
+            # Likely dictionary word bonus
             if is_likely_word(s) or any(w.isalpha() and len(w) >= 3 and w.lower() in nltk_words for w in re.split(r'\W+', s) if nltk_words):
                 score += 0.5
 
-            # small heuristic: extremely high entropy strings (no spaces, many chars) => likely encoded
-            # approximate by fraction of non-alnum characters
+            # High-entropy heuristic
             non_alnum = sum(1 for ch in s if not ch.isalnum())
             if len(s) > 12 and (non_alnum / len(s)) < 0.05 and len(set(s)) > (len(s) // 4):
-                # likely an encoded/packed blob or long random string
                 score += 1.5
 
-            scores[s] = score
+            # Store final score
+            scores[original_string] = score
             if score >= 4.0:
                 suspicious_count += 1
 
-        # sort top suspicious strings
-        sorted_by_score = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
-        top_strings = [t[0] for t in sorted_by_score if t[1] > 0][:50]
+        # Sort top suspicious strings
+        sorted_scores = sorted(scores.items(), key=lambda kv: kv[1], reverse=True)
+        top_strings = [t[0] for t in sorted_scores if t[1] > 0][:50]
+        suspicious_percentage = (suspicious_count / len(strings)) * 100.0
 
-        suspicious_percentage = (suspicious_count / total) * 100.0
+        analysis.update({
+            "yargen_strings": top_strings,
+            "yargen_suspicious_percentage": suspicious_percentage,
+            "scores": dict(sorted_scores[:200]),
+        })
 
-        analysis["yargen_strings"] = top_strings[:50]
-        analysis["yargen_suspicious_percentage"] = suspicious_percentage
-        analysis["scores"] = {k: v for k, v in sorted_by_score[:200]}
-        if suspicious_percentage < 1 and total > 100:
+        if suspicious_percentage < 1 and len(strings) > 100:
             analysis["status"] = "Likely Clean (very low suspicious string ratio)"
         elif suspicious_percentage > 30:
             analysis["status"] = "Potentially Malicious (high ratio of suspicious strings)"
         else:
             analysis["status"] = "Unknown/Generic"
+
     except Exception as exc:
         logging.error("yarGen scoring failed: %s", exc)
         analysis["status"] = f"Error during string analysis: {exc}"
-    return analysis
 
+    return analysis
 
 def analyze_yargen_strings_from_list(strings: List[str]) -> Dict[str, Any]:
     """
@@ -983,7 +1083,7 @@ def analyze_yargen_strings_from_list(strings: List[str]) -> Dict[str, Any]:
     return _simple_yargen_scores(strings)
 
 def analyze_single_file(path: str) -> dict:
-    """Analyze a single file with Capstone, basic checks, and known-good DB percentage.
+    """FIXED: Analyze a single file - YarGen analysis now only runs on suspicious files.
 
     Strings are extracted exactly once and reused everywhere.
     """
@@ -1106,7 +1206,7 @@ def analyze_single_file(path: str) -> dict:
             is_signed = features["signature_valid"]
             features["unknown"] = not is_good and not is_signed
 
-        # YarGen-like analysis only if suspicious
+        # FIXED: YarGen-like analysis ONLY if suspicious (not for all files)
         if features["suspicious"]:
             try:
                 features["yargen_summary"] = analyze_yargen_strings_from_list(extracted_strings)
@@ -1115,7 +1215,9 @@ def analyze_single_file(path: str) -> dict:
                     features["suspicious_score"] += 3
             except Exception:
                 logging.debug("YarGen-like analysis failed for %s", path, exc_info=True)
+                features["yargen_summary"] = {"status": "Analysis failed", "total_strings": len(extracted_strings)}
         else:
+            # Don't run YarGen analysis for non-suspicious files
             features["yargen_summary"] = {
                 "status": "Not analyzed (below suspicious threshold)",
                 "total_strings": len(extracted_strings),
@@ -1285,7 +1387,6 @@ def filter_opcode_set(opcode_set):
 
 def get_opcode_string(opcode):
     return " ".join(opcode[i : i + 2] for i in range(0, len(opcode), 2))
-
 
 def get_uint_string(magic):
     if len(magic) == 2:
