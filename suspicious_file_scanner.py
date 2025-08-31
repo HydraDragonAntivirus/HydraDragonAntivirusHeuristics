@@ -11,7 +11,6 @@ This version:
 from __future__ import annotations
 
 import os
-import sys
 import io
 import math
 import time
@@ -111,7 +110,7 @@ if not hasattr(ctypes, "BYTE"):
 # --------------------
 # Config / Globals
 # --------------------
-SUSPICIOUS_THRESHOLD = 13
+SUSPICIOUS_THRESHOLD = 15
 SCAN_FOLDER = "."
 
 # DB containers (opcode DB removed)
