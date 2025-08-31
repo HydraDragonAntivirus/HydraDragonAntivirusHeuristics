@@ -56,16 +56,14 @@ except Exception:
     nltk_words = set()
 
 # ------------------------------
-# Global Known-Good DB Containers
+# Global Known-Good DB Containers (normalized)
 # ------------------------------
-good_opcodes_db = {}
-# Small helper sets (populated by load_good_dbs)
+good_opcodes_db: Set[str] = set()
 base64strings: Set[str] = set()
 hexEncStrings: Set[str] = set()
 reversedStrings: Set[str] = set()
-good_opcodes_db: Set[str] = set()
-KNOWN_IMPHASHES = {}
-KNOWN_EXPORTS = {}
+KNOWN_IMPHASHES: Set[str] = set()
+KNOWN_EXPORTS: Set[str] = set()
 USE_OPCODES = False
 
 # Basic configuration
@@ -235,7 +233,6 @@ def is_hex_encoded(s: str, check_length: bool = True) -> bool:
 
 def extract_strings(file_data: bytes) -> List[str]:
     """Faster string extraction using precompiled regexes (ASCII, wide, hex candidates).
-
     This replaces the older multi-pass approach and aims to reduce duplicate
     decoding/reads. It returns a de-duplicated list of strings (order preserved).
     """
@@ -415,13 +412,14 @@ def calculate_entropy(path: str) -> float:
         logging.debug("Entropy calc failed for %s", path, exc_info=True)
         return 0.0
 
-def load_good_dbs(db_path="./dbs"):
+
+def load_good_dbs(db_path="./dbs", use_opcodes: bool = False):
     """
-    FIXED: Loads all known-good DBs safely and normalizes them for matching.
-    Fixed to properly populate global variables and handle different file formats.
+    Loads all known-good DBs safely and normalizes them for matching.
+    `use_opcodes` controls whether opcode DB files are processed.
     """
     global good_opcodes_db, base64strings, hexEncStrings, reversedStrings
-    global KNOWN_IMPHASHES, KNOWN_EXPORTS, USE_OPCODES
+    global KNOWN_IMPHASHES, KNOWN_EXPORTS
 
     # Clear and initialize globals
     good_opcodes_db = set()
@@ -448,16 +446,17 @@ def load_good_dbs(db_path="./dbs"):
         print(f"Loading: {bn}")
 
         # Skip opcode DBs unless explicitly requested
-        if "opcodes" in bn and not USE_OPCODES:
+        if "opcodes" in bn and not use_opcodes:
             skipped.append(p)
-            logging.info("Skipping opcode DB (USE_OPCODES=False): %s", bn)
+            logging.info("Skipping opcode DB (use_opcodes=False): %s", bn)
+            print(f"  -> Skipping opcode DB (use_opcodes=False)")
             continue
 
         try:
             # Try multiple loading strategies
             db_data = None
             load_method = "unknown"
-            
+
             # Strategy 1: Gzipped JSON
             try:
                 with gzip.open(p, "rt", encoding="utf-8", errors="ignore") as f:
@@ -494,7 +493,7 @@ def load_good_dbs(db_path="./dbs"):
                             except:
                                 # Try latin-1 as fallback
                                 content = raw_data.decode('latin-1', errors='ignore').strip()
-                            
+
                             if content.startswith('[') or content.startswith('{'):
                                 db_data = json.loads(content)
                                 load_method = "binary_json"
@@ -550,10 +549,10 @@ def load_good_dbs(db_path="./dbs"):
                 for s in items:
                     if not isinstance(s, str) or not s.strip():
                         continue
-                    
+
                     s = s.strip()
                     s_l = s.lower()
-                    
+
                     # Classify and store strings
                     if len(s) >= 6:  # Only process strings of reasonable length
                         if is_base_64(s):
@@ -612,14 +611,15 @@ def load_good_dbs(db_path="./dbs"):
         logging.warning("String databases appear to be empty - check file formats and content")
         print("WARNING: String databases appear to be empty")
 
+
 def is_likely_word(s: str) -> bool:
     """Return True if string is at least 3 chars and exists in NLTK words."""
     return len(s) >= 3 and s.lower() in nltk_words
 
+
 def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=None, debug=False):
     """
-    FIXED: Calculates how much of this file matches known-good DBs.
-    Fixed debugging and removed excessive debug output.
+    Calculates how much of this file matches known-good DBs.
     """
     global good_opcodes_db, base64strings, hexEncStrings, reversedStrings
     global KNOWN_IMPHASHES, KNOWN_EXPORTS, USE_OPCODES
@@ -633,7 +633,7 @@ def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=
         if USE_OPCODES and good_opcodes_db:
             opcodes = extract_opcodes(file_data)
             total_markers += len(opcodes)
-            
+
             for op in opcodes:
                 op_normalized = op.replace(" ", "").lower()
                 if op_normalized in good_opcodes_db:
@@ -645,7 +645,7 @@ def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=
     # --- IMPORT HASHES ---
     try:
         imphash, exports = get_pe_info(file_data)
-        
+
         if KNOWN_IMPHASHES and imphash:
             total_markers += 1
             if imphash.lower() in KNOWN_IMPHASHES:
@@ -659,7 +659,7 @@ def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=
     try:
         if KNOWN_EXPORTS and exports:
             total_markers += len(exports)
-            
+
             for e in exports:
                 if e and e.lower() in KNOWN_EXPORTS:
                     matches += 1
@@ -670,32 +670,32 @@ def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=
     # --- STRINGS ---
     try:
         strings = precomputed_strings or extract_strings(file_data)
-        
+
         if strings:
             total_markers += len(strings)
-            
+
             for s in strings:
                 s_l = s.lower()
                 match_found = False
-                
+
                 # Check base64 database
                 if s in base64strings or s_l in base64strings:
                     matches += 1
                     db_hits["strings"] += 1
                     match_found = True
-                
+
                 # Check hex encoded database (only if not already matched)
                 if not match_found and (s in hexEncStrings or s_l in hexEncStrings):
                     matches += 1
                     db_hits["strings"] += 1
                     match_found = True
-                
+
                 # Check reversed strings database (only if not already matched)
                 if not match_found and (s[::-1] in reversedStrings or s_l[::-1] in reversedStrings):
                     matches += 1
                     db_hits["strings"] += 1
                     match_found = True
-                    
+
     except Exception as e:
         logging.debug("String check failed for %s: %s", path, e)
 
@@ -804,7 +804,7 @@ def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
     return analysis
 
 
-# WinVerifyTrust / Authenticode constants, types and setup
+# --- WinVerifyTrust / Authenticode functions (unchanged) ---
 class CERT_CONTEXT(ctypes.Structure):
     _fields_ = [
         ("dwCertEncodingType", wintypes.DWORD),
@@ -842,7 +842,7 @@ class WINTRUST_FILE_INFO(ctypes.Structure):
         ("pgKnownSubject", ctypes.POINTER(WinVerifyTrust_GUID)),
     ]
 
-# Windows type aliases for use in structures
+
 WORD   = ctypes.c_ushort     # 16-bit
 DWORD  = ctypes.c_uint32     # 32-bit unsigned
 BOOL   = ctypes.c_int        # 32-bit signed (BOOL in WinAPI)
@@ -866,13 +866,12 @@ class WINTRUST_DATA(ctypes.Structure):
         ("pSignatureSettings", ctypes.c_void_p),
     ]
 
-# UI and revocation options
+
 WTD_UI_NONE = 2
 WTD_REVOKE_NONE = 0
 WTD_CHOICE_FILE = 1
 WTD_STATEACTION_IGNORE = 0x00000000
 
-# Load WinTrust DLL
 _wintrust = ctypes.windll.wintrust
 
 TRUST_E_NOSIGNATURE = 0x800B0100
@@ -950,6 +949,8 @@ def is_running_pe(path: str) -> bool:
         pass
     return False
 
+
+# --- YarGen-like scoring and wrappers (unchanged) ---
 def _simple_yargen_scores(strings: List[str]) -> Dict[str, Any]:
     """
     YarGen-inspired scoring with integration of filtering heuristics.
@@ -1076,17 +1077,16 @@ def _simple_yargen_scores(strings: List[str]) -> Dict[str, Any]:
 
     return analysis
 
+
 def analyze_yargen_strings_from_list(strings: List[str]) -> Dict[str, Any]:
     """
     Wrapper to keep compatibility with original name. Uses the conservative yarGen-style scorer above.
     """
     return _simple_yargen_scores(strings)
 
-def analyze_single_file(path: str) -> dict:
-    """FIXED: Analyze a single file - YarGen analysis now only runs on suspicious files.
 
-    Strings are extracted exactly once and reused everywhere.
-    """
+def analyze_single_file(path: str) -> dict:
+    """Analyze a single file - YarGen analysis only runs on suspicious files."""
     features = {
         "path": path,
         "entropy": 0.0,
@@ -1206,7 +1206,7 @@ def analyze_single_file(path: str) -> dict:
             is_signed = features["signature_valid"]
             features["unknown"] = not is_good and not is_signed
 
-        # FIXED: YarGen-like analysis ONLY if suspicious (not for all files)
+        # YarGen-like analysis ONLY if suspicious
         if features["suspicious"]:
             try:
                 features["yargen_summary"] = analyze_yargen_strings_from_list(extracted_strings)
@@ -1217,7 +1217,6 @@ def analyze_single_file(path: str) -> dict:
                 logging.debug("YarGen-like analysis failed for %s", path, exc_info=True)
                 features["yargen_summary"] = {"status": "Analysis failed", "total_strings": len(extracted_strings)}
         else:
-            # Don't run YarGen analysis for non-suspicious files
             features["yargen_summary"] = {
                 "status": "Not analyzed (below suspicious threshold)",
                 "total_strings": len(extracted_strings),
@@ -1228,6 +1227,7 @@ def analyze_single_file(path: str) -> dict:
         features["error"] = str(exc)
 
     return features
+
 
 def scan_directory_parallel(directory: str, max_workers: Optional[int] = None) -> List[Dict[str, Any]]:
     """
@@ -1273,6 +1273,7 @@ def scan_directory_parallel(directory: str, max_workers: Optional[int] = None) -
                 logging.error("Error during analysis of %s: %s", futures.get(future), e)
 
     return suspicious_results
+
 
 def generate_general_condition(file_info: dict):
     conditions = []
@@ -1388,6 +1389,7 @@ def filter_opcode_set(opcode_set):
 def get_opcode_string(opcode):
     return " ".join(opcode[i : i + 2] for i in range(0, len(opcode), 2))
 
+
 def get_uint_string(magic):
     if len(magic) == 2:
         return "uint8(0) == 0x{0}{1}".format(magic[0], magic[1])
@@ -1431,11 +1433,12 @@ def get_file_range(size):
 # Database update helper + Main execution
 # -----------------------
 
-def update_databases(force: bool = False, db_dir: str = "./dbs"):
+def update_databases(force: bool = False, db_dir: str = "./dbs", use_opcodes: bool = False):
     """Download REPO_URLS into db_dir.
 
     - If force is False, only download missing files (resume-safe).
     - If force is True, re-download all files.
+    - If use_opcodes is False, skip downloading files that contain 'opcodes' in the name.
     """
     try:
         if not os.path.exists(db_dir):
@@ -1445,6 +1448,11 @@ def update_databases(force: bool = False, db_dir: str = "./dbs"):
         return
 
     for filename, repo_url in REPO_URLS.items():
+        # Skip opcode files unless user specifically requested them
+        if "opcodes" in filename and not use_opcodes:
+            logging.info("Skipping download of opcode DB (use_opcodes=False): %s", filename)
+            continue
+
         out_path = os.path.join(db_dir, filename)
         if os.path.exists(out_path) and not force:
             logging.info("DB already present, skipping: %s", out_path)
@@ -1466,32 +1474,32 @@ if __name__ == "__main__":
         help="Download/update DB files from REPO_URLS into ./dbs before scanning (no other flags).",
     )
     parser.add_argument(
-    "--use-opcodes",
-    action="store_true",
-    help="Enable opcode extraction and good-opcodes DB checks (CPU heavy). Default: OFF",
+        "--use-opcodes",
+        action="store_true",
+        help="Enable opcode extraction and good-opcodes DB checks (CPU heavy). Default: OFF",
     )
 
     args = parser.parse_args()
+
+    # enable opcodes only if user explicitly asked — set this BEFORE loading DBs
+    USE_OPCODES = getattr(args, "use_opcodes", False)
 
     logging.info("Starting file scan with Capstone analysis (parallel)...")
 
     # DB update / load: only the single --update-db flag controls network activity.
     if args.update_db:
         try:
-            logging.info("Requested DB update: downloading into ./dbs (force not available).")
-            update_databases(force=False, db_dir="./dbs")
-            load_good_dbs("./dbs")
+            logging.info("Requested DB update: downloading into ./dbs (respecting use_opcodes).")
+            update_databases(force=False, db_dir="./dbs", use_opcodes=USE_OPCODES)
+            load_good_dbs("./dbs", use_opcodes=USE_OPCODES)
         except Exception:
             logging.exception("Failed to update/load good DBs")
     else:
         # Try to load DBs if present; do not attempt network activity.
         try:
-            load_good_dbs("./dbs")
+            load_good_dbs("./dbs", use_opcodes=USE_OPCODES)
         except Exception:
             logging.exception("Failed to load good DBs")
-
-    # enable opcodes only if user explicitly asked
-    USE_OPCODES = getattr(args, "use_opcodes", False)
 
     # Run scan (always uses configured SCAN_FOLDER)
     try:
