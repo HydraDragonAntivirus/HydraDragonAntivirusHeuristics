@@ -694,7 +694,8 @@ def analyze_single_file(path: str) -> dict:
         'suspicious_score': 0,
         'suspicious': False,
         'phase1_score': 0,
-        'phase2_summary': None
+        'phase2_summary': None,
+        'phase2_percentage': 0.0
     }
 
     try:
@@ -714,7 +715,7 @@ def analyze_single_file(path: str) -> dict:
 
         except pefile.PEFormatError:
             # Not a valid PE, skip executable-specific
-            return features
+            pass
         finally:
             if pe:
                 try:
@@ -788,34 +789,24 @@ def analyze_single_file(path: str) -> dict:
             # --------------------
             # Phase 2: YarGen string scoring
             # --------------------
-            if features['suspicious']:
-                try:
-                    with open(path, "rb") as fh:
-                        file_data = fh.read()
-                    strings = extract_strings(file_data)
-                    yargen_summary = score_strings_yargen_style(strings)  # uses global good_strings_db
-                    features['phase2_summary'] = yargen_summary
-                    logging.info(f"[Phase 2] YarGen summary for {path}: {yargen_summary}")
+            try:
+                with open(path, "rb") as fh:
+                    file_data = fh.read()
+                strings = extract_strings(file_data)
+                yargen_summary = score_strings_yargen_style(strings)  # uses global good_strings_db
+                features['phase2_summary'] = yargen_summary
+                features['phase2_percentage'] = yargen_summary.get('unknown_percentage', 0.0)
 
-                    # --------------------
-                    # Adjust suspicious score using unknown percentage
-                    # --------------------
-                    unknown_pct = yargen_summary.get("unknown_percentage", 0.0)
-                    if unknown_pct < 20.0:
-                        # Mostly known, reduce phase1_score to avoid false positives
-                        features['suspicious_score'] = max(features['phase1_score'] // 2, 0)
-                        features['suspicious'] = features['suspicious_score'] >= SUSPICIOUS_THRESHOLD
-                    elif unknown_pct < 50.0:
-                        # Partially unknown, slightly reduce
-                        features['suspicious_score'] = max(int(features['phase1_score'] * 0.75), 0)
-                        features['suspicious'] = features['suspicious_score'] >= SUSPICIOUS_THRESHOLD
-                    else:
-                        # Mostly unknown, keep full score
-                        features['suspicious_score'] = features['phase1_score']
-                        features['suspicious'] = features['suspicious_score'] >= SUSPICIOUS_THRESHOLD
+                # Optionally combine Phase 1 + Phase 2 into final suspicious score
+                combined_score = phase1 + (features['phase2_percentage'] / 10)  # scale 0–100% into small weight
+                features['suspicious_score'] = combined_score
+                features['suspicious'] = combined_score >= SUSPICIOUS_THRESHOLD
 
-                except Exception as e:
-                    logging.warning(f"[Phase 2] Failed for {path}: {e}")
+                logging.info(f"[Phase 2] YarGen summary for {path}: {yargen_summary}")
+                logging.info(f"[Phase 2] Phase2 % used in score: {features['phase2_percentage']:.2f}%")
+
+            except Exception as e:
+                logging.warning(f"[Phase 2] Failed for {path}: {e}")
 
     except Exception as e:
         logging.error(f"Failed to analyze {path}: {e}")
