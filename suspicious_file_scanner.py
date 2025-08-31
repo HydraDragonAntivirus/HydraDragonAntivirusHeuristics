@@ -574,7 +574,18 @@ def check_valid_signature(file_path: str) -> dict:
 # --------------------
 # yarGen-style string scoring (Unknownity only)
 # --------------------
+# --------------------
+# YarGen-style string scoring (fixed)
+# --------------------
 def score_strings_yargen_style(strings: List[str], good_strings_db: Dict[str, int]) -> Dict[str, Any]:
+    """
+    Score strings in YarGen style:
+    - Baseline unknown strings get +1
+    - Known words (NLTK) get +1
+    - Base64 / hex decodable strings get extra +2
+    - Reversed known strings get +2
+    Returns top unknowns and summary percentages.
+    """
     global stringScores, base64strings, hexEncStrings, reversedStrings
     stringScores, base64strings, hexEncStrings, reversedStrings = {}, {}, {}, {}
     local_scores = {}
@@ -585,27 +596,17 @@ def score_strings_yargen_style(strings: List[str], good_strings_db: Dict[str, in
         if s.startswith("UTF16LE:"):
             s = s[8:]
 
-        # Known in whitelist DB?
+        # Check DB
         known = s_orig in good_strings_db or s in good_strings_db
         known_count = good_strings_db.get(s_orig, 0) or good_strings_db.get(s, 0) if known else 0
         score = -known_count if known else 1  # baseline unknown score
 
         if not known:
-            # Likely English word but unknown to DB
-            if is_likely_known_word(s):
-                score += 1  # extra weight for real word
+            # NLTK likely word check
+            if is_likely_word(s):
+                score += 1
 
-            # Extra unknownity weight for encoding/obfuscation
-            if re.fullmatch(r'(?:[A-Za-z0-9+/]{4}){2,}(?:==|=)?', s) and is_base_64(s):
-                score += 2
-            hex_candidate = re.sub(r'[^0-9a-fA-F]', '', s)
-            if len(hex_candidate) > 8 and is_hex_encoded(hex_candidate, False):
-                score += 2
-            if s[::-1] in good_strings_db:
-                score += 2
-                reversedStrings[s_orig] = s[::-1]
-
-            # Attempt decoding
+            # Attempt decoding (Base64 / Hex)
             try:
                 for m_string in (s, s[1:], s[:-1], s + "=", s + "=="):
                     if is_base_64(m_string):
@@ -628,11 +629,17 @@ def score_strings_yargen_style(strings: List[str], good_strings_db: Dict[str, in
             except Exception:
                 pass
 
+            # Reversed string detection
+            if s[::-1] in good_strings_db:
+                score += 2
+                reversedStrings[s_orig] = s[::-1]
+
         local_scores[s_orig] = score
         stringScores[s_orig] = score
         if score > 0:
             unknown_count += 1
 
+    # Summary
     total_strings = len(strings)
     unknown_percentage = (unknown_count / total_strings) * 100 if total_strings else 0.0
     sorted_scores = sorted(local_scores.items(), key=lambda kv: kv[1], reverse=True)
