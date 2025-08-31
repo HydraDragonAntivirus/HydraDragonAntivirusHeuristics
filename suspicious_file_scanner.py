@@ -714,6 +714,12 @@ def check_against_good_dbs_percentage(path, file_data=None, precomputed_strings=
 
 
 def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
+    """
+    Capstone analysis with safety guards:
+      - caps max bytes disassembled per section to avoid CS_ERR_MEM
+      - always returns a dict (never None)
+      - catches Capstone errors and returns them in analysis['error']
+    """
     analysis = {
         "overall_analysis": {
             "total_instructions": 0,
@@ -730,17 +736,17 @@ def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
             analysis["error"] = "capstone module not available"
             return analysis
 
-        if pe.FILE_HEADER.Machine == 0x014C:
-            md = capstone_module.Cs(
-                capstone_module.CS_ARCH_X86, capstone_module.CS_MODE_32
-            )
-        elif pe.FILE_HEADER.Machine == 0x8664:
-            md = capstone_module.Cs(
-                capstone_module.CS_ARCH_X86, capstone_module.CS_MODE_64
-            )
+        # choose architecture
+        if getattr(pe, "FILE_HEADER", None) and getattr(pe.FILE_HEADER, "Machine", None) == 0x014C:
+            md = capstone_module.Cs(capstone_module.CS_ARCH_X86, capstone_module.CS_MODE_32)
+        elif getattr(pe, "FILE_HEADER", None) and getattr(pe.FILE_HEADER, "Machine", None) == 0x8664:
+            md = capstone_module.Cs(capstone_module.CS_ARCH_X86, capstone_module.CS_MODE_64)
         else:
             analysis["error"] = "Unsupported architecture."
             return analysis
+
+        # Safety: cap bytes per section to avoid OOM (tune as needed)
+        MAX_SECTION_BYTES = 256 * 1024  # 256 KB per section
 
         total_add_count = 0
         total_mov_count = 0
@@ -750,12 +756,12 @@ def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
             try:
                 section_name = section.Name.decode(errors="ignore").strip("\x00")
             except Exception:
-                section_name = str(section.Name)
-            code = section.get_data()
-            base_address = pe.OPTIONAL_HEADER.ImageBase + section.VirtualAddress
+                section_name = str(getattr(section, "Name", "unknown"))
 
-            instruction_counts = {}
-            total_instructions_in_section = 0
+            try:
+                code = section.get_data()
+            except Exception:
+                code = b""
 
             if not code:
                 analysis["sections"][section_name] = {
@@ -767,11 +773,39 @@ def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
                 }
                 continue
 
-            instructions = md.disasm(code, base_address)
-            for i in instructions:
-                mnemonic = i.mnemonic
-                instruction_counts[mnemonic] = instruction_counts.get(mnemonic, 0) + 1
-                total_instructions_in_section += 1
+            # Trim oversized sections to avoid Capstone OOMs
+            if len(code) > MAX_SECTION_BYTES:
+                code = code[:MAX_SECTION_BYTES]
+
+            base_address = 0
+            try:
+                base_address = pe.OPTIONAL_HEADER.ImageBase + section.VirtualAddress
+            except Exception:
+                # fallback if OPTIONAL_HEADER missing / broken
+                base_address = section.VirtualAddress if hasattr(section, "VirtualAddress") else 0
+
+            instruction_counts = {}
+            total_instructions_in_section = 0
+
+            try:
+                instructions = md.disasm(code, base_address)
+                for i in instructions:
+                    mnemonic = getattr(i, "mnemonic", None)
+                    if not mnemonic:
+                        continue
+                    instruction_counts[mnemonic] = instruction_counts.get(mnemonic, 0) + 1
+                    total_instructions_in_section += 1
+            except Exception as e:
+                # Capstone error for this section: record and continue
+                logging.debug("Capstone section disasm failed for %s: %s", section_name, e)
+                analysis["sections"][section_name] = {
+                    "instruction_counts": {},
+                    "total_instructions": 0,
+                    "add_count": 0,
+                    "mov_count": 0,
+                    "is_likely_packed": False,
+                }
+                continue
 
             add_count = instruction_counts.get("add", 0)
             mov_count = instruction_counts.get("mov", 0)
@@ -785,9 +819,7 @@ def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
                 "total_instructions": total_instructions_in_section,
                 "add_count": add_count,
                 "mov_count": mov_count,
-                "is_likely_packed": (
-                    add_count > mov_count if total_instructions_in_section > 0 else False
-                ),
+                "is_likely_packed": (add_count > mov_count if total_instructions_in_section > 0 else False),
             }
 
         analysis["overall_analysis"]["total_instructions"] = grand_total_instructions
@@ -802,7 +834,6 @@ def analyze_with_capstone(pe, capstone_module) -> Dict[str, Any]:
         analysis["error"] = str(exc)
 
     return analysis
-
 
 # --- WinVerifyTrust / Authenticode functions (unchanged) ---
 class CERT_CONTEXT(ctypes.Structure):
@@ -1084,9 +1115,11 @@ def analyze_yargen_strings_from_list(strings: List[str]) -> Dict[str, Any]:
     """
     return _simple_yargen_scores(strings)
 
-
 def analyze_single_file(path: str) -> dict:
-    """Analyze a single file - YarGen analysis only runs on suspicious files."""
+    """
+    Two-stage analysis: light-first, heavy-only-if-needed.
+    Ensures features['capstone_analysis'] is always a dict to avoid None.get errors.
+    """
     features = {
         "path": path,
         "entropy": 0.0,
@@ -1095,7 +1128,7 @@ def analyze_single_file(path: str) -> dict:
         "has_version_info": False,
         "signature_valid": False,
         "signature_status": "N/A",
-        "capstone_analysis": None,
+        "capstone_analysis": {},  # <- ensure default is dict
         "is_running": False,
         "age_days": 0,
         "extension": "",
@@ -1103,57 +1136,58 @@ def analyze_single_file(path: str) -> dict:
         "suspicious": False,
         "known_good_percent": 0.0,
         "unknown": False,
-        "strings": [],  # store extracted strings
+        "strings": [],  # populated only in heavy stage
+        "yargen_summary": {"status": "Not analyzed (light-pass)", "total_strings": 0},
     }
 
     try:
-        # Basic FS stats
-        stats = os.stat(path)
-        features["size"] = stats.st_size
-        features["age_days"] = (time.time() - stats.st_ctime) / (24 * 3600)
-        features["entropy"] = calculate_entropy(path)
+        # Basic FS stats (very cheap)
+        try:
+            stats = os.stat(path)
+            features["size"] = stats.st_size
+            features["age_days"] = (time.time() - stats.st_ctime) / (24 * 3600)
+        except Exception:
+            logging.debug("stat failed for %s", path, exc_info=True)
+
+        # Entropy (chunked)
+        try:
+            features["entropy"] = calculate_entropy(path)
+        except Exception:
+            logging.debug("Entropy calc failed for %s", path, exc_info=True)
 
         filename_lc = os.path.basename(path).lower()
         ext = os.path.splitext(filename_lc)[1].lstrip(".")
         features["extension"] = ext
 
-        # Read file bytes once
-        file_bytes = b""
-        try:
-            with open(path, "rb") as fh:
-                file_bytes = fh.read()
-        except Exception:
-            logging.debug("Failed to read file bytes for %s", path, exc_info=True)
-
-        # Extract strings once
-        if file_bytes:
-            extracted_strings = extract_strings(file_bytes)
-        else:
-            extracted_strings = []
-
-        features["strings"] = extracted_strings
-
-        # Known-good DB percentage using the precomputed strings
-        try:
-            features["known_good_percent"] = check_against_good_dbs_percentage(
-                path, file_data=file_bytes, precomputed_strings=extracted_strings
-            )
-        except Exception:
-            logging.debug("known_good_percent check failed for %s", path, exc_info=True)
-
-        # PE analysis
+        # --- PE quick analysis ---
         pe_obj = None
         try:
             if pefile:
-                pe_obj = pefile.PE(path)
-                features["is_executable"] = True
-                features["has_version_info"] = (
-                    hasattr(pe_obj, "VS_FIXEDFILEINFO") and pe_obj.VS_FIXEDFILEINFO is not None
-                )
-                features["capstone_analysis"] = analyze_with_capstone(pe_obj, capstone)
+                try:
+                    pe_obj = pefile.PE(path, fast_load=True)
+                    features["is_executable"] = True
+                    features["has_version_info"] = (
+                        hasattr(pe_obj, "VS_FIXEDFILEINFO") and pe_obj.VS_FIXEDFILEINFO is not None
+                    )
+                except Exception:
+                    # If PE parsing fails, keep going but mark as not executable
+                    logging.debug("pefile quick_load failed for %s", path, exc_info=True)
+                    features["is_executable"] = False
+                else:
+                    # Run capstone analysis but guard that result is a dict
+                    try:
+                        cap_res = analyze_with_capstone(pe_obj, capstone)
+                        if isinstance(cap_res, dict):
+                            features["capstone_analysis"] = cap_res
+                        else:
+                            # unexpected return type from analyzer -> use empty dict
+                            features["capstone_analysis"] = {}
+                            logging.debug("analyze_with_capstone returned non-dict for %s", path)
+                    except Exception as e:
+                        logging.debug("Capstone analysis raised for %s: %s", path, e, exc_info=True)
+                        features["capstone_analysis"] = {}
         except Exception:
-            features["is_executable"] = features.get("is_executable", False)
-            logging.debug("PE analysis failed for %s", path, exc_info=True)
+            logging.debug("PE quick-check block failed for %s", path, exc_info=True)
         finally:
             if pe_obj:
                 try:
@@ -1161,52 +1195,87 @@ def analyze_single_file(path: str) -> dict:
                 except Exception:
                     pass
 
-        if features["is_executable"]:
-            try:
+        # Defensive fallback (in case something overwrote it)
+        if not isinstance(features.get("capstone_analysis"), dict):
+            features["capstone_analysis"] = {}
+
+        # Signature & running status
+        try:
+            if features["is_executable"]:
                 sig = check_valid_signature(path)
                 features["signature_valid"] = sig.get("is_valid", False)
                 features["signature_status"] = sig.get("status", "N/A")
-            except Exception:
-                logging.debug("Signature check failed for %s", path, exc_info=True)
+        except Exception:
+            logging.debug("Signature check failed for %s", path, exc_info=True)
+
+        try:
             features["is_running"] = is_running_pe(path)
+        except Exception:
+            features["is_running"] = False
 
-        # Heuristic scoring
-        score = 0
-        cap_analysis = features.get("capstone_analysis", {}).get("overall_analysis", {})
+        # ---------- LIGHTWEIGHT HEURISTICS (no strings) ----------
+        prelim_score = 0
+        capstone_obj = features.get("capstone_analysis") or {}
+        cap_analysis = capstone_obj.get("overall_analysis") or {}
+
         if cap_analysis.get("is_likely_packed"):
-            score += 3
+            prelim_score += 3
         if features["entropy"] > 7.5:
-            score += 5 if not features["signature_valid"] else 2
+            prelim_score += 5 if not features["signature_valid"] else 2
         if features["age_days"] < 1:
-            score += 2
+            prelim_score += 2
         if "temp" in path.lower() or "cache" in path.lower():
-            score += 2
+            prelim_score += 2
         if features["is_executable"] and not features["has_version_info"] and not features["signature_valid"]:
-            score += 1
+            prelim_score += 1
         if features["is_executable"] and not features["signature_valid"]:
-            score += 4 if features["signature_status"] == "Untrusted root" else 2
-        if features["signature_valid"]:
-            score = max(score - 3, 0)
+            prelim_score += 4 if features["signature_status"] == "Untrusted root" else 2
         if features["is_running"]:
-            score += 3
+            prelim_score += 3
         if ext == "":
-            score += 2
+            prelim_score += 2
 
-        # Adjust based on known-good DB
+        # store prelim score
+        features["suspicious_score"] = prelim_score
+
+        # Tune this threshold if you want lighter/heavier filtering
+        LIGHT_ANALYSIS_THRESHOLD = max(1, int(SUSPICIOUS_THRESHOLD / 2))
+        if prelim_score < LIGHT_ANALYSIS_THRESHOLD:
+            features["suspicious"] = prelim_score >= SUSPICIOUS_THRESHOLD
+            features["yargen_summary"] = {
+                "status": "Not analyzed (light-pass, below threshold)",
+                "total_strings": 0,
+            }
+            return features
+
+        # ---------- HEAVY STAGE ----------
+        file_bytes = b""
+        try:
+            with open(path, "rb") as fh:
+                file_bytes = fh.read()
+        except Exception:
+            logging.debug("Failed to read file bytes for heavy stage %s", path, exc_info=True)
+
+        extracted_strings = extract_strings(file_bytes) if file_bytes else []
+        features["strings"] = extracted_strings
+
+        # Known-good DB percentage
+        try:
+            features["known_good_percent"] = check_against_good_dbs_percentage(
+                path, file_data=file_bytes, precomputed_strings=extracted_strings
+            )
+        except Exception:
+            logging.debug("known_good_percent check failed for %s", path, exc_info=True)
+
+        # Final score adjustments
+        score = prelim_score
         if features["known_good_percent"] > 0:
             reduction = score * min(features["known_good_percent"] / 100, 0.5)
             score = max(score - reduction, 0)
 
-        features["suspicious_score"] = score
+        features["suspicious_score"] = int(score)
         features["suspicious"] = score >= SUSPICIOUS_THRESHOLD
 
-        # Mark unknown only if suspicious
-        if features["suspicious"]:
-            is_good = features["known_good_percent"] > 0
-            is_signed = features["signature_valid"]
-            features["unknown"] = not is_good and not is_signed
-
-        # YarGen-like analysis ONLY if suspicious
         if features["suspicious"]:
             try:
                 features["yargen_summary"] = analyze_yargen_strings_from_list(extracted_strings)
@@ -1218,16 +1287,20 @@ def analyze_single_file(path: str) -> dict:
                 features["yargen_summary"] = {"status": "Analysis failed", "total_strings": len(extracted_strings)}
         else:
             features["yargen_summary"] = {
-                "status": "Not analyzed (below suspicious threshold)",
+                "status": "Not analyzed (final score below suspicious threshold)",
                 "total_strings": len(extracted_strings),
             }
+
+        if features["suspicious"]:
+            is_good = features["known_good_percent"] > 0
+            is_signed = features["signature_valid"]
+            features["unknown"] = not is_good and not is_signed
 
     except Exception as exc:
         logging.error("Failed to analyze %s: %s", path, exc)
         features["error"] = str(exc)
 
     return features
-
 
 def scan_directory_parallel(directory: str, max_workers: Optional[int] = None) -> List[Dict[str, Any]]:
     """
@@ -1508,48 +1581,67 @@ if __name__ == "__main__":
         logging.error("Top-level parallel scan failed: %s", exc)
         results = []
 
+    # Summarize suspicious results (store index instead of path for stable lookup)
     suspicious_count = 0
-    top_offenders = []
-    for res in results:
-        if res.get("suspicious", False):
-            suspicious_count += 1
-            top_offenders.append((res.get("suspicious_score", 0), res.get("path")))
+    top_offenders = []  # list of (score:int, idx:int)
 
-    top_offenders.sort(reverse=True)
+    for idx, res in enumerate(results):
+        try:
+            if res.get("suspicious", False):
+                suspicious_count += 1
+                try:
+                    score_val = int(res.get("suspicious_score", 0))
+                except Exception:
+                    score_val = 0
+                top_offenders.append((score_val, idx))
+        except Exception:
+            logging.debug("Bad result entry while summarizing: %s", res, exc_info=True)
+
+    # Sort descending by score (highest first)
+    top_offenders.sort(key=lambda x: x[0], reverse=True)
+
     logging.info(
         "Scan complete: %d files scanned, %d suspicious files found.",
         len(results),
         suspicious_count,
     )
 
+    # Detailed logging for top offenders (defensive; lookup by index)
     if top_offenders:
         logging.info("--- Detailed Analysis of Top Suspicious Files ---")
-        for score, path in top_offenders[:20]:
-            original_features = next((f for f in results if f.get("path") == path), {})
-            notes = []
-            if original_features.get("capstone_analysis", {}).get("overall_analysis", {}).get(
-                "is_likely_packed"
-            ):
-                notes.append("Capstone suggests file may be packed")
+        for score, idx in top_offenders[:20]:
+            original_features = results[idx] if 0 <= idx < len(results) else {}
+            # defensive values
+            path = original_features.get("path") or "<unknown>"
+            logging.info("Path: %s (Initial Score: %d)", path, int(score or 0))
+
+            # Defensive capstone access
+            capstone_obj = original_features.get("capstone_analysis") or {}
+            overall = capstone_obj.get("overall_analysis") or {}
+            if overall.get("is_likely_packed"):
+                logging.info("  - Triage Note: Capstone suggests file may be packed")
+
             if original_features.get("entropy", 0) > 7.5:
-                notes.append("High entropy detected")
+                logging.info("  - Triage Note: High entropy detected")
+
             if not original_features.get("signature_valid"):
-                notes.append(
-                    "Invalid or missing signature (Status: %s)"
-                    % original_features.get("signature_status", "N/A")
+                logging.info(
+                    "  - Triage Note: Invalid or missing signature (Status: %s)",
+                    original_features.get("signature_status", "N/A"),
                 )
 
-            logging.info("Path: %s (Initial Score: %d)", path, score)
-            for note in notes:
-                logging.info("  - Triage Note: %s", note)
-
             logging.info("  - Running on-demand string analysis... (already precomputed)")
-            yargen_analysis = original_features.get("yargen_summary", {})
+            yargen_analysis = original_features.get("yargen_summary") or {}
             logging.info("  - String Analysis Result: %s", yargen_analysis.get("status", "N/A"))
-            logging.info(
-                "    (Found %.1f%% suspicious strings out of %d total.)",
-                yargen_analysis.get("yargen_suspicious_percentage", 0.0),
-                yargen_analysis.get("total_strings", 0),
-            )
+            try:
+                pct = float(yargen_analysis.get("yargen_suspicious_percentage", 0.0))
+            except Exception:
+                pct = 0.0
+            try:
+                total_strings = int(yargen_analysis.get("total_strings", 0))
+            except Exception:
+                total_strings = 0
+            logging.info("    (Found %.1f%% suspicious strings out of %d total.)", pct, total_strings)
     else:
         logging.info("No suspicious files found above the threshold.")
+
