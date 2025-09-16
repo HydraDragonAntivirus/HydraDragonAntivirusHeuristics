@@ -1,143 +1,393 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Suspicious file scanner + PEStudio XML whitelist preserved.
-
-This version:
- - Keeps Phase1 heuristics (entropy, age, signature, capstone packing analysis).
- - Loads PEStudio-style strings XML (whitelist).
+Suspicious file scanner with hardcoded scoring system focused on obfuscation detection.
+Removes ML dependencies and uses pattern-based detection for evasive malware.
+ReactOS and Python 3.5+ compatible.
 """
 import os
-import io
 import math
 import time
-import logging
-import argparse
-from typing import Any, Dict, List, Optional, Tuple
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import hydra_logger
+import quarantine
+import threading
+import re
+import string
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import psutil
 
-import ctypes
-from ctypes import wintypes
-
-# Optional heavy deps (kept where useful)
+# --- Compatibility imports for tkinter ---
 try:
-    import psutil
-except Exception:
-    psutil = None
+    import tkinter as tk
+    from tkinter import ttk, filedialog, scrolledtext, messagebox, font
+except ImportError:
+    import Tkinter as tk
+    import ttk
+    import tkFileDialog as filedialog
+    import ScrolledText as scrolledtext
+    import tkMessageBox as messagebox
+    import tkFont as font
 
+# Import the PE feature extractor from machine_learning module
+# but we'll only use the PEFeatureExtractor class, not the ML functions
 try:
-    import pefile
-except Exception:
-    pefile = None
+    from machine_learning import get_cached_pe_features
+except ImportError:
+    hydra_logger.logger.error("Could not import PE feature extractor. Make sure machine_learning.py is available.")
+    raise
 
-try:
-    import capstone
-except Exception:
-    capstone = None
+base_dir = os.path.dirname(os.path.abspath(__file__))
 
-try:
-    import lief
-except Exception:
-    lief = None
+# --- Globals and Configuration ---
+SUSPICIOUS_THRESHOLD = 25  # Increased threshold for hardcoded system
+DETECTION_NAME = "HEUR:Win32.Susp.Obfuscated.gen"
 
-try:
-    from tqdm import tqdm
-except Exception:
-    def tqdm(it, **kwargs): return it
-
-# lxml preferred for robust XML parsing; fallback to ElementTree
-try:
-    from lxml import etree as lxml_etree
-    etree = lxml_etree
-except Exception:
-    import xml.etree.ElementTree as lxml_etree  # type: ignore
-    etree = lxml_etree
-
-# Optional heavy deps (kept where useful)
-try:
-    import psutil
-except Exception:
-    psutil = None
-
-try:
-    import pefile
-except Exception:
-    pefile = None
-
-try:
-    import capstone
-except Exception:
-    capstone = None
-
-try:
-    import lief
-except Exception:
-    lief = None
-
-try:
-    from tqdm import tqdm
-except Exception:
-    def tqdm(it, **kwargs): return it
-
-# lxml preferred for robust XML parsing; fallback to ElementTree
-try:
-    from lxml import etree as lxml_etree
-    etree = lxml_etree
-except Exception:
-    import xml.etree.ElementTree as lxml_etree  # type: ignore
-    etree = lxml_etree
-
-# Logging
-logging.basicConfig(
-    filename="suspicious_file_scanner.log",
-    filemode="a",
-    level=logging.DEBUG,
-    format="%(asctime)s - %(levelname)s - %(message)s"
-)
-
-# Define missing Windows types if not provided by ctypes
-if not hasattr(ctypes, "DWORD"):
-    ctypes.DWORD = ctypes.c_uint32
-if not hasattr(ctypes, "WORD"):
-    ctypes.WORD = ctypes.c_uint16
-if not hasattr(ctypes, "BYTE"):
-    ctypes.BYTE = ctypes.c_ubyte
-
-# --------------------
-# Config / Globals
-# --------------------
-SUSPICIOUS_THRESHOLD = 15
-SCAN_FOLDER = "."
-
-# Suspicious / system directories (used by capstone scanner)
 SUSPICIOUS_DIRS = [
     os.environ.get('TEMP', ''),
     os.path.join(os.environ.get('USERPROFILE', ''), 'Downloads'),
     os.path.join(os.environ.get('USERPROFILE', ''), 'AppData', 'Local', 'Temp')
 ]
-SYSTEM_ROOT = os.environ.get('SystemRoot', os.environ.get('WINDIR', r"C:\Windows"))
-SYSTEM_DIRS = [
-    os.path.join(SYSTEM_ROOT, 'System32'),
-    os.path.join(SYSTEM_ROOT, 'SysWOW64'),
-    os.path.join(SYSTEM_ROOT)
-]
-STARTUP_DIRS = [
-    os.path.join(os.environ.get('APPDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup'),
-    os.path.join(os.environ.get('PROGRAMDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup')
-]
 
-# --------------------
-# PEStudio whitelist file (user requested location)
-# --------------------
-PE_STRINGS_FILE = "./3rdparty/strings.xml"
+# --- Dynamic Startup Directory Location ---
+STARTUP_DIRS = []
+try:
+    import ctypes
+    from ctypes import wintypes
+    CSIDL_STARTUP = 0x0007
+    CSIDL_COMMON_STARTUP = 0x0018
+    def get_special_folder_path(csidl):
+        try:
+            buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
+            ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf)
+            return buf.value
+        except Exception as e:
+            hydra_logger.logger.warning("Could not get special folder path for CSIDL {}: {}".format(csidl, e))
+            return None
+    user_startup = get_special_folder_path(CSIDL_STARTUP)
+    if user_startup:
+        STARTUP_DIRS.append(user_startup)
+    common_startup = get_special_folder_path(CSIDL_COMMON_STARTUP)
+    if common_startup:
+        STARTUP_DIRS.append(common_startup)
+except Exception as e:
+    hydra_logger.logger.warning("Could not initialize dynamic startup directory search: {}".format(e))
 
-# pestudio strings global store (populated at startup)
-pestudio_strings_global: Dict[str, List[str]] = {}
+# --- Obfuscation Detection Patterns ---
+def is_obfuscated_string(s):
+    """Detect if a string appears obfuscated using various heuristics."""
+    if not s or len(s) < 3:
+        return False
+    
+    # Check for non-printable characters
+    non_printable_count = sum(1 for c in s if c not in string.printable)
+    if non_printable_count > len(s) * 0.3:  # More than 30% non-printable
+        return True
+    
+    # Check for excessive special characters
+    special_chars = sum(1 for c in s if c in '!@#$%^&*()_+-=[]{}|;:,.<>?~`')
+    if special_chars > len(s) * 0.4:  # More than 40% special characters
+        return True
+    
+    # Check for patterns like base64 padding or hex patterns
+    if re.search(r'[A-Za-z0-9+/]{20,}={0,2}$', s):  # Base64-like
+        return True
+    
+    if re.search(r'^[0-9A-Fa-f]{16,}$', s):  # Long hex string
+        return True
+    
+    # Check for reversed common strings
+    common_words = ['kernel32', 'ntdll', 'advapi32', 'user32', 'shell32']
+    reversed_s = s[::-1].lower()
+    if any(word in reversed_s for word in common_words):
+        return True
+    
+    # Check for mixed case in unusual patterns
+    if re.search(r'[a-z][A-Z][a-z][A-Z]', s):
+        return True
+    
+    return False
 
-# --------------------
-# Utility functions
-# --------------------
-def calculate_entropy(path: str) -> float:
+def calculate_string_entropy(s):
+    """Calculate Shannon entropy for a string."""
+    if not s:
+        return 0
+    
+    # Get frequency of each character
+    char_counts = {}
+    for char in s:
+        char_counts[char] = char_counts.get(char, 0) + 1
+    
+    # Calculate entropy
+    entropy = 0
+    length = len(s)
+    for count in char_counts.values():
+        p = count / length
+        if p > 0:
+            entropy -= p * math.log2(p)
+    
+    return entropy
+
+def detect_packing_heuristics(pe_features):
+    """Detect packing indicators from PE features."""
+    score = 0
+    reasons = []
+    
+    # Check section disassembly for packing indicators
+    disasm = pe_features.get('section_disassembly', {}).get('overall_analysis', {})
+    if disasm.get('is_likely_packed'):
+        score += 10
+        reasons.append("Assembly analysis indicates packing (+10)")
+    
+    # High add-to-mov ratio suggests packing
+    add_count = disasm.get('add_count', 0)
+    mov_count = disasm.get('mov_count', 0)
+    if mov_count > 0 and (add_count / mov_count) > 2:
+        score += 8
+        reasons.append("Suspicious ADD/MOV instruction ratio (+8)")
+    
+    # Check for sections with high entropy
+    sections = pe_features.get('section_characteristics', {})
+    high_entropy_sections = 0
+    for section_name, data in sections.items():
+        entropy = data.get('entropy', 0)
+        if entropy > 7.0:
+            high_entropy_sections += 1
+    
+    if high_entropy_sections > 1:
+        score += 8
+        reasons.append("Multiple high-entropy sections detected (+8)")
+    elif high_entropy_sections == 1:
+        score += 4
+        reasons.append("High-entropy section detected (+4)")
+    
+    # Check for unusual section size ratios
+    pe_sections = pe_features.get('sections', [])
+    if pe_sections:
+        total_virtual = sum(s.get('virtual_size', 0) for s in pe_sections)
+        total_raw = sum(s.get('size_of_raw_data', 0) for s in pe_sections)
+        if total_raw > 0 and (total_virtual / total_raw) > 3:
+            score += 6
+            reasons.append("Suspicious virtual/raw size ratio (+6)")
+    
+    return score, reasons
+
+def analyze_section_obfuscation(pe_features):
+    """Analyze sections for obfuscation indicators."""
+    score = 0
+    reasons = []
+    
+    sections = pe_features.get('sections', [])
+    section_chars = pe_features.get('section_characteristics', {})
+    
+    for section in sections:
+        section_name = section.get('name', '')
+        
+        # Check for obfuscated section names
+        if is_obfuscated_string(section_name):
+            score += 8
+            reasons.append("Obfuscated section name '{}' (+8)".format(section_name))
+        
+        # Check for non-standard section names with suspicious patterns
+        if section_name and not section_name.startswith(('.text', '.data', '.rdata', '.rsrc', '.reloc', '.idata')):
+            # Check for entropy in section name
+            name_entropy = calculate_string_entropy(section_name)
+            if name_entropy > 3.5:
+                score += 5
+                reasons.append("High-entropy section name '{}' (+5)".format(section_name))
+        
+        # Check for sections with suspicious characteristics
+        characteristics = section.get('characteristics', 0)
+        if characteristics & 0x20000000 and characteristics & 0x80000000:  # Execute + Write
+            score += 6
+            reasons.append("Section '{}' has execute+write characteristics (+6)".format(section_name))
+    
+    # Check section characteristics for anomalies
+    for section_name, data in section_chars.items():
+        flags = data.get('flags', {})
+        
+        # Sections that are both executable and writable are suspicious
+        if flags.get('MEM_EXECUTE') and flags.get('MEM_WRITE'):
+            score += 7
+            reasons.append("Section '{}' is both executable and writable (+7)".format(section_name))
+        
+        # Very large sections relative to total image
+        size_ratio = data.get('size_ratio', 0)
+        if size_ratio > 0.8:
+            score += 4
+            reasons.append("Section '{}' takes up {}% of image (+4)".format(section_name, int(size_ratio * 100)))
+    
+    return score, reasons
+
+def analyze_import_obfuscation(pe_features):
+    """Analyze imports for obfuscation and evasion techniques."""
+    score = 0
+    reasons = []
+    
+    imports = pe_features.get('imports', [])
+    
+    # Check for obfuscated import names
+    obfuscated_imports = 0
+    for imp_name in imports:
+        if imp_name and is_obfuscated_string(imp_name):
+            obfuscated_imports += 1
+    
+    if obfuscated_imports > 0:
+        score += min(obfuscated_imports * 3, 15)  # Cap at 15 points
+        reasons.append("{} obfuscated import names (+{})".format(obfuscated_imports, min(obfuscated_imports * 3, 15)))
+    
+    # Check for unusual import patterns
+    if len(imports) == 0:
+        score += 8
+        reasons.append("No imports detected - possible import obfuscation (+8)")
+    elif len(imports) < 5:
+        score += 4
+        reasons.append("Very few imports - possible selective import loading (+4)")
+    
+    # Check delay imports for evasion
+    delay_imports = pe_features.get('delay_imports', [])
+    if len(delay_imports) > len(imports):
+        score += 6
+        reasons.append("More delay imports than regular imports (+6)")
+    
+    return score, reasons
+
+def analyze_header_anomalies(pe_features):
+    """Analyze PE headers for suspicious modifications."""
+    score = 0
+    reasons = []
+    
+    # Check checksum
+    checksum = pe_features.get('CheckSum', 0)
+    if checksum == 0:
+        score += 3
+        reasons.append("PE checksum is zero (+3)")
+    
+    # Check for unusual loader flags
+    loader_flags = pe_features.get('LoaderFlags', 0)
+    if loader_flags != 0:
+        score += 5
+        reasons.append("Non-zero LoaderFlags: 0x{:x} (+5)".format(loader_flags))
+    
+    # Check for suspicious subsystem values
+    subsystem = pe_features.get('Subsystem', 0)
+    if subsystem not in [1, 2, 3, 5, 6, 7, 8, 9, 10, 14, 16]:  # Known valid subsystems
+        score += 6
+        reasons.append("Unknown subsystem value: {} (+6)".format(subsystem))
+    
+    # Check entry point location
+    entry_point = pe_features.get('AddressOfEntryPoint', 0)
+    sections = pe_features.get('sections', [])
+    
+    # Find which section contains the entry point
+    entry_in_non_code_section = True
+    for section in sections:
+        va_start = section.get('virtual_address', 0)
+        va_size = section.get('virtual_size', 0)
+        if va_start <= entry_point < va_start + va_size:
+            section_name = section.get('name', '')
+            if section_name.startswith('.text') or 'CODE' in section_name.upper():
+                entry_in_non_code_section = False
+            break
+    
+    if entry_in_non_code_section and entry_point != 0:
+        score += 8
+        reasons.append("Entry point not in code section (+8)")
+    
+    return score, reasons
+
+def analyze_resource_anomalies(pe_features):
+    """Analyze resources for suspicious patterns."""
+    score = 0
+    reasons = []
+    
+    resources = pe_features.get('resources', [])
+    
+    # Check for unusually large resources
+    large_resources = 0
+    for resource in resources:
+        res_size = resource.get('size', 0)
+        if res_size > 1024 * 1024:  # > 1MB
+            large_resources += 1
+    
+    if large_resources > 0:
+        score += large_resources * 3
+        reasons.append("{} large resources (>1MB each) (+{})".format(large_resources, large_resources * 3))
+    
+    # Check for excessive number of resources
+    if len(resources) > 50:
+        score += 5
+        reasons.append("Excessive number of resources: {} (+5)".format(len(resources)))
+    
+    return score, reasons
+
+def analyze_tls_anomalies(pe_features):
+    """Analyze TLS callbacks for evasion techniques."""
+    score = 0
+    reasons = []
+    
+    tls_callbacks = pe_features.get('tls_callbacks', {})
+    callbacks = tls_callbacks.get('callbacks', [])
+    
+    if callbacks:
+        score += 8
+        reasons.append("TLS callbacks detected - possible anti-analysis (+8)")
+        
+        if len(callbacks) > 3:
+            score += 4
+            reasons.append("Multiple TLS callbacks: {} (+4)".format(len(callbacks)))
+    
+    return score, reasons
+
+def analyze_rich_header_anomalies(pe_features):
+    """Analyze Rich header for tampering."""
+    score = 0
+    reasons = []
+    
+    rich_header = pe_features.get('rich_header', {})
+    
+    # Rich header presence without compiler info could indicate tampering
+    if rich_header and not rich_header.get('comp_id_info'):
+        score += 4
+        reasons.append("Rich header present but no compiler info (+4)")
+    
+    # Check for unusual compiler IDs
+    comp_info = rich_header.get('comp_id_info', [])
+    for comp in comp_info:
+        comp_id = comp.get('comp_id', 0)
+        # Look for very high or suspicious compiler IDs
+        if comp_id > 300 or comp_id == 0:
+            score += 3
+            reasons.append("Suspicious compiler ID: {} (+3)".format(comp_id))
+            break
+    
+    return score, reasons
+
+def analyze_overlay_anomalies(pe_features):
+    """Analyze overlay for suspicious content."""
+    score = 0
+    reasons = []
+    
+    overlay = pe_features.get('overlay', {})
+    
+    if overlay.get('exists'):
+        overlay_size = overlay.get('size', 0)
+        overlay_entropy = overlay.get('entropy', 0)
+        
+        score += 5
+        reasons.append("Overlay data detected (+5)")
+        
+        if overlay_entropy > 7.5:
+            score += 6
+            reasons.append("High-entropy overlay data (+6)")
+        
+        if overlay_size > 100 * 1024:  # > 100KB
+            score += 4
+            reasons.append("Large overlay: {} bytes (+4)".format(overlay_size))
+    
+    return score, reasons
+
+# --- Utility Functions (unchanged) ---
+def calculate_entropy(path):
     freq = [0] * 256
     total = 0
     try:
@@ -152,379 +402,16 @@ def calculate_entropy(path: str) -> float:
         if total > 0:
             for f in freq:
                 if f > 0:
-                    p = f / total
+                    p = float(f) / total
                     entropy -= p * math.log2(p)
         return entropy
     except Exception as e:
-        logging.debug("Entropy calc failed for %s: %s", path, e, exc_info=True)
+        hydra_logger.logger.debug("Entropy calc failed for {}: {}".format(path, e), exc_info=True)
         return 0.0
 
-def get_section_entropy(data: bytes) -> float:
-    """
-    Calculate the Shannon entropy of a section or byte array.
-    Returns 0.0 if data is empty.
-    """
-    if not data:
-        return 0.0
-
-    freq = [0] * 256  # count occurrences of each byte value
-    for b in data:
-        freq[b] += 1
-
-    entropy = 0.0
-    data_len = len(data)
-    for f in freq:
-        if f == 0:
-            continue
-        p = f / data_len
-        entropy -= p * math.log2(p)
-
-    return entropy
-
-# --------------------
-# PEStudio strings loader & scorer (kept)
-# --------------------
-def get_abs_path(path: str) -> str:
-    """Return an absolute path if possible, otherwise return the input unchanged."""
+def is_running_pe(path):
     try:
-        return os.path.abspath(path) if path else path
-    except Exception:
-        return path
-
-
-def initialize_pestudio_strings(xml_path: str = PE_STRINGS_FILE) -> Dict[str, List[str]]:
-    """
-    Parse the PEStudio strings XML and return a dict mapping types to lists of **string texts**.
-
-    This version is permissive: it looks for child tags <string> and <item>, and also
-    captures direct node text. It normalizes (strips, lowercases) and deduplicates the results.
-    It also builds a fast lookup map `pestudio_marker` for O(1) matching.
-    """
-    keys = ["strings", "av", "folder", "os", "reg", "guid", "ssdl", "ext", "agent", "oid", "priv"]
-    pestudio: Dict[str, List[str]] = {k: [] for k in keys}
-
-    try:
-        if not xml_path or not os.path.exists(xml_path):
-            logging.info("PEStudio strings XML not found: %s", xml_path)
-            return pestudio
-
-        tree = etree.parse(get_abs_path(xml_path))
-        root = tree.getroot()
-
-        for k in keys:
-            nodes = root.findall('.//' + k)
-            for node in nodes:
-                # prefer children named 'string' or 'item'
-                for child_tag in ("string", "item"):
-                    for child in node.findall('.//' + child_tag):
-                        if child is None or child.text is None:
-                            continue
-                        s = child.text.strip()
-                        if s:
-                            pestudio[k].append(s)
-                # fallback to node text
-                if (node.text is not None) and node.text.strip():
-                    pestudio[k].append(node.text.strip())
-
-        # normalize: strip, dedupe, preserve case variants (store lower for marker)
-        for k in keys:
-            seen = set()
-            cleaned = []
-            for it in pestudio[k]:
-                if not it:
-                    continue
-                norm = it.strip()
-                if not norm:
-                    continue
-                if norm in seen:
-                    continue
-                seen.add(norm)
-                cleaned.append(norm)
-            pestudio[k] = cleaned
-
-        # build a quick marker dict for O(1) lookups (lowercased keys)
-        global pestudio_marker
-        pestudio_marker = {}
-        for typ, lst in pestudio.items():
-            for s in lst:
-                if s:
-                    pestudio_marker[s.strip().lower()] = typ
-
-        logging.info("Loaded pestudio strings from %s: %s", xml_path, {k: len(v) for k, v in pestudio.items()})
-        return pestudio
-
-    except Exception as e:
-        logging.exception("Failed to initialize pestudio strings from %s: %s", xml_path, e)
-        return pestudio
-
-
-def get_pestudio_score(string: str) -> Tuple[int, str]:
-    """
-    Efficient lookup using the pre-built `pestudio_marker` map.
-
-    Returns (score:int, matched_type:str). Score 5 for exact full match found in pestudio lists
-    (excluding the 'ext' type which is ignored).
-    """
-    if not string:
-        return 0, ""
-    # build marker on first use if missing
-    global pestudio_marker, pestudio_strings_global
-    try:
-        if 'pestudio_marker' not in globals() or not pestudio_marker:
-            # ensure pestudio_strings_global is initialized
-            if not pestudio_strings_global:
-                pestudio_strings_global = initialize_pestudio_strings(PE_STRINGS_FILE)
-            # initialize marker from global store
-            pestudio_marker = {}
-            for typ, lst in pestudio_strings_global.items():
-                for s in lst:
-                    if s:
-                        pestudio_marker[s.strip().lower()] = typ
-    except Exception:
-        pestudio_marker = {}
-
-    key = string.strip().lower()
-    typ = pestudio_marker.get(key)
-    if not typ:
-        return 0, ""
-    if typ == 'ext':
-        return 0, ""
-    return 5, typ
-    s_lower = string.strip().lower()
-    for typ, lst in pestudio_strings.items():
-        if not lst:
-            continue
-        if typ == "ext":
-            continue  # skip extensions as per original code
-        for item in lst:
-            if not item:
-                continue
-            if item.strip().lower() == s_lower:
-                return 5, typ
-    return 0, ""
-
-# --------------------
-# PE/Capstone utilities (kept)
-# --------------------
-def get_pe_info(file_bytes: bytes) -> Tuple[str, List[str]]:
-    imphash, exports = "", []
-    if not file_bytes or file_bytes[:2] != b'MZ':
-        return imphash, exports
-    if lief:
-        try:
-            binary = lief.parse(io.BytesIO(file_bytes))
-            if isinstance(binary, lief.PE.Binary):
-                try:
-                    imphash = lief.PE.get_imphash(binary, lief.PE.PE.IMPHASH_MODE.PEFILE)
-                except Exception:
-                    imphash = ""
-                if binary.has_exports:
-                    for e in binary.exported_functions:
-                        if e.name:
-                            exports.append(e.name)
-        except Exception:
-            pass
-    else:
-        try:
-            if pefile:
-                pe = pefile.PE(data=file_bytes, fast_load=True)
-                try:
-                    imphash = getattr(pe, "get_imphash", lambda: "")()
-                except Exception:
-                    imphash = ""
-                try:
-                    if hasattr(pe, 'DIRECTORY_ENTRY_EXPORT'):
-                        for exp in getattr(pe, 'DIRECTORY_ENTRY_EXPORT').symbols:
-                            if exp.name:
-                                exports.append(exp.name.decode(errors='ignore'))
-                except Exception:
-                    pass
-        except Exception:
-            pass
-    return imphash or "", exports
-
-
-def analyze_with_capstone_pe(pe_obj) -> Dict[str, Any]:
-    analysis = {
-        "overall_analysis": {
-            "is_likely_packed": False,
-            "add_count": 0,
-            "mov_count": 0,
-            "total_instructions": 0
-        },
-        "sections": {},
-        "error": None
-    }
-
-    if not capstone or not pe_obj or not pefile:
-        return analysis
-
-    try:
-        machine_type = getattr(getattr(pe_obj, "FILE_HEADER", None), "Machine", None)
-        if machine_type == pefile.MACHINE_TYPE.get('IMAGE_FILE_MACHINE_I386', 0x014c):
-            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_32)
-        elif machine_type == pefile.MACHINE_TYPE.get('IMAGE_FILE_MACHINE_AMD64', 0x8664):
-            md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-        else:
-            return analysis
-
-        total_add = 0
-        total_mov = 0
-        total_instructions = 0
-
-        for section in pe_obj.sections:
-            try:
-                code = section.get_data()
-                if not code:
-                    continue
-
-                base_addr = pe_obj.OPTIONAL_HEADER.ImageBase + section.VirtualAddress
-                instructions = md.disasm(code, base_addr)
-
-                counts = {}
-                add_count = 0
-                mov_count = 0
-                section_total = 0
-
-                for instr in instructions:
-                    mnem = instr.mnemonic
-                    counts[mnem] = counts.get(mnem, 0) + 1
-                    section_total += 1
-                    if mnem == "add":
-                        add_count += 1
-                    elif mnem == "mov":
-                        mov_count += 1
-
-                section_name = section.Name.decode(errors='ignore').strip('\x00')
-                analysis["sections"][section_name] = {
-                    "instruction_counts": counts,
-                    "add_count": add_count,
-                    "mov_count": mov_count,
-                    "total_instructions": section_total,
-                    "is_likely_packed": (add_count > mov_count) if section_total > 0 else False
-                }
-
-                total_add += add_count
-                total_mov += mov_count
-                total_instructions += section_total
-
-            except Exception:
-                continue
-
-        analysis["overall_analysis"]["add_count"] = total_add
-        analysis["overall_analysis"]["mov_count"] = total_mov
-        analysis["overall_analysis"]["total_instructions"] = total_instructions
-        analysis["overall_analysis"]["is_likely_packed"] = (total_add > total_mov) if total_instructions > 0 else False
-
-    except Exception as e:
-        analysis["error"] = str(e)
-
-    return analysis
-
-# --------------------
-# WinVerifyTrust signature checking (kept)
-# --------------------
-class WinVerifyTrust_GUID(ctypes.Structure):
-    _fields_ = [
-        ("Data1", wintypes.DWORD),
-        ("Data2", wintypes.WORD),
-        ("Data3", wintypes.WORD),
-        ("Data4", ctypes.c_ubyte * 8),
-    ]
-
-WINTRUST_ACTION_GENERIC_VERIFY = WinVerifyTrust_GUID(
-    0x00AAC56B, 0xCD44, 0x11D0,
-    (ctypes.c_ubyte * 8)(0x8C, 0xC2, 0x00, 0xC0, 0x4F, 0xC2, 0x95, 0xEE)
-)
-
-class WINTRUST_FILE_INFO(ctypes.Structure):
-    _fields_ = [
-        ("cbStruct", wintypes.DWORD),
-        ("pcwszFilePath", wintypes.LPCWSTR),
-        ("hFile", wintypes.HANDLE),
-        ("pgKnownSubject", ctypes.POINTER(WinVerifyTrust_GUID)),
-    ]
-
-class WINTRUST_DATA(ctypes.Structure):
-    _fields_ = [
-        ("cbStruct", wintypes.DWORD),
-        ("pPolicyCallbackData", ctypes.c_void_p),
-        ("pSIPClientData", ctypes.c_void_p),
-        ("dwUIChoice", wintypes.DWORD),
-        ("fdwRevocationChecks", wintypes.DWORD),
-        ("dwUnionChoice", ctypes.c_void_p),
-        ("pFile", ctypes.POINTER(WINTRUST_FILE_INFO)),
-        ("dwStateAction", ctypes.DWORD),
-        ("hWVTStateData", wintypes.HANDLE),
-        ("pwszURLReference", wintypes.LPCWSTR),
-        ("dwProvFlags", ctypes.DWORD),
-        ("dwUIContext", ctypes.DWORD),
-        ("pSignatureSettings", ctypes.c_void_p),
-    ]
-
-WTD_UI_NONE = 2
-WTD_REVOKE_NONE = 0
-WTD_CHOICE_FILE = 1
-WTD_STATEACTION_IGNORE = 0x00000000
-
-_trust = None
-try:
-    _trust = ctypes.windll.wintrust
-except Exception:
-    _trust = None
-
-TRUST_E_NOSIGNATURE = 0x800B0100
-TRUST_E_SUBJECT_FORM_UNKNOWN = 0x800B0008
-TRUST_E_PROVIDER_UNKNOWN     = 0x800B0001
-CERT_E_UNTRUSTEDROOT         = 0x800B0109
-TRUST_E_BAD_DIGEST           = 0x80096010
-TRUST_E_CERT_SIGNATURE       = 0x80096004
-NO_SIGNATURE_CODES = {TRUST_E_NOSIGNATURE, TRUST_E_SUBJECT_FORM_UNKNOWN, TRUST_E_PROVIDER_UNKNOWN}
-
-def _build_wtd_for(file_path: str) -> WINTRUST_DATA:
-    fi = WINTRUST_FILE_INFO(ctypes.sizeof(WINTRUST_FILE_INFO), file_path, None, None)
-    wtd = WINTRUST_DATA()
-    ctypes.memset(ctypes.byref(wtd), 0, ctypes.sizeof(wtd))
-    wtd.cbStruct = ctypes.sizeof(WINTRUST_DATA)
-    wtd.dwUIChoice = WTD_UI_NONE
-    wtd.fdwRevocationChecks = WTD_REVOKE_NONE
-    wtd.dwUnionChoice = WTD_CHOICE_FILE
-    wtd.pFile = ctypes.pointer(fi)
-    wtd.dwStateAction = WTD_STATEACTION_IGNORE
-    return wtd
-
-def verify_authenticode_signature(file_path: str) -> int:
-    if not _trust:
-        raise RuntimeError("WinVerifyTrust not available on this platform")
-    wtd = _build_wtd_for(file_path)
-    return _trust.WinVerifyTrust(None, ctypes.byref(WINTRUST_ACTION_GENERIC_VERIFY), ctypes.byref(wtd))
-
-def check_valid_signature(file_path: str) -> dict:
-    try:
-        res = verify_authenticode_signature(file_path)
-        h = res & 0xFFFFFFFF
-        if h == 0:
-            return {"is_valid": True, "status": "Valid"}
-        if h in NO_SIGNATURE_CODES:
-            return {"is_valid": False, "status": "No signature"}
-        if h == CERT_E_UNTRUSTEDROOT:
-            return {"is_valid": False, "status": "Untrusted root"}
-        if h == TRUST_E_BAD_DIGEST:
-            return {"is_valid": False, "status": f"Fully invalid (bad digest) (HRESULT=0x{h:08X})"}
-        if h == TRUST_E_CERT_SIGNATURE:
-            return {"is_valid": False, "status": f"Fully invalid (cert signature verify failed) (HRESULT=0x{h:08X})"}
-        return {"is_valid": False, "status": f"Invalid signature (HRESULT=0x{h:08X})"}
-    except Exception as e:
-        logging.debug("Signature check error for %s: %s", file_path, e)
-        return {"is_valid": False, "status": str(e)}
-
-# --------------------
-# Runtime helpers
-# --------------------
-def is_running_pe(path: str) -> bool:
-    try:
-        if not psutil:
-            return False
+        if not psutil: return False
         for proc in psutil.process_iter(['exe', 'name']):
             try:
                 exe = proc.info.get('exe')
@@ -536,387 +423,394 @@ def is_running_pe(path: str) -> bool:
         pass
     return False
 
-def is_in_suspicious_location_pe(path: str) -> bool:
+def is_in_suspicious_location_pe(path):
     path_norm = os.path.normcase(path)
     for d in SUSPICIOUS_DIRS + STARTUP_DIRS:
         if d and os.path.normcase(d) in path_norm:
             return True
     return False
 
-def is_system_file(path: str) -> bool:
+# --- Core Analysis Logic ---
+def analyze_single_file(path):
     """
-    Returns True if the file has the Windows SYSTEM attribute.
+    Analyzes a single file using hardcoded obfuscation detection.
     """
-    FILE_ATTRIBUTE_SYSTEM = 0x4
-    try:
-        attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-        if attrs == -1:
-            return False
-        return bool(attrs & FILE_ATTRIBUTE_SYSTEM)
-    except Exception:
-        return False
-
-def is_system_file_unusual(path: str) -> bool:
-    """
-    Return True if the file has SYSTEM attribute and is NOT in standard SYSTEM dirs.
-    """
-    if not is_system_file(path):
-        return False
-    path_norm = os.path.normcase(path)
-    for sys_dir in SYSTEM_DIRS:
-        if sys_dir and os.path.normcase(sys_dir) in path_norm:
-            return False  # file is in a normal system location
-    return True
-
-# --------------------
-# Single-file analysis (Phase1 only, all detectors Suspicious)
-# --------------------
-def analyze_single_file(path: str) -> dict:
-    """
-    Phase1 heuristics + PE-specific checks.
-    All PE detectors produce verdict 'Suspicious' when triggered.
-    Returns features dict including `pe_checks` and updated phase1_score.
-    MODIFIED: Now tracks what caused the file to be flagged.
-    """
-    features: Dict[str, Any] = {
+    analysis_result = {
         'path': path,
-        'entropy': 0.0,
-        'size': 0,
-        'is_executable': False,
-        'has_version_info': False,
-        'signature_valid': False,
-        'signature_status': "N/A",
-        'capstone_analysis': None,
-        'is_running': False,
-        'in_suspicious_location': False,
-        'age_days': 0,
-        'suspicious_score': 0,
         'suspicious': False,
-        'phase1_score': 0,
-        'phase2_summary': None,
-        'phase2_percentage': 0.0,
-        'pe_checks': [],
-        'flagging_reasons': []  # NEW: Track what caused flagging
+        'detection_name': "Clean",
+        'suspicious_score': 0.0,
+        'flagging_reasons': [],
+        'status': 'Scanned'
     }
 
     try:
-        stats = os.stat(path)
-        features['size'] = stats.st_size
-        features['age_days'] = (time.time() - stats.st_ctime) / (24 * 3600)
-        features['entropy'] = calculate_entropy(path)
+        # Get PE features using the cached extractor
+        pe_features = get_cached_pe_features(path)
+        if not pe_features:
+            analysis_result['detection_name'] = "Not a PE file or unreadable"
+            analysis_result['status'] = 'Skipped'
+            return analysis_result
 
-        # Check if the file is running
-        features['is_running'] = is_running_pe(path)
+        total_score = 0
+        all_reasons = []
 
-        # Check if file is in suspicious location
-        features['in_suspicious_location'] = is_in_suspicious_location_pe(path)
+        # Run all hardcoded detection modules
+        score, reasons = detect_packing_heuristics(pe_features)
+        total_score += score
+        all_reasons.extend(reasons)
 
-        # Additional check: SYSTEM file at unusual location
-        try:
-            import ctypes
-            FILE_ATTRIBUTE_SYSTEM = 0x4
-            attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
-            if attrs != -1 and (attrs & FILE_ATTRIBUTE_SYSTEM):
-                # SYSTEM file outside Windows/System32/SysWOW64 is suspicious
-                norm_path = os.path.normcase(os.path.abspath(path))
-                allowed_dirs = [os.path.normcase(d) for d in SYSTEM_DIRS if d]
-                if not any(norm_path.startswith(d) for d in allowed_dirs):
-                    features['pe_checks'].append(("SYSTEM file at unusual location", "Suspicious"))
-        except Exception:
-            pass
+        score, reasons = analyze_section_obfuscation(pe_features)
+        total_score += score
+        all_reasons.extend(reasons)
 
-        pe = None
-        try:
-            if pefile:
-                pe = pefile.PE(path)
-                features['is_executable'] = True
-                features['has_version_info'] = hasattr(pe, 'VS_FIXEDFILEINFO') and getattr(pe, 'VS_FIXEDFILEINFO') is not None
+        score, reasons = analyze_import_obfuscation(pe_features)
+        total_score += score
+        all_reasons.extend(reasons)
 
-                # capstone analysis
-                try:
-                    cap_analysis = analyze_with_capstone_pe(pe)
-                    if cap_analysis is None:
-                        cap_analysis = {
-                            "overall_analysis": {
-                                "is_likely_packed": False,
-                                "add_count": 0,
-                                "mov_count": 0,
-                                "total_instructions": 0
-                            },
-                            "sections": {},
-                            "error": "Capstone analysis returned None"
-                        }
-                    features['capstone_analysis'] = cap_analysis
-                except Exception as e:
-                    features['capstone_analysis'] = {
-                        "overall_analysis": {
-                            "is_likely_packed": False,
-                            "add_count": 0,
-                            "mov_count": 0,
-                            "total_instructions": 0
-                        },
-                        "sections": {},
-                        "error": f"Capstone analysis exception: {e}"
-                    }
+        score, reasons = analyze_header_anomalies(pe_features)
+        total_score += score
+        all_reasons.extend(reasons)
 
-                # --- PE-specific checks (all Suspicious) ---
-                pe_checks: List[Tuple[str, str]] = []
+        score, reasons = analyze_resource_anomalies(pe_features)
+        total_score += score
+        all_reasons.extend(reasons)
 
-                try:
-                    lf = getattr(pe.OPTIONAL_HEADER, 'LoaderFlags', None)
-                    if lf is not None and int(lf) != 0:
-                        pe_checks.append(("Optional Header LoaderFlags field is valued illegal", "Suspicious"))
-                except Exception:
-                    pass
+        score, reasons = analyze_tls_anomalies(pe_features)
+        total_score += score
+        all_reasons.extend(reasons)
 
-                try:
-                    for sec in pe.sections:
-                        try:
-                            name = sec.Name.decode(errors='ignore').rstrip('\x00')
-                        except Exception:
-                            name = ""
-                        if not name or any(ord(c) < 32 or ord(c) > 126 for c in name):
-                            pe_checks.append(("Non-ascii or empty section names detected", "Suspicious"))
-                            break
-                except Exception:
-                    pass
+        score, reasons = analyze_rich_header_anomalies(pe_features)
+        total_score += score
+        all_reasons.extend(reasons)
 
-                try:
-                    soh = getattr(getattr(pe, 'FILE_HEADER', None), 'SizeOfOptionalHeader', None)
-                    if soh is not None and (soh < 0x60 or soh > 0x1000):
-                        pe_checks.append(("Illegal size of optional Header", "Suspicious"))
-                except Exception:
-                    pass
+        score, reasons = analyze_overlay_anomalies(pe_features)
+        total_score += score
+        all_reasons.extend(reasons)
 
-                try:
-                    for sec in pe.sections:
-                        data = sec.get_data() or b''
-                        if not data:
-                            continue
-                        ent = get_section_entropy(data)
-                        if ent > 7.5:
-                            pe_checks.append(("Based on the sections entropy check! file is possibly packed", "Suspicious"))
-                            break
-                except Exception:
-                    pass
-
-                try:
-                    ts = getattr(getattr(pe, 'FILE_HEADER', None), 'TimeDateStamp', 0)
-                    if ts == 0 or ts > int(time.time()) + 365*24*3600:
-                        pe_checks.append(("Timestamp value suspicious", "Suspicious"))
-                except Exception:
-                    pass
-
-                try:
-                    chksum = getattr(pe.OPTIONAL_HEADER, 'CheckSum', None)
-                    if chksum is not None and int(chksum) == 0:
-                        pe_checks.append(("Header Checksum is zero!", "Suspicious"))
-                except Exception:
-                    pass
-
-                try:
-                    ep = int(getattr(pe, 'OPTIONAL_HEADER').AddressOfEntryPoint)
-                    first_code_section = None
-                    for s in pe.sections:
-                        name = s.Name.decode(errors='ignore').rstrip('\x00').lower()
-                        if name in ('.text', '.code'):
-                            first_code_section = s
-                            break
-                    if first_code_section is not None:
-                        va = int(first_code_section.VirtualAddress)
-                        size = int(first_code_section.Misc_VirtualSize)
-                        if not (va <= ep < va + size):
-                            pe_checks.append(("Entry point is outside the 1st(.code) section! Binary is possibly packed", "Suspicious"))
-                except Exception:
-                    pass
-
-                try:
-                    nrva = getattr(pe.OPTIONAL_HEADER, 'NumberOfRvaAndSizes', None)
-                    if nrva is not None and (nrva < 10 or nrva > 64):
-                        pe_checks.append(("Optional Header NumberOfRvaAndSizes field is valued illegal", "Suspicious"))
-                except Exception:
-                    pass
-
-                try:
-                    imports = []
-                    if hasattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
-                        for imp in getattr(pe, 'DIRECTORY_ENTRY_IMPORT'):
-                            if imp.dll:
-                                imports.append(imp.dll.decode(errors='ignore').lower())
-                    if any(x for x in ('vbox','vmware','vmwareuser','xen') if any(x in i for i in imports)):
-                        pe_checks.append(("Anti-vm present", "Suspicious"))
-                except Exception:
-                    pass
-
-                try:
-                    for sec in pe.sections:
-                        if hasattr(sec, 'SizeOfRawData') and hasattr(sec, 'Misc_VirtualSize'):
-                            if sec.SizeOfRawData == 0 and sec.Misc_VirtualSize > 0:
-                                pe_checks.append(("The Size Of Raw data is valued illegal! Binary might crash your disassembler/debugger", "Suspicious"))
-                                break
-                except Exception:
-                    pass
-
-                try:
-                    if hasattr(pe, 'DIRECTORY_ENTRY_TLS') and getattr(pe, 'DIRECTORY_ENTRY_TLS') is not None:
-                        pe_checks.append(("TLS callback functions array detected", "Suspicious"))
-                except Exception:
-                    pass
-
-                features['pe_checks'].extend(pe_checks)
-
-        except Exception as e:
-            logging.debug("PE parsing failed for %s: %s", path, e)
-        finally:
-            if pe:
-                try:
-                    pe.close()
-                except Exception:
-                    pass
-
-        if features['capstone_analysis'] is None:
-            features['capstone_analysis'] = {
-                "overall_analysis": {
-                    "is_likely_packed": False,
-                    "add_count": 0,
-                    "mov_count": 0,
-                    "total_instructions": 0
-                },
-                "sections": {},
-                "error": "No PE file or capstone not available"
-            }
-
-        try:
-            sig = check_valid_signature(path)
-            features['signature_valid'] = sig.get('is_valid', False)
-            features['signature_status'] = sig.get('status', "N/A")
-        except Exception:
-            pass
-
-        # --------------------
-        # Phase1 scoring: every Suspicious check adds +2
-        # MODIFIED: Track what caused each point addition
-        # --------------------
-        phase1 = 0
-        flagging_reasons = []
+        # Additional basic heuristics
+        if is_running_pe(path):
+            total_score += 5
+            all_reasons.append("Process is actively running (+5)")
+        if is_in_suspicious_location_pe(path):
+            total_score += 5
+            all_reasons.append("Located in suspicious directory (+5)")
         
-        cap = features['capstone_analysis'].get('overall_analysis', {})
-        if cap.get('is_likely_packed'):
-            phase1 += 3
-            flagging_reasons.append(f"Capstone packing detection (+3 points)")
-            
-        if features['entropy'] > 7.5:
-            points = 5 if not features['signature_valid'] else 2
-            phase1 += points
-            flagging_reasons.append(f"High entropy {features['entropy']:.2f} (+{points} points)")
-            
-        if features['age_days'] < 1:
-            phase1 += 2
-            flagging_reasons.append(f"Recent file {features['age_days']:.2f} days old (+2 points)")
-            
-        if 'temp' in path.lower() or 'cache' in path.lower():
-            phase1 += 2
-            flagging_reasons.append(f"File in temp/cache directory (+2 points)")
-            
-        if features['is_executable'] and not features['has_version_info'] and not features['signature_valid']:
-            phase1 += 1
-            flagging_reasons.append(f"Executable without version info or signature (+1 point)")
-            
-        if features['is_executable'] and not features['signature_valid']:
-            if features['signature_status'] == "Untrusted root":
-                phase1 += 4
-                flagging_reasons.append(f"Untrusted root certificate (+4 points)")
-            else:
-                phase1 += 2
-                flagging_reasons.append(f"No valid signature: {features['signature_status']} (+2 points)")
-                
-        if features['in_suspicious_location']:
-            phase1 += 2
-            flagging_reasons.append(f"File in suspicious location (+2 points)")
-            
-        if features['is_running']:
-            phase1 += 3
-            flagging_reasons.append(f"File is currently running (+3 points)")
+        # File entropy check
+        file_entropy = calculate_entropy(path)
+        if file_entropy > 7.8:
+            total_score += 8
+            all_reasons.append("Very high file entropy: {:.2f} (+8)".format(file_entropy))
+        elif file_entropy > 7.5:
+            total_score += 4
+            all_reasons.append("High file entropy: {:.2f} (+4)".format(file_entropy))
 
-        # Add +2 per Suspicious PE check
-        for check_desc, verdict in features['pe_checks']:
-            if verdict == "Suspicious":
-                phase1 += 2
-                flagging_reasons.append(f"PE check: {check_desc} (+2 points)")
+        # File age check
+        stats = os.stat(path)
+        age_days = (time.time() - stats.st_ctime) / (24 * 3600)
+        if age_days < 1:
+            total_score += 3
+            all_reasons.append("Recent file ({:.1f} days) (+3)".format(age_days))
 
-        features['phase1_score'] = phase1
-        features['suspicious_score'] = phase1
-        features['suspicious'] = phase1 >= SUSPICIOUS_THRESHOLD
-        features['flagging_reasons'] = flagging_reasons
+        # Check for missing version info
+        if not pe_features.get('certificates', {}).get('fixed_file_info'):
+            total_score += 2
+            all_reasons.append("No version information (+2)")
 
-        if features['suspicious']:
-            logging.info(
-                "[Phase 1] Suspicious detected: %s | Score: %d | Reasons: %s | PE Checks: %s",
-                features['path'],
-                features['phase1_score'],
-                features['flagging_reasons'],
-                [desc for desc, verdict in features['pe_checks'] if verdict == "Suspicious"]
-            )
+        analysis_result['suspicious_score'] = total_score
+        analysis_result['flagging_reasons'] = all_reasons
+
+        if total_score >= SUSPICIOUS_THRESHOLD:
+            analysis_result.update({
+                'suspicious': True,
+                'detection_name': DETECTION_NAME,
+                'status': 'Detection'
+            })
+            hydra_logger.logger.info("[Suspicious] File: {} | Score: {} | Reasons: {}".format(path, total_score, "; ".join(all_reasons)))
+        else:
+            analysis_result['detection_name'] = "Clean (Score: {})".format(total_score)
 
     except Exception as e:
-        logging.error(f"Failed to analyze {path}: {e}")
-        features['error'] = str(e)
+        hydra_logger.logger.error("Failed to analyze {}: {}".format(path, e), exc_info=True)
+        analysis_result.update({
+            'detection_name': "Analysis-Error",
+            'flagging_reasons': [str(e)],
+            'status': 'Error'
+        })
 
-    return features
+    return analysis_result
 
-# --------------------
-# Directory scanning (parallel)
-# --------------------
-def scan_directory_parallel(directory: str, max_workers: Optional[int] = None):
-    results = []
+def scan_directory_parallel(directory, app_instance, max_workers=None):
+    """Scan directory in parallel using hardcoded detection."""
     file_paths = []
+    app_instance.update_status("Collecting files...")
     for root, _, files in os.walk(directory):
         for f in files:
             file_paths.append(os.path.join(root, f))
+    
     total = len(file_paths)
     if total == 0:
-        print("No files to scan.")
-        return []
+        app_instance.scan_finished(0, 0)
+        return
 
     workers = max_workers or (os.cpu_count() or 1)
-    with ProcessPoolExecutor(max_workers=workers) as ex:
+    processed_count = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(analyze_single_file, p): p for p in file_paths}
-        for fut in tqdm(as_completed(futures), total=total, desc="Scanning", unit="file"):
+        for fut in as_completed(futures):
             p = futures[fut]
+            processed_count += 1
+            app_instance.update_progress(processed_count, total)
             try:
                 res = fut.result()
-                results.append(res)
+                if res:
+                    app_instance.add_result(res)
             except Exception as e:
-                logging.exception("Worker failed for %s: %s", p, e)
-    return results
+                hydra_logger.logger.exception("Worker failed for {}: {}".format(p, e))
 
-# --------------------
-# CLI / main
-# --------------------
+    detections = len([r for r in app_instance.scan_results if r.get('suspicious')])
+    app_instance.scan_finished(total, detections)
+
+# --- GUI Application (unchanged structure, minor updates) ---
+class ScannerApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("HydraScanner - Hardcoded Obfuscation Detection")
+        self.root.geometry("1000x700")
+        self.root.minsize(800, 500)
+
+        # --- Style Configuration ---
+        self.style = ttk.Style()
+        self.style.theme_use('clam')
+        self.style.configure("TFrame", background="#2E2E2E")
+        self.style.configure("TButton", background="#4A4A4A", foreground="white", relief="flat", padding=5)
+        self.style.map("TButton", background=[('active', '#5A5A5A')])
+        self.style.configure("TLabel", background="#2E2E2E", foreground="white")
+        self.style.configure("Treeview", rowheight=25, fieldbackground="#1C1C1C", background="#1C1C1C", foreground="#D3D3D3", borderwidth=0)
+        self.style.configure("Treeview.Heading", background="#4A4A4A", foreground="white", relief="flat", font=('Arial', 10, 'bold'))
+        self.style.map("Treeview.Heading", background=[('active', '#5A5A5A')])
+        self.style.configure("Vertical.TScrollbar", background='#4A4A4A', troughcolor='#2E2E2E', arrowcolor='white')
+        
+        self.root.configure(bg='#2E2E2E')
+        self.scan_results = []
+        self._create_widgets()
+
+    def _create_widgets(self):
+        # --- Top Control Frame ---
+        top_frame = ttk.Frame(self.root, padding="10")
+        top_frame.pack(fill=tk.X)
+
+        self.scan_button = ttk.Button(top_frame, text="Select Directory & Scan", command=self.start_scan)
+        self.scan_button.pack(side=tk.LEFT, padx=(0, 10))
+        
+        self.filter_var = tk.StringVar(value="Detections Only")
+        self.filter_all = ttk.Radiobutton(top_frame, text="All", variable=self.filter_var, value="All", command=self.apply_filter)
+        self.filter_all.pack(side=tk.LEFT, padx=5)
+        self.filter_detections = ttk.Radiobutton(top_frame, text="Detections Only", variable=self.filter_var, value="Detections Only", command=self.apply_filter)
+        self.filter_detections.pack(side=tk.LEFT, padx=5)
+        self.filter_clean = ttk.Radiobutton(top_frame, text="Clean Only", variable=self.filter_var, value="Clean Only", command=self.apply_filter)
+        self.filter_clean.pack(side=tk.LEFT, padx=5)
+
+        # --- Results Treeview ---
+        tree_frame = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        tree_frame.pack(expand=True, fill='both')
+
+        columns = ("#", "file_path", "detection", "score", "status")
+        self.tree = ttk.Treeview(tree_frame, columns=columns, show='headings')
+        
+        self.tree.heading("#", text="#", anchor='w')
+        self.tree.heading("file_path", text="File Path", anchor='w')
+        self.tree.heading("detection", text="Detection Name", anchor='w')
+        self.tree.heading("score", text="Score", anchor='w')
+        self.tree.heading("status", text="Status", anchor='w')
+
+        self.tree.column("#", width=60, stretch=False)
+        self.tree.column("file_path", width=450)
+        self.tree.column("detection", width=200)
+        self.tree.column("score", width=120, stretch=False, anchor='center')
+        self.tree.column("status", width=100, stretch=False, anchor='center')
+
+        self.tree.pack(side=tk.LEFT, expand=True, fill='both')
+        
+        # --- Scrollbar ---
+        scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
+        self.tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill='y')
+
+        # --- Tag configurations for colors ---
+        self.tree.tag_configure('CLEAN', foreground='#8FBC8F')
+        self.tree.tag_configure('SUSPICIOUS', foreground='#FFD700')
+        self.tree.tag_configure('MALICIOUS', foreground='#FF6347')
+        self.tree.tag_configure('ERROR', foreground='#D3D3D3')
+        self.tree.tag_configure('QUARANTINED', foreground='#ADD8E6')
+
+        # --- Context Menu ---
+        self.context_menu = tk.Menu(self.root, tearoff=0, bg="#1C1C1C", fg="white")
+        self.context_menu.add_command(label="Quarantine File", command=self.quarantine_selected)
+        self.context_menu.add_command(label="Show Details", command=self.show_details)
+        self.tree.bind("<Button-3>", self.show_context_menu)
+        
+        # --- Bottom Status Frame ---
+        status_frame = ttk.Frame(self.root, padding="5 5 10 5")
+        status_frame.pack(fill=tk.X)
+        self.status_label = ttk.Label(status_frame, text="Ready - Hardcoded Obfuscation Detection", anchor='w')
+        self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.progress_bar = ttk.Progressbar(status_frame, orient='horizontal', mode='determinate')
+        self.progress_bar.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+
+    def start_scan(self):
+        directory = filedialog.askdirectory()
+        if not directory: return
+        
+        self.scan_button.config(state=tk.DISABLED)
+        self.tree.delete(*self.tree.get_children())
+        self.scan_results.clear()
+        self.status_label.config(text="Starting hardcoded scan in: {}".format(directory))
+        
+        scan_thread = threading.Thread(target=scan_directory_parallel, args=(directory, self))
+        scan_thread.daemon = True
+        scan_thread.start()
+
+    def update_status(self, message):
+        self.root.after(0, lambda: self.status_label.config(text=message))
+
+    def update_progress(self, current, total):
+        def _update():
+            self.progress_bar['maximum'] = total
+            self.progress_bar['value'] = current
+            self.update_status("Scanning... ({}/{})".format(current, total))
+        self.root.after(0, _update)
+
+    def add_result(self, result):
+        self.root.after(0, lambda: self._add_result_to_view(result))
+    
+    def _add_result_to_view(self, result):
+        self.scan_results.append(result)
+        if self.filter_var.get() == "All":
+            self.insert_result_into_tree(result)
+        elif self.filter_var.get() == "Detections Only" and result['suspicious']:
+            self.insert_result_into_tree(result)
+        elif self.filter_var.get() == "Clean Only" and not result['suspicious']:
+            self.insert_result_into_tree(result)
+
+    def insert_result_into_tree(self, result):
+        tag = 'CLEAN'
+        if result['status'] == 'Error' or result['status'] == 'Skipped':
+            tag = 'ERROR'
+        elif result['suspicious']:
+            tag = 'MALICIOUS'
+
+        score_val = result['suspicious_score']
+        score_text = str(int(score_val)) if isinstance(score_val, (int, float)) else str(score_val)
+        
+        item_id = self.tree.insert('', 'end', values=(
+            len(self.tree.get_children()) + 1,
+            result['path'],
+            result['detection_name'],
+            score_text,
+            result['status']
+        ), tags=(tag,))
+        result['tree_id'] = item_id  # Link result dict to tree item
+
+    def apply_filter(self):
+        self.tree.delete(*self.tree.get_children())
+        filter_mode = self.filter_var.get()
+        
+        filtered_results = []
+        if filter_mode == "All":
+            filtered_results = self.scan_results
+        elif filter_mode == "Detections Only":
+            filtered_results = [r for r in self.scan_results if r['suspicious']]
+        elif filter_mode == "Clean Only":
+            filtered_results = [r for r in self.scan_results if not r['suspicious']]
+        
+        for result in filtered_results:
+            self.insert_result_into_tree(result)
+
+    def show_context_menu(self, event):
+        item_id = self.tree.identify_row(event.y)
+        if item_id:
+            self.tree.selection_set(item_id)
+            result = self.get_result_from_id(item_id)
+            if result and (result.get('suspicious') or result.get('status') == 'Detection'):
+                self.context_menu.tk_popup(event.x_root, event.y_root)
+
+    def get_result_from_id(self, item_id):
+        return next((r for r in self.scan_results if r.get('tree_id') == item_id), None)
+
+    def quarantine_selected(self):
+        if not self.tree.selection(): return
+        selected_id = self.tree.selection()[0]
+        result = self.get_result_from_id(selected_id)
+        if not result or not (result.get('suspicious') or result.get('status') == 'Detection'):
+            return
+
+        file_path = result['path']
+        warning_msg = (
+            "You are about to quarantine the following file:\n\n"
+            "{}\n\n"
+            "This action will attempt to:\n"
+            "1. Terminate the associated process (if running).\n"
+            "2. Make the process a 'critical process' before termination. MISTAKES CAN CAUSE A SYSTEM CRASH (BSOD).\n"
+            "3. Move the file to a secure quarantine folder.\n\n"
+            "This is a high-risk operation. Proceed?"
+        ).format(file_path)
+        
+        if messagebox.askyesno("Confirm Quarantine", warning_msg, icon='warning'):
+            try:
+                success, message = quarantine.initiate_quarantine(file_path)
+                if success:
+                    result['status'] = 'Quarantined'
+                    self.tree.item(selected_id, values=(self.tree.item(selected_id, 'values')[0], result['path'], result['detection_name'], self.tree.item(selected_id, 'values')[3], 'Quarantined'), tags=('QUARANTINED',))
+                    messagebox.showinfo("Success", message)
+                else:
+                    messagebox.showerror("Quarantine Failed", message)
+            except Exception as e:
+                messagebox.showerror("Quarantine Error", "An unexpected error occurred: {}".format(e))
+
+    def show_details(self):
+        if not self.tree.selection(): return
+        selected_id = self.tree.selection()[0]
+        result = self.get_result_from_id(selected_id)
+        if not result: return
+        
+        score_val = result.get('suspicious_score', 'N/A')
+        score_text = str(int(score_val)) if isinstance(score_val, (int, float)) else str(score_val)
+
+        details_format = (
+            "File: {path}\n"
+            "Detection: {detection_name}\n"
+            "Obfuscation Score: {score}\n"
+            "Status: {status}\n\n"
+            "--- Detection Reasons ---\n"
+        )
+        details = details_format.format(
+            path=result.get('path', 'N/A'),
+            detection_name=result.get('detection_name', 'N/A'),
+            score=score_text,
+            status=result.get('status', 'N/A')
+        )
+        reasons = result.get('flagging_reasons', ['None'])
+        details += "\n".join(reasons) if reasons else "No specific reasons available."
+
+        # Display details in a new Toplevel window
+        top = tk.Toplevel(self.root)
+        top.title("Obfuscation Analysis Details")
+        top.geometry("700x500")
+        top.configure(bg="#2E2E2E")
+        txt = scrolledtext.ScrolledText(top, wrap=tk.WORD, bg='#1C1C1C', fg='#D3D3D3', font=('Consolas', 10))
+        txt.pack(expand=True, fill='both', padx=10, pady=10)
+        txt.insert(tk.END, details)
+        txt.config(state=tk.DISABLED)
+
+    def scan_finished(self, total_scanned, suspicious_found):
+        def _finish():
+            self.scan_button.config(state=tk.NORMAL)
+            self.progress_bar['value'] = 0
+            self.update_status("Hardcoded scan complete. Scanned: {}. Detections: {}.".format(total_scanned, suspicious_found))
+        self.root.after(0, _finish)
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Suspicious file scanner")
-    parser.add_argument("-m", "--malware-path", dest="scan_path", default=SCAN_FOLDER, help="Directory to scan")
-    parser.add_argument("-t", "--threshold", type=int, default=SUSPICIOUS_THRESHOLD, help="Suspicion threshold")
-    parser.add_argument('--whitelist-xml', dest='whitelist_xml', default=PE_STRINGS_FILE, help='Path to pestudio strings.xml (whitelist)')
-
-    args = parser.parse_args()
-
-    SUSPICIOUS_THRESHOLD = int(args.threshold)
-    SCAN_FOLDER = args.scan_path
-
-    print("--- Suspicious file scanner ---")
-
-    # Load pestudio whitelist XML (no local good_* DBs used)
-    try:
-        pestudio_strings_global = initialize_pestudio_strings(args.whitelist_xml)
-    except Exception as e:
-        logging.warning("Failed to load pestudio whitelist: %s", e)
-
-    print(f"Starting scan: {SCAN_FOLDER}")
-    start = time.time()
-    results = scan_directory_parallel(SCAN_FOLDER)
-    dur = time.time() - start
-
-    suspicious = [r for r in results if r and r.get("suspicious")]
-    print("\n--- Scan Summary ---")
-    print(f"Completed in {dur:.2f}s. Files scanned: {len(results)} Suspicious: {len(suspicious)}")
+    root = tk.Tk()
+    app = ScannerApp(root)
+    root.mainloop()
