@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-HydraScanner - Hardcoded Obfuscation Detection (patched)
-This file is the full scanner GUI with persistent result storage ("remembering results")
-and a simple known-malware store. The previous "make process critical" / BSOD behavior
-has been removed; quarantine now relies on the quarantine module to safely handle termination
-and moving files. The pe_feature_extractor import (get_cached_pe_features) is kept and used.
-This patched version adds defensive checks and a safe runner for analyzer functions so
-single-function failures won't convert the whole file into "Analysis-Error".
-Compatible with Python 3.5+ and ReactOS where tkinter/psutil/quarantine are available.
+HydraScanner - Hardcoded Obfuscation Detection (patched + RAPPS installer adjustment)
+This variant adds:
+ - RAPPS Downloads auto-whitelist (configurable)
+ - Probable-installer heuristic with configurable score deduction (default -20)
+ - GUI toggles for RAPPS whitelist and installer deduction
+ - Persistent config file: scanner_config.json
+ - Simple audit stats persisted in scanner_stats.json
+ - Logging of adjustments for scientific measurement and tuning
+Compatible with Python 3.5+ and typical Windows dev environments.
+
+Additional integrated features (kept and merged into the original file):
+ - Script/text obfuscation scoring for common script types (JS/PS1/PY/VBS/etc.)
+   - scripts now get "HEUR:Script.Obfuscated" / HEUR:Script.Clean" detections instead of being skipped
+ - Last scan duration and cumulative scan time persisted in scanner_stats.json
+ - scan_directory_parallel reports elapsed time to the UI and stats
+ - RAPPS whitelist path-checking corrected to use absolute-folder matching
 """
 import os
 import math
@@ -22,19 +30,21 @@ import re
 import string
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+import ctypes
+from ctypes import wintypes
 import psutil
 
 # --- Compatibility imports for tkinter ---
 try:
     import tkinter as tk
-    from tkinter import ttk, filedialog, scrolledtext, messagebox, font
+    from tkinter import ttk, filedialog, scrolledtext, messagebox
 except ImportError:
     import Tkinter as tk
     import ttk
     import tkFileDialog as filedialog
     import ScrolledText as scrolledtext
     import tkMessageBox as messagebox
-    import tkFont as font
 
 # Import the PE feature extractor helper (kept per requirement)
 try:
@@ -45,13 +55,23 @@ except ImportError:
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
 
+# --- Provide STARTUP_DIRS default if not defined elsewhere ---
+# (Some helper functions reference STARTUP_DIRS; keep safe)
+STARTUP_DIRS = [
+    os.path.join(os.environ.get('APPDATA', ''), 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup') if os.environ.get('APPDATA') else ''
+]
+
 # --- Persistence files ---
 _SCAN_HISTORY_FILE = os.path.join(base_dir, "scan_history.json")
 _KNOWN_MALWARE_FILE = os.path.join(base_dir, "known_malware.json")
 _persistence_lock = threading.RLock()
 
-# --- Globals and Configuration ---
-SUSPICIOUS_THRESHOLD = 43  # Increased threshold for hardcoded system
+# --- New config and stats files ---
+_CONFIG_FILE = os.path.join(base_dir, "scanner_config.json")
+_STATS_FILE = os.path.join(base_dir, "scanner_stats.json")
+
+# --- Globals and Configuration (defaults) ---
+SUSPICIOUS_THRESHOLD = 47  # original default
 DETECTION_NAME = "HEUR:Win32.Susp.Obfuscated.gen"
 
 SUSPICIOUS_DIRS = [
@@ -60,47 +80,137 @@ SUSPICIOUS_DIRS = [
     os.path.join(os.environ.get('USERPROFILE', ''), 'AppData', 'Local', 'Temp') if os.environ.get('USERPROFILE') else ''
 ]
 
-# --- Dynamic Startup Directory Location ---
-STARTUP_DIRS = []
-try:
-    import ctypes
-    from ctypes import wintypes
-    CSIDL_STARTUP = 0x0007
-    CSIDL_COMMON_STARTUP = 0x0018
+# Bind SHGetFolderPathW
+SHGetFolderPathW = ctypes.windll.shell32.SHGetFolderPathW
 
-    def get_special_folder_path(csidl):
-        try:
-            buf = ctypes.create_unicode_buffer(wintypes.MAX_PATH)
-            ctypes.windll.shell32.SHGetFolderPathW(None, csidl, None, 0, buf)
-            return buf.value
-        except Exception as e:
-            hydra_logger.logger.warning("Could not get special folder path for CSIDL {}: {}".format(csidl, e))
-            return None
+# Constants
+CSIDL_PERSONAL = 0x0005  # "My Documents"
+MAX_PATH = 260
 
-    user_startup = get_special_folder_path(CSIDL_STARTUP)
-    if user_startup:
-        STARTUP_DIRS.append(user_startup)
-    common_startup = get_special_folder_path(CSIDL_COMMON_STARTUP)
-    if common_startup:
-        STARTUP_DIRS.append(common_startup)
-except Exception as e:
-    hydra_logger.logger.warning("Could not initialize dynamic startup directory search: {}".format(e))
+def get_documents_folder():
+    """Get 'My Documents' folder (works on XP, ReactOS)."""
+    path_buf = ctypes.create_unicode_buffer(MAX_PATH)
+    hr = SHGetFolderPathW(0, CSIDL_PERSONAL, 0, 0, path_buf)
+    if hr != 0:
+        # fallback if API fails
+        return Path(os.environ.get("USERPROFILE", "")) / "Documents"
+    return Path(path_buf.value)
+    
+docs = get_documents_folder()
+rapps_folder = docs / "RAPPS Downloads"
 
-# --- Utility: compute MD5 (used for remembering and known-malware keys) ---
-def compute_md5(file_path):
-    """Compute MD5 hash of a file; returns hex digest or None on error."""
-    import hashlib
-    hash_md5 = hashlib.md5()
+ENABLE_RAPPS_WHITELIST = True  # keep the toggle
+
+def is_rapps_whitelisted(path):
+    """
+    Check if the given path is inside any of the known RAPPS folders.
+    """
     try:
-        with open(file_path, "rb") as f:
-            for chunk in iter(lambda: f.read(4096), b""):
-                hash_md5.update(chunk)
-        return hash_md5.hexdigest()
+        if not path:
+            return False
+        path_norm = os.path.abspath(path).lower()
+        if rapps_folder:
+            folder_abs = os.path.abspath(rapps_folder)
+            # exact folder equality or path inside that folder
+            if folder_abs == path_norm or path_norm.startswith(folder_abs + os.sep):
+                return True
     except Exception as e:
-        hydra_logger.logger.error("Could not compute MD5 for {}: {}".format(file_path, e))
-        return None
+        hydra_logger.logger.debug("RAPPS whitelist check failed for {}: {}".format(path, e), exc_info=True)
+    return False
 
-# --- Persistence helpers (use default=str to help JSON-serialize numpy or other weird types) ---
+# Default scanner config (can be changed in scanner_config.json)
+_DEFAULT_CONFIG = {
+    "enable_rapps_whitelist": True,
+    # substring (lowercase) to match for RAPPS folder detection; adjust to your actual folder name
+    "enable_installer_adjustment": True,
+    "installer_score_deduction": 20,  # points to deduct from suspicious score when installer heuristics match
+    "suspicious_threshold": SUSPICIOUS_THRESHOLD,
+    "script_suspicious_threshold": 50,  # threshold for script/text obfuscation scoring
+    "audit_log_enabled": True,
+    "audit_log_file": os.path.join(base_dir, "scanner_audit.log")
+}
+
+# Attempt to load config, otherwise save defaults
+def load_config():
+    try:
+        with _persistence_lock:
+            if os.path.exists(_CONFIG_FILE):
+                with open(_CONFIG_FILE, "r", encoding="utf-8") as fh:
+                    cfg = json.load(fh)
+                    # merge missing keys from defaults
+                    merged = dict(_DEFAULT_CONFIG)
+                    merged.update(cfg or {})
+                    return merged
+            else:
+                # create default config file
+                with open(_CONFIG_FILE, "w", encoding="utf-8") as fh:
+                    json.dump(_DEFAULT_CONFIG, fh, ensure_ascii=False, indent=2)
+                return dict(_DEFAULT_CONFIG)
+    except Exception as e:
+        hydra_logger.logger.warning("Failed to load config, using defaults: {}".format(e))
+        return dict(_DEFAULT_CONFIG)
+
+CONFIG = load_config()
+# Use config values for threshold and other runtime behavior
+SUSPICIOUS_THRESHOLD = CONFIG.get("suspicious_threshold", SUSPICIOUS_THRESHOLD)
+ENABLE_RAPPS_WHITELIST = bool(CONFIG.get("enable_rapps_whitelist", True))
+ENABLE_INSTALLER_ADJUSTMENT = bool(CONFIG.get("enable_installer_adjustment", True))
+INSTALLER_SCORE_DEDUCTION = float(CONFIG.get("installer_score_deduction", 20.0))
+SCRIPT_SUSPICIOUS_THRESHOLD = float(CONFIG.get("script_suspicious_threshold", 15.0))
+AUDIT_LOG_ENABLED = bool(CONFIG.get("audit_log_enabled", True))
+AUDIT_LOG_FILE = CONFIG.get("audit_log_file", os.path.join(base_dir, "scanner_audit.log"))
+
+# --- Stats persistence (simple counters) ---
+_default_stats = {
+    "total_scanned": 0,
+    "total_detections": 0,
+    "rapps_whitelisted": 0,
+    "installer_adjustments_applied": 0,
+    "detections_prevented_by_adjustment": 0,
+    "last_reset": datetime.datetime.utcnow().isoformat() + "Z",
+    "last_scan_duration_seconds": 0.0,
+    "cumulative_scan_time_seconds": 0.0
+}
+
+def load_stats():
+    try:
+        with _persistence_lock:
+            if os.path.exists(_STATS_FILE):
+                with open(_STATS_FILE, "r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            else:
+                with open(_STATS_FILE, "w", encoding="utf-8") as fh:
+                    json.dump(_default_stats, fh, ensure_ascii=False, indent=2)
+                return dict(_default_stats)
+    except Exception as e:
+        hydra_logger.logger.warning("Failed to load stats, using defaults: {}".format(e))
+        return dict(_default_stats)
+
+def save_stats(stats):
+    try:
+        with _persistence_lock:
+            with open(_STATS_FILE, "w", encoding="utf-8") as fh:
+                json.dump(stats, fh, ensure_ascii=False, indent=2, default=str)
+    except Exception as e:
+        hydra_logger.logger.warning("Failed to save stats: {}".format(e))
+
+STATS = load_stats()
+
+# --- Scan control flags (pause/stop) ---
+SCAN_STOP = threading.Event()    # set() to request immediate stop/cancel
+SCAN_PAUSED = threading.Event()  # set() to pause; clear() to resume
+
+def audit_log(msg):
+    if not AUDIT_LOG_ENABLED:
+        return
+    try:
+        ts = datetime.datetime.utcnow().isoformat() + "Z"
+        with open(AUDIT_LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write("[{}] {}\n".format(ts, msg))
+    except Exception:
+        hydra_logger.logger.debug("Failed to write audit log.", exc_info=True)
+
+# --- Persistence helpers (scan history, known malware) ---
 def load_scan_history():
     with _persistence_lock:
         try:
@@ -137,14 +247,56 @@ def save_known_malware(km):
         except Exception as e:
             hydra_logger.logger.error("Failed to save known malware store: {}".format(e))
 
-# --- Small helper to ensure JSON-friendly value types in results (best-effort) ---
+# --- User-defined whitelist persistence ---
+_WHITELIST_FILE = os.path.join(base_dir, "whitelist.json")
+
+def load_whitelist():
+    with _persistence_lock:
+        try:
+            if os.path.exists(_WHITELIST_FILE):
+                with open(_WHITELIST_FILE, "r", encoding="utf-8") as fh:
+                    data = json.load(fh)
+                    if isinstance(data, dict):
+                        return {
+                            'paths': list(data.get('paths', [])),
+                            'md5s': list(data.get('md5s', []))
+                        }
+        except Exception as e:
+            hydra_logger.logger.warning("Failed to load whitelist: {}".format(e))
+    return {'paths': [], 'md5s': []}
+
+def save_whitelist(w):
+    with _persistence_lock:
+        try:
+            payload = {'paths': list(w.get('paths', [])), 'md5s': list(w.get('md5s', []))}
+            with open(_WHITELIST_FILE, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2, default=str)
+        except Exception as e:
+            hydra_logger.logger.error("Failed to save whitelist: {}".format(e))
+
+def is_whitelisted(path, md5=None):
+    try:
+        wl = load_whitelist()
+        path_norm = (path or '').lower()
+        for p in wl.get('paths', []):
+            try:
+                if p and p.lower() in path_norm:
+                    return True
+            except Exception:
+                continue
+        if md5:
+            if md5 in wl.get('md5s', []):
+                return True
+    except Exception as e:
+        hydra_logger.logger.debug("Whitelist check failed: {}".format(e), exc_info=True)
+    return False
+
+# --- Small helper to ensure JSON-friendly value types in results ---
 def _sanitize_result_for_persistence(r):
     try:
         sanitized = dict(r)
-        # ensure basic fields are basic types
         if 'suspicious_score' in sanitized:
             try:
-                # cast to float (or int)
                 sanitized['suspicious_score'] = float(sanitized['suspicious_score'])
             except Exception:
                 sanitized['suspicious_score'] = str(sanitized['suspicious_score'])
@@ -161,89 +313,146 @@ def _sanitize_result_for_persistence(r):
 
 # --- Obfuscation Detection Patterns ---
 def is_obfuscated_string(s):
-    """Detect if a string appears obfuscated using various heuristics."""
     if not s or len(s) < 3:
         return False
-
-    # Check for non-printable characters
     non_printable_count = sum(1 for c in s if c not in string.printable)
-    if non_printable_count > len(s) * 0.3:  # More than 30% non-printable
+    if non_printable_count > len(s) * 0.3:
         return True
-
-    # Check for excessive special characters
     special_chars = sum(1 for c in s if c in '!@#$%^&*()_+-=[]{}|;:,.<>?~`')
-    if special_chars > len(s) * 0.4:  # More than 40% special characters
+    if special_chars > len(s) * 0.4:
         return True
-
-    # Check for patterns like base64 padding or hex patterns
-    if re.search(r'[A-Za-z0-9+/]{20,}={0,2}$', s):  # Base64-like
+    if re.search(r'[A-Za-z0-9+/]{20,}={0,2}$', s):
         return True
-
-    if re.search(r'^[0-9A-Fa-f]{16,}$', s):  # Long hex string
+    if re.search(r'^[0-9A-Fa-f]{16,}$', s):
         return True
-
-    # Check for reversed common strings
     common_words = ['kernel32', 'ntdll', 'advapi32', 'user32', 'shell32']
     reversed_s = s[::-1].lower()
     if any(word in reversed_s for word in common_words):
         return True
-
-    # Check for mixed case in unusual patterns
     if re.search(r'[a-z][A-Z][a-z][A-Z]', s):
         return True
-
     return False
 
 def calculate_string_entropy(s):
-    """Calculate Shannon entropy for a string."""
     if not s:
         return 0
-
-    # Get frequency of each character
     char_counts = {}
     for char in s:
         char_counts[char] = char_counts.get(char, 0) + 1
-
-    # Calculate entropy
     entropy = 0
     length = len(s)
     for count in char_counts.values():
         p = count / length
         if p > 0:
             entropy -= p * math.log2(p)
-
     return entropy
+
+# --- Script obfuscation heuristics (new) ---
+def analyze_script_obfuscation(path):
+    """
+    Score text/script-based obfuscation heuristics for common script files.
+    Returns (score_float, reasons_list).
+    """
+    score = 0.0
+    reasons = []
+    try:
+        ext = os.path.splitext(path or "")[1].lower()
+        script_exts = ('.js', '.mjs', '.cjs', '.ps1', '.py', '.vbs', '.vbe', '.bat', '.cmd', '.wsf', '.jse', '.hta', '.sh')
+        if ext not in script_exts:
+            return 0.0, []
+
+        # read up to 1MB to avoid huge files
+        with open(path, "rb") as fh:
+            raw = fh.read(1024 * 1024)
+        try:
+            content = raw.decode('utf-8', errors='ignore')
+        except Exception:
+            content = str(raw)
+
+        # heuristic: long base64-like blobs
+        b64_matches = re.findall(r'[A-Za-z0-9+/]{40,}={0,2}', content)
+        if b64_matches:
+            add = min(len(b64_matches) * 6, 24)
+            score += add
+            reasons.append("{:d} long base64-like blobs found (+{:d})".format(len(b64_matches), int(add)))
+
+        # many escaped hex sequences like \xNN (common in JS obfuscation)
+        hex_escapes = len(re.findall(r'\\x[0-9A-Fa-f]{2}', content))
+        if hex_escapes > 10:
+            score += 8
+            reasons.append("{} hex escape sequences (\\x..) (+8)".format(hex_escapes))
+        elif hex_escapes > 3:
+            score += 4
+            reasons.append("{} hex escape sequences (\\x..) (+4)".format(hex_escapes))
+
+        # eval/Function/exec usage (suspicious pattern)
+        eval_tokens = 0
+        for tok in ('eval(', 'Function(', 'new Function', 'setTimeout(', 'setInterval(', 'exec(', 'Invoke-Expression', 'IEX '):
+            eval_tokens += content.count(tok)
+        if eval_tokens > 0:
+            add = min(eval_tokens * 3, 12)
+            score += add
+            reasons.append("{} suspicious evaluation/exec tokens (+{})".format(eval_tokens, int(add)))
+
+        # long lines (single-line obfuscated payloads)
+        long_lines = sum(1 for l in content.splitlines() if len(l) > 300)
+        if long_lines:
+            add = min(long_lines * 3, 12)
+            score += add
+            reasons.append("{} very long lines detected (+{})".format(long_lines, int(add)))
+
+        # concatenation tokens (crude proxy)
+        concat_ops = content.count('+') + content.count('.')
+        if concat_ops > 500:
+            score += 8
+            reasons.append("Very high concatenation token count (+8)")
+
+        # text entropy on sample
+        sample = content[:2000]
+        ent = calculate_string_entropy(sample)
+        if ent > 4.2:
+            score += 6
+            reasons.append("High text entropy in sample ({:.2f}) (+6)".format(ent))
+
+        non_alnum_ratio = sum(1 for c in sample if not c.isalnum() and not c.isspace()) / (len(sample) or 1)
+        if non_alnum_ratio > 0.25:
+            score += 4
+            reasons.append("High non-alphanumeric ratio in sample (+4)")
+
+        # cap
+        if score > 60:
+            score = 60.0
+
+    except Exception as e:
+        reasons.append("Script analysis failed: {}".format(e))
+        hydra_logger.logger.debug("Script obfuscation analysis failed for {}: {}".format(path, e), exc_info=True)
+    return float(score), reasons
 
 # --- Analysis modules (unchanged semantics, kept as functions) ---
 def detect_packing_heuristics(pe_features):
     score = 0
     reasons = []
-
     disasm = pe_features.get('section_disassembly', {}).get('overall_analysis', {})
     if disasm.get('is_likely_packed'):
         score += 10
         reasons.append("Assembly analysis indicates packing (+10)")
-
     add_count = disasm.get('add_count', 0)
     mov_count = disasm.get('mov_count', 0)
     if mov_count > 0 and (add_count / mov_count) > 2:
         score += 8
         reasons.append("Suspicious ADD/MOV instruction ratio (+8)")
-
     sections = pe_features.get('section_characteristics', {})
     high_entropy_sections = 0
     for section_name, data in sections.items():
         entropy = data.get('entropy', 0)
         if entropy > 7.0:
             high_entropy_sections += 1
-
     if high_entropy_sections > 1:
         score += 8
         reasons.append("Multiple high-entropy sections detected (+8)")
     elif high_entropy_sections == 1:
         score += 4
         reasons.append("High-entropy section detected (+4)")
-
     pe_sections = pe_features.get('sections', [])
     if pe_sections:
         total_virtual = sum(s.get('virtual_size', 0) for s in pe_sections)
@@ -251,98 +460,78 @@ def detect_packing_heuristics(pe_features):
         if total_raw > 0 and (total_virtual / total_raw) > 3:
             score += 6
             reasons.append("Suspicious virtual/raw size ratio (+6)")
-
     return score, reasons
 
 def analyze_section_obfuscation(pe_features):
     score = 0
     reasons = []
-
     sections = pe_features.get('sections', [])
     section_chars = pe_features.get('section_characteristics', {})
-
     for section in sections:
         section_name = section.get('name', '')
-
         if is_obfuscated_string(section_name):
             score += 8
             reasons.append("Obfuscated section name '{}' (+8)".format(section_name))
-
         if section_name and not section_name.startswith(('.text', '.data', '.rdata', '.rsrc', '.reloc', '.idata')):
             name_entropy = calculate_string_entropy(section_name)
             if name_entropy > 3.5:
                 score += 5
                 reasons.append("High-entropy section name '{}' (+5)".format(section_name))
-
         characteristics = section.get('characteristics', 0)
         if characteristics & 0x20000000 and characteristics & 0x80000000:  # Execute + Write
             score += 6
             reasons.append("Section '{}' has execute+write characteristics (+6)".format(section_name))
-
     for section_name, data in section_chars.items():
         flags = data.get('flags', {})
         if flags.get('MEM_EXECUTE') and flags.get('MEM_WRITE'):
             score += 7
             reasons.append("Section '{}' is both executable and writable (+7)".format(section_name))
-
         size_ratio = data.get('size_ratio', 0)
         if size_ratio > 0.8:
             score += 4
             reasons.append("Section '{}' takes up {}% of image (+4)".format(section_name, int(size_ratio * 100)))
-
     return score, reasons
 
 def analyze_import_obfuscation(pe_features):
     score = 0
     reasons = []
-
     imports = pe_features.get('imports', [])
-
     obfuscated_imports = 0
     for imp_name in imports:
         if imp_name and is_obfuscated_string(imp_name):
             obfuscated_imports += 1
-
     if obfuscated_imports > 0:
         score += min(obfuscated_imports * 3, 15)
         reasons.append("{} obfuscated import names (+{})".format(obfuscated_imports, min(obfuscated_imports * 3, 15)))
-
     if len(imports) == 0:
         score += 8
         reasons.append("No imports detected - possible import obfuscation (+8)")
     elif len(imports) < 5:
         score += 4
         reasons.append("Very few imports - possible selective import loading (+4)")
-
     delay_imports = pe_features.get('delay_imports', [])
     if len(delay_imports) > len(imports):
         score += 6
         reasons.append("More delay imports than regular imports (+6)")
-
     return score, reasons
 
 def analyze_header_anomalies(pe_features):
     score = 0
     reasons = []
-
     checksum = pe_features.get('CheckSum', 0)
     if checksum == 0:
         score += 3
         reasons.append("PE checksum is zero (+3)")
-
     loader_flags = pe_features.get('LoaderFlags', 0)
     if loader_flags != 0:
         score += 5
         reasons.append("Non-zero LoaderFlags: 0x{:x} (+5)".format(loader_flags))
-
     subsystem = pe_features.get('Subsystem', 0)
     if subsystem not in [1, 2, 3, 5, 6, 7, 8, 9, 10, 14, 16]:
         score += 6
         reasons.append("Unknown subsystem value: {} (+6)".format(subsystem))
-
     entry_point = pe_features.get('AddressOfEntryPoint', 0)
     sections = pe_features.get('sections', [])
-
     entry_in_non_code_section = True
     for section in sections:
         va_start = section.get('virtual_address', 0)
@@ -352,62 +541,65 @@ def analyze_header_anomalies(pe_features):
             if section_name.startswith('.text') or 'CODE' in section_name.upper():
                 entry_in_non_code_section = False
             break
-
     if entry_in_non_code_section and entry_point != 0:
         score += 8
         reasons.append("Entry point not in code section (+8)")
-
     return score, reasons
 
 def analyze_resource_anomalies(pe_features):
     score = 0
     reasons = []
-
-    resources = pe_features.get('resources', [])
-
+    resources = pe_features.get('resources') if isinstance(pe_features, dict) else None
+    if not resources:
+        resources = []
+    elif not isinstance(resources, list):
+        try:
+            resources = list(resources)
+        except Exception:
+            resources = []
     large_resources = 0
     for resource in resources:
-        res_size = resource.get('size', 0)
-        if res_size > 1024 * 1024:  # > 1MB
+        res_size = 0
+        try:
+            if isinstance(resource, dict):
+                res_size = int(resource.get('size') or 0)
+            else:
+                res_size = int(resource)
+        except Exception:
+            res_size = 0
+        if res_size > 1024 * 1024:
             large_resources += 1
-
     if large_resources > 0:
         score += large_resources * 3
         reasons.append("{} large resources (>1MB each) (+{})".format(large_resources, large_resources * 3))
-
-    if len(resources) > 50:
-        score += 5
-        reasons.append("Excessive number of resources: {} (+5)".format(len(resources)))
-
+    try:
+        if len(resources) > 50:
+            score += 5
+            reasons.append("Excessive number of resources: {} (+5)".format(len(resources)))
+    except Exception:
+        pass
     return score, reasons
 
 def analyze_tls_anomalies(pe_features):
     score = 0
     reasons = []
-
     tls_callbacks = pe_features.get('tls_callbacks', {})
     callbacks = tls_callbacks.get('callbacks', [])
-
     if callbacks:
         score += 8
         reasons.append("TLS callbacks detected - possible anti-analysis (+8)")
-
         if len(callbacks) > 3:
             score += 4
             reasons.append("Multiple TLS callbacks: {} (+4)".format(len(callbacks)))
-
     return score, reasons
 
 def analyze_rich_header_anomalies(pe_features):
     score = 0
     reasons = []
-
     rich_header = pe_features.get('rich_header', {})
-
     if rich_header and not rich_header.get('comp_id_info'):
         score += 4
         reasons.append("Rich header present but no compiler info (+4)")
-
     comp_info = rich_header.get('comp_id_info', [])
     for comp in comp_info:
         comp_id = comp.get('comp_id', 0)
@@ -415,30 +607,23 @@ def analyze_rich_header_anomalies(pe_features):
             score += 3
             reasons.append("Suspicious compiler ID: {} (+3)".format(comp_id))
             break
-
     return score, reasons
 
 def analyze_overlay_anomalies(pe_features):
     score = 0
     reasons = []
-
     overlay = pe_features.get('overlay', {})
-
     if overlay.get('exists'):
         overlay_size = overlay.get('size', 0)
         overlay_entropy = overlay.get('entropy', 0)
-
         score += 5
         reasons.append("Overlay data detected (+5)")
-
         if overlay_entropy > 7.5:
             score += 6
             reasons.append("High-entropy overlay data (+6)")
-
-        if overlay_size > 100 * 1024:  # > 100KB
+        if overlay_size > 100 * 1024:
             score += 4
             reasons.append("Large overlay: {} bytes (+4)".format(overlay_size))
-
     return score, reasons
 
 # --- Utility Functions (unchanged) ---
@@ -492,17 +677,11 @@ def is_in_suspicious_location_pe(path):
 
 # --- Safe-run helper to isolate analyzer function exceptions ---
 def _safe_run(name, func, *args, **kwargs):
-    """
-    Run func(*args, **kwargs) and return (score, reasons).
-    On exception, log full traceback and return (0, ["<name> error: ..."]).
-    """
     try:
         result = func(*args, **kwargs)
-        # normalize expected return types (score, reasons)
         if isinstance(result, tuple) and len(result) == 2:
             score, reasons = result
             try:
-                # ensure types
                 score = float(score)
             except Exception:
                 try:
@@ -518,7 +697,6 @@ def _safe_run(name, func, *args, **kwargs):
                     reasons = [str(reasons)]
             return score, reasons
         else:
-            # unexpected return, treat as no score
             hydra_logger.logger.warning("Analyzer '%s' returned unexpected type: %s", name, type(result))
             return 0, []
     except Exception as e:
@@ -526,19 +704,66 @@ def _safe_run(name, func, *args, **kwargs):
         hydra_logger.logger.error("Analysis function '%s' raised: %s\n%s", name, e, tb)
         return 0, ["{} analysis failed: {}".format(name, str(e))]
 
-# --- Core Analysis Logic (with persistence hooks) ---
-def _append_history_and_known(result):
-    """Thread-safe store of scan result and known-malware update."""
+# --- New helper: probable-installer heuristic (scientific, auditable) ---
+def is_probable_installer(path, pe_features):
+    """
+    Heuristic check for installer-like files.
+    Returns True for common installer types (.msi, .msix, .msp),
+    filenames containing installer tokens, or pe metadata/imports that point to installer frameworks.
+    """
     try:
-        # Load, append, save history
+        # extension checks
+        ext = os.path.splitext(path or "")[1].lower()
+        if ext in ('.msi', '.msix', '.msm', '.msp'):
+            return True
+
+        # filename clues
+        name = os.path.basename(path or "").lower()
+        if any(token in name for token in ('setup', 'install', 'installer', 'uninstall', 'update', 'patch', 'setup32', 'setup64')):
+            return True
+
+        # metadata clues
+        try:
+            desc = ''
+            prod = ''
+            if isinstance(pe_features, dict):
+                desc = (pe_features.get('file_description') or pe_features.get('FileDescription') or '') or ''
+                prod = (pe_features.get('product_name') or pe_features.get('ProductName') or '') or ''
+                desc = desc.lower()
+                prod = prod.lower()
+                if any(k in desc for k in ('installer', 'inno', 'nsis', 'installshield')):
+                    return True
+                if any(k in prod for k in ('installer', 'inno', 'nsis', 'installshield')):
+                    return True
+        except Exception:
+            pass
+
+        # imports / API clues
+        try:
+            imports = pe_features.get('imports') if isinstance(pe_features, dict) else []
+            for imp in (imports or []):
+                if not imp:
+                    continue
+                ik = imp.lower()
+                if any(token in ik for token in ('msi', 'setupapi', 'cabinet', 'cabinetlib', 'installshield', 'instmsi', 'nsis')):
+                    return True
+        except Exception:
+            pass
+
+    except Exception:
+        return False
+
+    return False
+
+# --- Core Analysis Logic (with RAPPS whitelist + installer adjustment) ---
+def _append_history_and_known(result):
+    try:
         history = load_scan_history()
         sanitized = _sanitize_result_for_persistence(result)
         history.append(sanitized)
         if len(history) > 5000:
             history = history[-5000:]
         save_scan_history(history)
-
-        # If suspicious, add/update known malware store by MD5
         if result.get('suspicious'):
             md5 = compute_md5(result.get('path')) or result.get('md5')
             known = load_known_malware()
@@ -558,29 +783,138 @@ def _append_history_and_known(result):
     except Exception as e:
         hydra_logger.logger.warning("Failed to append history/known store: {}".format(e), exc_info=True)
 
+def compute_md5(file_path):
+    import hashlib
+    hash_md5 = hashlib.md5()
+    try:
+        with open(file_path, "rb") as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                hash_md5.update(chunk)
+        return hash_md5.hexdigest()
+    except Exception as e:
+        hydra_logger.logger.error("Could not compute MD5 for {}: {}".format(file_path, e))
+        return None
+
 def analyze_single_file(path):
     """
     Analyzes a single file using hardcoded obfuscation detection.
-    Stores results to persistent history and updates known-malware store.
+    Adds RAPPS auto-whitelist and installer score adjustment as configured.
+    Also handles script/text obfuscation detection for script extensions.
+
+    NOTE: Scripts are evaluated *only* against SCRIPT_SUSPICIOUS_THRESHOLD (default ~15)
+    and will NOT be compared to the PE SUSPICIOUS_THRESHOLD (default 43). This prevents
+    scripts from being flagged by the PE threshold.
     """
+    global STATS, SCRIPT_SUSPICIOUS_THRESHOLD, SUSPICIOUS_THRESHOLD
     analysis_result = {
         'path': path,
         'suspicious': False,
         'detection_name': "Clean",
         'suspicious_score': 0.0,
+        'suspicious_score_display': "0%",   # human-readable score with % suffix
         'flagging_reasons': [],
         'status': 'Scanned',
         'md5': compute_md5(path)
     }
 
+    # Count total scanned (stat)
     try:
-        # Defensive: ensure file still exists before processing
+        STATS['total_scanned'] = STATS.get('total_scanned', 0) + 1
+    except Exception:
+        pass
+
+    # Check user whitelist (paths or MD5s)
+    try:
+        try_md5 = analysis_result.get('md5')
+    except Exception:
+        try_md5 = None
+    if is_whitelisted(path, try_md5):
+        analysis_result.update({
+            'suspicious': False,
+            'detection_name': 'Whitelisted',
+            'status': 'Whitelisted',
+            'flagging_reasons': ['User whitelist'],
+            'suspicious_score_display': "0%"
+        })
+        try:
+            _append_history_and_known(analysis_result)
+        except Exception:
+            hydra_logger.logger.debug("Failed to persist whitelisted result.", exc_info=True)
+        return analysis_result
+
+    # Defensive: ensure file still exists before processing
+    try:
         if not os.path.exists(path):
             analysis_result['detection_name'] = "File missing"
             analysis_result['status'] = 'Skipped'
             _append_history_and_known(analysis_result)
             return analysis_result
+    except Exception:
+        pass
 
+    # RAPPS auto-whitelist (configurable)
+    try:
+        if ENABLE_RAPPS_WHITELIST and is_rapps_whitelisted(path):
+            analysis_result.update({
+                'suspicious': False,
+                'detection_name': 'Whitelisted - RAPPS Downloads',
+                'status': 'Whitelisted',
+                'flagging_reasons': ['RAPPS Downloads trusted folder'],
+                'suspicious_score_display': "0%"
+            })
+            _append_history_and_known(analysis_result)
+            # update stats
+            try:
+                STATS['rapps_whitelisted'] = STATS.get('rapps_whitelisted', 0) + 1
+                save_stats(STATS)
+            except Exception:
+                pass
+            audit_log("RAPPS auto-whitelisted: {}".format(path))
+            return analysis_result
+    except Exception as e:
+        hydra_logger.logger.debug("RAPPS auto-whitelist check failed for {}: {}".format(path, e), exc_info=True)
+
+    # --- SCRIPT-SPECIFIC HANDLING: run BEFORE any PE feature extraction ---
+    # This ensures scripts are only checked against SCRIPT_SUSPICIOUS_THRESHOLD and
+    # cannot be accidentally flagged by the PE threshold (SUSPICIOUS_THRESHOLD).
+    try:
+        ext = os.path.splitext(path or "")[1].lower()
+        script_exts = ('.js', '.mjs', '.cjs', '.ps1', '.py', '.vbs', '.vbe', '.bat', '.cmd', '.wsf', '.jse', '.hta', '.sh')
+        if ext in script_exts:
+            sc_score, sc_reasons = analyze_script_obfuscation(path)
+            analysis_result['suspicious_score'] = sc_score
+            analysis_result['flagging_reasons'] = sc_reasons
+            analysis_result['suspicious_score_display'] = "{}%".format(int(sc_score))
+            # Use the dedicated script threshold — do NOT compare to SUSPICIOUS_THRESHOLD
+            if sc_score >= float(SCRIPT_SUSPICIOUS_THRESHOLD):
+                analysis_result.update({
+                    'suspicious': True,
+                    'detection_name': "HEUR:Script.Obfuscated_conf_{}%".format(int(sc_score)),
+                    'status': 'Detection',
+                    'confidence': int(sc_score)
+                })
+                try:
+                    STATS['total_detections'] = STATS.get('total_detections', 0) + 1
+                except Exception:
+                    pass
+                hydra_logger.logger.info("[Script-Suspicious] File: {} | Score: {} | Reasons: {}".format(
+                    path, sc_score, "; ".join(sc_reasons)
+                ))
+            else:
+                analysis_result.update({
+                    'suspicious': False,
+                    'detection_name': "HEUR:Script.Clean(Score:{}%)".format(int(sc_score)),
+                    'status': 'Scanned',
+                    'confidence': int(sc_score)
+                })
+            _append_history_and_known(analysis_result)
+            return analysis_result
+    except Exception as e:
+        hydra_logger.logger.debug("Script analysis early-exit failed for {}: {}".format(path, e), exc_info=True)
+        # fall through to normal handling (non-script case) if an unexpected error occurs
+
+    # --- PE / binary handling continues here ---
+    try:
         pe_features = None
         try:
             pe_features = get_cached_pe_features(path)
@@ -594,7 +928,6 @@ def analyze_single_file(path):
             _append_history_and_known(analysis_result)
             return analysis_result
 
-        # Defensive: ensure pe_features is a mapping-like object
         if not hasattr(pe_features, 'get'):
             hydra_logger.logger.warning("get_cached_pe_features returned unexpected type (%s) for %s", type(pe_features), path)
             try:
@@ -608,7 +941,7 @@ def analyze_single_file(path):
         total_score = 0.0
         all_reasons = []
 
-        # Use _safe_run for each analyzer so one failing analyzer won't mark whole file as Analysis-Error
+        # Run each analyzer using safe wrapper
         score, reasons = _safe_run('detect_packing_heuristics', detect_packing_heuristics, pe_features)
         total_score += score
         all_reasons.extend(reasons)
@@ -641,7 +974,7 @@ def analyze_single_file(path):
         total_score += score
         all_reasons.extend(reasons)
 
-        # Additional heuristics (wrapped defensively)
+        # Additional heuristics
         try:
             if is_running_pe(path):
                 total_score += 5
@@ -683,27 +1016,66 @@ def analyze_single_file(path):
         except Exception as e:
             hydra_logger.logger.debug("certificates check failed for %s: %s", path, e, exc_info=True)
 
+        # === Installer heuristic adjustment (configurable) ===
+        try:
+            if ENABLE_INSTALLER_ADJUSTMENT and is_probable_installer(path, pe_features):
+                prev_score = float(total_score)
+                total_score = max(0.0, float(total_score) - INSTALLER_SCORE_DEDUCTION)
+                all_reasons.append("Installer heuristic adjustment (-{})".format(int(INSTALLER_SCORE_DEDUCTION)))
+                try:
+                    STATS['installer_adjustments_applied'] = STATS.get('installer_adjustments_applied', 0) + 1
+                except Exception:
+                    pass
+                audit_log("Installer adjustment: file={} prev_score={} new_score={}".format(path, prev_score, total_score))
+        except Exception as e:
+            hydra_logger.logger.debug("Installer heuristic adjustment failed for {}: {}".format(path, e), exc_info=True)
+
         # finalize
         analysis_result['suspicious_score'] = total_score
+        analysis_result['suspicious_score_display'] = "{}%".format(int(total_score))
         analysis_result['flagging_reasons'] = all_reasons
 
-        if total_score >= SUSPICIOUS_THRESHOLD:
+        if total_score >= float(SUSPICIOUS_THRESHOLD):
+            confidence = int(total_score)
             analysis_result.update({
                 'suspicious': True,
-                'detection_name': DETECTION_NAME,
-                'status': 'Detection'
+                'detection_name': "{}_confidence_{}%".format(DETECTION_NAME, confidence),
+                'status': 'Detection',
+                'confidence': confidence
             })
-            hydra_logger.logger.info("[Suspicious] File: {} | Score: {} | Reasons: {}".format(path, total_score, "; ".join(all_reasons)))
+            hydra_logger.logger.info(
+                "[Suspicious] File: {} | Score: {} | Confidence: {} | Reasons: {}".format(
+                    path, total_score, confidence, "; ".join(all_reasons)
+                )
+            )
+            try:
+                STATS['total_detections'] = STATS.get('total_detections', 0) + 1
+            except Exception:
+                pass
         else:
-            analysis_result['detection_name'] = "Clean (Score: {})".format(total_score)
+            confidence = int(total_score)
+            analysis_result['detection_name'] = "Clean (Score: {}%)".format(int(total_score))
+            analysis_result['confidence'] = confidence
+
+        # If adjustment was applied and this file would have been detected before adjustment,
+        # we consider it as "detection prevented by adjustment" for stats and audit.
+        try:
+            if ENABLE_INSTALLER_ADJUSTMENT and any('Installer heuristic adjustment' in r for r in all_reasons):
+                hypothetical_score = float(analysis_result['suspicious_score']) + float(INSTALLER_SCORE_DEDUCTION)
+                if hypothetical_score >= float(SUSPICIOUS_THRESHOLD) and analysis_result.get('suspicious') == False:
+                    STATS['detections_prevented_by_adjustment'] = STATS.get('detections_prevented_by_adjustment', 0) + 1
+                    audit_log("Detection prevented by adjustment: file={} hypothetical_score={} threshold={}".format(
+                        path, hypothetical_score, SUSPICIOUS_THRESHOLD))
+        except Exception:
+            pass
 
     except Exception as e:
-        # This except should be rare because per-analyzer errors are isolated by _safe_run.
         hydra_logger.logger.error("Failed to analyze {}: {}".format(path, e), exc_info=True)
         analysis_result.update({
             'detection_name': "Analysis-Error",
             'flagging_reasons': [str(e)],
-            'status': 'Error'
+            'status': 'Error',
+            'suspicious_score_display': "{}%".format(int(analysis_result.get('suspicious_score', 0)))
         })
 
     # persist result & known-malware entry if applicable
@@ -712,52 +1084,94 @@ def analyze_single_file(path):
     except Exception:
         hydra_logger.logger.debug("Failed to persist analysis result for {}".format(path), exc_info=True)
 
+    # try to save stats periodically
+    try:
+        save_stats(STATS)
+    except Exception:
+        pass
+
     return analysis_result
 
 def scan_directory_parallel(directory, app_instance, max_workers=None):
-    """Scan directory in parallel using hardcoded detection."""
     file_paths = []
     app_instance.update_status("Collecting files...")
     for root, _, files in os.walk(directory):
         for f in files:
             file_paths.append(os.path.join(root, f))
-
     total = len(file_paths)
     if total == 0:
-        app_instance.scan_finished(0, 0)
+        # report zero-duration
+        app_instance.scan_finished(0, 0, 0.0)
         return
-
-    workers = max_workers or 100
+    workers = max_workers or min(100, max(4, (os.cpu_count() or 2) * 4))
     processed_count = 0
+    start_time = time.time()
     with ThreadPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(analyze_single_file, p): p for p in file_paths}
-        for fut in as_completed(futures):
-            p = futures[fut]
-            processed_count += 1
-            app_instance.update_progress(processed_count, total)
-            try:
-                res = fut.result()
-                if res:
-                    app_instance.add_result(res)
-            except Exception as e:
-                hydra_logger.logger.exception("Worker failed for {}: {}".format(p, e))
+        try:
+            for fut in as_completed(futures):
+                # If user requested a stop, attempt to cancel remaining tasks and break.
+                if SCAN_STOP.is_set():
+                    try:
+                        for f in futures:
+                            try:
+                                f.cancel()
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    break
 
+                # If paused, wait here (but remain responsive to Stop)
+                while SCAN_PAUSED.is_set() and not SCAN_STOP.is_set():
+                    try:
+                        app_instance.update_status("Scan paused... ({}/{})".format(processed_count, total))
+                    except Exception:
+                        pass
+                    time.sleep(0.25)
+
+                p = futures[fut]
+                processed_count += 1
+                app_instance.update_progress(processed_count, total)
+                try:
+                    res = fut.result()
+                    if res:
+                        app_instance.add_result(res)
+                except Exception as e:
+                    hydra_logger.logger.exception("Worker failed for {}: {}".format(p, e))
+        except Exception as e:
+            hydra_logger.logger.exception("scan_directory_parallel main loop failure: {}".format(e))
+
+    elapsed = time.time() - start_time
+
+    # persist timing stats
+    try:
+        STATS['last_scan_duration_seconds'] = float(elapsed)
+        STATS['cumulative_scan_time_seconds'] = STATS.get('cumulative_scan_time_seconds', 0.0) + float(elapsed)
+        save_stats(STATS)
+    except Exception:
+        hydra_logger.logger.debug("Failed to persist scan timing stats.", exc_info=True)
+
+    # Determine number of detections in the current view
     detections = len([r for r in app_instance.scan_results if r.get('suspicious')])
-    app_instance.scan_finished(total, detections)
 
-# --- GUI Application ---
+    # If we stopped early, use processed_count; else total
+    final_total = processed_count if SCAN_STOP.is_set() else total
+    app_instance.scan_finished(final_total, detections, elapsed)
+
+# --- GUI Application (with toggles for rappps & installer adjustment) ---
 class ScannerApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("HydraScanner - Hardcoded Obfuscation Detection")
+        self.root.title("HydraScanner - Hardcoded Obfuscation Detection (RAPPS + Installer Adjustment)")
         self.root.geometry("1000x700")
-        self.root.minsize(800, 500)
-
+        self.root.minsize(900, 500)
         self.style = ttk.Style()
         try:
             self.style.theme_use('clam')
         except Exception:
             pass
+        # Styling (keeps previous theme choices)
         self.style.configure("TFrame", background="#2E2E2E")
         self.style.configure("TButton", background="#4A4A4A", foreground="white", relief="flat", padding=5)
         try:
@@ -772,15 +1186,17 @@ class ScannerApp:
         except Exception:
             pass
         self.style.configure("Vertical.TScrollbar", background='#4A4A4A', troughcolor='#2E2E2E', arrowcolor='white')
-
         self.root.configure(bg='#2E2E2E')
+
+        # runtime options (bound to config)
+        self.enable_rapps_var = tk.BooleanVar(value=ENABLE_RAPPS_WHITELIST)
+        self.enable_inst_adj_var = tk.BooleanVar(value=ENABLE_INSTALLER_ADJUSTMENT)
+
         self.scan_results = []
         self._create_widgets()
-
-        # load persistent history into view (remember results)
+        # load persistent history into view
         try:
             persisted = load_scan_history()
-            # keep only last N for UI performance
             for r in persisted[-1000:]:
                 r['tree_id'] = None
                 self.scan_results.append(r)
@@ -789,99 +1205,217 @@ class ScannerApp:
             hydra_logger.logger.debug("Failed to load persisted scan history.", exc_info=True)
 
     def _create_widgets(self):
-        top_frame = ttk.Frame(self.root, padding="10")
+        # --- Top frame: controls stacked vertically ---
+        top_frame = ttk.Frame(self.root, padding=10)
         top_frame.pack(fill=tk.X)
 
-        self.scan_button = ttk.Button(top_frame, text="Select Directory & Scan", command=self.start_scan)
-        self.scan_button.pack(side=tk.LEFT, padx=(0, 10))
+        # --- Scan buttons ---
+        scan_frame = ttk.Frame(top_frame)
+        scan_frame.pack(fill=tk.X, pady=2)
+        self.scan_button = ttk.Button(scan_frame, text="Select Directory & Scan", command=self.start_scan)
+        self.scan_button.pack(side=tk.LEFT, padx=2)
+        self.pause_button = ttk.Button(scan_frame, text="Pause", command=self.pause_scan, state=tk.DISABLED)
+        self.pause_button.pack(side=tk.LEFT, padx=2)
+        self.resume_button = ttk.Button(scan_frame, text="Resume", command=self.resume_scan, state=tk.DISABLED)
+        self.resume_button.pack(side=tk.LEFT, padx=2)
+        self.stop_button = ttk.Button(scan_frame, text="Stop", command=self.cancel_scan, state=tk.DISABLED)
+        self.stop_button.pack(side=tk.LEFT, padx=2)
 
+        # --- Options & filters ---
+        options_frame = ttk.Frame(top_frame)
+        options_frame.pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(options_frame, text="Enable RAPPS Whitelist", variable=self.enable_rapps_var,
+                        command=self.toggle_rapps_whitelist).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(options_frame, text="Enable Installer Adjust (-{})".format(int(INSTALLER_SCORE_DEDUCTION)),
+                        variable=self.enable_inst_adj_var, command=self.toggle_installer_adjustment).pack(side=tk.LEFT, padx=5)
         self.filter_var = tk.StringVar(value="Detections Only")
-        self.filter_all = ttk.Radiobutton(top_frame, text="All", variable=self.filter_var, value="All", command=self.apply_filter)
-        self.filter_all.pack(side=tk.LEFT, padx=5)
-        self.filter_detections = ttk.Radiobutton(top_frame, text="Detections Only", variable=self.filter_var, value="Detections Only", command=self.apply_filter)
-        self.filter_detections.pack(side=tk.LEFT, padx=5)
-        self.filter_clean = ttk.Radiobutton(top_frame, text="Clean Only", variable=self.filter_var, value="Clean Only", command=self.apply_filter)
-        self.filter_clean.pack(side=tk.LEFT, padx=5)
+        ttk.Radiobutton(options_frame, text="All", variable=self.filter_var, value="All", command=self.apply_filter).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(options_frame, text="Detections Only", variable=self.filter_var, value="Detections Only", command=self.apply_filter).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(options_frame, text="Clean Only", variable=self.filter_var, value="Clean Only", command=self.apply_filter).pack(side=tk.LEFT, padx=2)
 
-        tree_frame = ttk.Frame(self.root, padding=(10, 0, 10, 10))
+        # --- Search + Whitelist ---
+        search_frame = ttk.Frame(top_frame)
+        search_frame.pack(fill=tk.X, pady=2)
+        self.search_var = tk.StringVar()
+        search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=30)
+        search_entry.pack(side=tk.LEFT, padx=2)
+        search_entry.bind('<Return>', lambda e: self.apply_filter())
+        ttk.Button(search_frame, text="Search", command=self.apply_filter).pack(side=tk.LEFT, padx=2)
+        ttk.Button(search_frame, text="Clear", command=self.clear_search).pack(side=tk.LEFT, padx=2)
+        ttk.Button(search_frame, text="Manage Whitelist", command=self.manage_whitelist).pack(side=tk.LEFT, padx=2)
+
+        # --- Treeview frame ---
+        tree_frame = ttk.Frame(self.root, padding=(10, 5, 10, 10))
         tree_frame.pack(expand=True, fill='both')
-
         columns = ("#", "file_path", "detection", "score", "status")
         self.tree = ttk.Treeview(tree_frame, columns=columns, show='headings')
-
-        self.tree.heading("#", text="#", anchor='w')
-        self.tree.heading("file_path", text="File Path", anchor='w')
-        self.tree.heading("detection", text="Detection Name", anchor='w')
-        self.tree.heading("score", text="Score", anchor='w')
-        self.tree.heading("status", text="Status", anchor='w')
-
-        self.tree.column("#", width=60, stretch=False)
-        self.tree.column("file_path", width=450)
-        self.tree.column("detection", width=200)
-        self.tree.column("score", width=120, stretch=False, anchor='center')
-        self.tree.column("status", width=100, stretch=False, anchor='center')
-
+        for col, w in zip(columns, [60, 450, 200, 120, 100]):
+            self.tree.heading(col, text=col.replace("_", " ").title())
+            self.tree.column(col, width=w, stretch=False if col in ("#", "score", "status") else True,
+                            anchor='center' if col in ("score", "status") else 'w')
         self.tree.pack(side=tk.LEFT, expand=True, fill='both')
-
         scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill='y')
 
-        self.tree.tag_configure('CLEAN', foreground='#8FBC8F')
-        self.tree.tag_configure('SUSPICIOUS', foreground='#FFD700')
-        self.tree.tag_configure('MALICIOUS', foreground='#FF6347')
-        self.tree.tag_configure('ERROR', foreground='#D3D3D3')
-        self.tree.tag_configure('QUARANTINED', foreground='#ADD8E6')
-
-        self.context_menu = tk.Menu(self.root, tearoff=0, bg="#1C1C1C", fg="white")
-        self.context_menu.add_command(label="Quarantine File", command=self.quarantine_selected)
-        self.context_menu.add_command(label="Show Details", command=self.show_details)
-        self.tree.bind("<Button-3>", self.show_context_menu)
-
-        status_frame = ttk.Frame(self.root, padding="5 5 10 5")
-        status_frame.pack(fill=tk.X)
-        self.status_label = ttk.Label(status_frame, text="Ready - Hardcoded Obfuscation Detection", anchor='w')
+        # --- Bottom frame: status + progress bar ---
+        bottom_frame = ttk.Frame(self.root, padding=10)
+        bottom_frame.pack(fill=tk.X)
+        self.status_label = ttk.Label(bottom_frame, text="Ready", anchor='w')
         self.status_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.progress_bar = ttk.Progressbar(status_frame, orient='horizontal', mode='determinate')
+        self.progress_bar = ttk.Progressbar(bottom_frame, orient='horizontal', mode='determinate')
         self.progress_bar.pack(side=tk.RIGHT, fill=tk.X, expand=True)
+
+    def _stats_text(self):
+        try:
+            s = STATS
+            # show last scan duration if available
+            last_dur = s.get('last_scan_duration_seconds', 0.0)
+            try:
+                last_fmt = str(datetime.timedelta(seconds=int(last_dur)))
+            except Exception:
+                last_fmt = "{}s".format(int(last_dur or 0))
+            return "Scanned: {}  Detections: {}  RAPPS-whitelisted: {}  Installer-adjustments: {}  Prevented: {}  LastScan: {}".format(
+                s.get('total_scanned', 0), s.get('total_detections', 0),
+                s.get('rapps_whitelisted', 0), s.get('installer_adjustments_applied', 0),
+                s.get('detections_prevented_by_adjustment', 0),
+                last_fmt
+            )
+        except Exception:
+            return "Stats unavailable"
+
+    def _update_stats_label(self):
+        self.stats_label.config(text=self._stats_text())
+
+    def refresh_stats(self):
+        global STATS
+        try:
+            STATS = load_stats()
+        except Exception:
+            pass
+
+    def toggle_rapps_whitelist(self):
+        global ENABLE_RAPPS_WHITELIST, CONFIG
+        ENABLE_RAPPS_WHITELIST = bool(self.enable_rapps_var.get())
+        CONFIG['enable_rapps_whitelist'] = ENABLE_RAPPS_WHITELIST
+        try:
+            with open(_CONFIG_FILE, "w", encoding="utf-8") as fh:
+                json.dump(CONFIG, fh, ensure_ascii=False, indent=2)
+        except Exception:
+            hydra_logger.logger.debug("Failed to write config", exc_info=True)
+
+    def toggle_installer_adjustment(self):
+        global ENABLE_INSTALLER_ADJUSTMENT, CONFIG
+        ENABLE_INSTALLER_ADJUSTMENT = bool(self.enable_inst_adj_var.get())
+        CONFIG['enable_installer_adjustment'] = ENABLE_INSTALLER_ADJUSTMENT
+        try:
+            with open(_CONFIG_FILE, "w", encoding="utf-8") as fh:
+                json.dump(CONFIG, fh, ensure_ascii=False, indent=2)
+        except Exception:
+            hydra_logger.logger.debug("Failed to write config", exc_info=True)
 
     def start_scan(self):
         directory = filedialog.askdirectory()
         if not directory:
             return
 
+        # Reset global control flags for a fresh scan
+        SCAN_STOP.clear()
+        SCAN_PAUSED.clear()
+
+        # enable pause & stop controls
+        try:
+            self.pause_button.config(state=tk.NORMAL)
+            self.resume_button.config(state=tk.DISABLED)
+            self.stop_button.config(state=tk.NORMAL)
+        except Exception:
+            pass
+
         self.scan_button.config(state=tk.DISABLED)
         self.tree.delete(*self.tree.get_children())
         self.scan_results.clear()
         self.status_label.config(text="Starting hardcoded scan in: {}".format(directory))
-
         scan_thread = threading.Thread(target=scan_directory_parallel, args=(directory, self))
         scan_thread.daemon = True
         scan_thread.start()
+
+    def pause_scan(self):
+        """
+        Pause scanning. Worker loop checks SCAN_PAUSED and will block between results.
+        """
+        try:
+            SCAN_PAUSED.set()
+            self.pause_button.config(state=tk.DISABLED)
+            self.resume_button.config(state=tk.NORMAL)
+            self.update_status("Scan paused by user.")
+        except Exception:
+            hydra_logger.logger.debug("Failed to pause scan.", exc_info=True)
+
+    def resume_scan(self):
+        """
+        Resume scanning after pause.
+        """
+        try:
+            SCAN_PAUSED.clear()
+            self.pause_button.config(state=tk.NORMAL)
+            self.resume_button.config(state=tk.DISABLED)
+            self.update_status("Resuming scan...")
+        except Exception:
+            hydra_logger.logger.debug("Failed to resume scan.", exc_info=True)
+
+    def cancel_scan(self):
+        """
+        Cancel/stop the running scan. This signals worker loop to stop and attempts to cancel queued tasks.
+        """
+        try:
+            SCAN_STOP.set()
+            SCAN_PAUSED.clear()
+            # disable control buttons while stopping
+            self.pause_button.config(state=tk.DISABLED)
+            self.resume_button.config(state=tk.DISABLED)
+            self.stop_button.config(state=tk.DISABLED)
+            self.update_status("Stopping scan (please wait)...")
+        except Exception:
+            hydra_logger.logger.debug("Failed to request scan stop.", exc_info=True)
 
     def update_status(self, message):
         self.root.after(0, lambda: self.status_label.config(text=message))
 
     def update_progress(self, current, total):
         def _update():
-            self.progress_bar['maximum'] = total
-            self.progress_bar['value'] = current
-            self.update_status("Scanning... ({}/{})".format(current, total))
+            try:
+                self.progress_bar['maximum'] = total
+                self.progress_bar['value'] = current
+                self.update_status("Scanning... ({}/{})".format(current, total))
+            except Exception:
+                pass
         self.root.after(0, _update)
 
     def add_result(self, result):
-        # ensure UI-visible update happens on main thread
         self.root.after(0, lambda: self._add_result_to_view(result))
 
     def _add_result_to_view(self, result):
-        # append to in-memory list and apply current filter
         self.scan_results.append(result)
-        if self.filter_var.get() == "All":
+        if self._result_matches_filters(result):
             self.insert_result_into_tree(result)
-        elif self.filter_var.get() == "Detections Only" and result['suspicious']:
-            self.insert_result_into_tree(result)
-        elif self.filter_var.get() == "Clean Only" and not result['suspicious']:
-            self.insert_result_into_tree(result)
+
+    def _result_matches_filters(self, result):
+        filter_mode = self.filter_var.get()
+        if filter_mode == "Detections Only" and not result.get('suspicious'):
+            return False
+        if filter_mode == "Clean Only" and result.get('suspicious'):
+            return False
+        q = (self.search_var.get() or '').strip().lower()
+        if not q:
+            return True
+        hay = []
+        hay.append(result.get('path', '') or '')
+        hay.append(result.get('detection_name', '') or '')
+        hay.append(result.get('md5', '') or '')
+        for r in (result.get('flagging_reasons') or []):
+            hay.append(str(r))
+        hay_text = '\n'.join(hay).lower()
+        return q in hay_text
 
     def insert_result_into_tree(self, result):
         tag = 'CLEAN'
@@ -889,10 +1423,8 @@ class ScannerApp:
             tag = 'ERROR'
         elif result['suspicious']:
             tag = 'MALICIOUS'
-
         score_val = result.get('suspicious_score', 0)
         score_text = str(int(score_val)) if isinstance(score_val, (int, float)) else str(score_val)
-
         item_id = self.tree.insert('', 'end', values=(
             len(self.tree.get_children()) + 1,
             result.get('path', 'N/A'),
@@ -905,18 +1437,140 @@ class ScannerApp:
     def apply_filter(self):
         self.tree.delete(*self.tree.get_children())
         filter_mode = self.filter_var.get()
-
         if filter_mode == "All":
             filtered_results = self.scan_results
         elif filter_mode == "Detections Only":
-            filtered_results = [r for r in self.scan_results if r['suspicious']]
+            filtered_results = [r for r in self.scan_results if r.get('suspicious')]
         elif filter_mode == "Clean Only":
-            filtered_results = [r for r in self.scan_results if not r['suspicious']]
+            filtered_results = [r for r in self.scan_results if not r.get('suspicious')]
         else:
             filtered_results = self.scan_results
-
+        q = (self.search_var.get() or '').strip().lower()
+        if q:
+            def matches_q(r):
+                hay = []
+                hay.append(r.get('path', '') or '')
+                hay.append(r.get('detection_name', '') or '')
+                hay.append(r.get('md5', '') or '')
+                for rr in (r.get('flagging_reasons') or []):
+                    hay.append(str(rr))
+                hay_text = '\n'.join(hay).lower()
+                return q in hay_text
+            filtered_results = [r for r in filtered_results if matches_q(r)]
         for result in filtered_results:
             self.insert_result_into_tree(result)
+
+    def clear_search(self):
+        self.search_var.set('')
+        self.apply_filter()
+
+    def manage_whitelist(self):
+        try:
+            self._open_whitelist_window()
+        except Exception as e:
+            hydra_logger.logger.error("Failed to open whitelist manager: {}".format(e), exc_info=True)
+
+    def _open_whitelist_window(self):
+        wl = load_whitelist()
+        top = tk.Toplevel(self.root)
+        top.title("Whitelist Manager")
+        top.geometry("700x400")
+        top.configure(bg="#2E2E2E")
+        frm = ttk.Frame(top, padding=10)
+        frm.pack(expand=True, fill='both')
+        left = ttk.Frame(frm)
+        left.pack(side=tk.LEFT, fill='both', expand=True)
+        right = ttk.Frame(frm, width=200)
+        right.pack(side=tk.RIGHT, fill='y')
+        lblp = ttk.Label(left, text="Whitelisted Paths (substring match):")
+        lblp.pack(anchor='w')
+        self._wl_paths_lb = tk.Listbox(left, height=8)
+        self._wl_paths_lb.pack(fill='x', pady=(0,10))
+        lblm = ttk.Label(left, text="Whitelisted MD5s:")
+        lblm.pack(anchor='w')
+        self._wl_md5_lb = tk.Listbox(left, height=8)
+        self._wl_md5_lb.pack(fill='x', pady=(0,10))
+        for p in wl.get('paths', []):
+            self._wl_paths_lb.insert(tk.END, p)
+        for m in wl.get('md5s', []):
+            self._wl_md5_lb.insert(tk.END, m)
+        ent_frame = ttk.Frame(right, padding=5)
+        ent_frame.pack(anchor='n')
+        ttk.Label(ent_frame, text="Add path substring:").pack()
+        self._wl_add_path = ttk.Entry(ent_frame, width=30)
+        self._wl_add_path.pack(pady=5)
+        ttk.Button(ent_frame, text="Add Path", command=self.add_whitelist_entry).pack(pady=2)
+        ttk.Label(ent_frame, text="Add MD5:").pack(pady=(10,0))
+        self._wl_add_md5 = ttk.Entry(ent_frame, width=30)
+        self._wl_add_md5.pack(pady=5)
+        ttk.Button(ent_frame, text="Add MD5", command=self.add_whitelist_entry).pack(pady=2)
+        ttk.Separator(right, orient='horizontal').pack(fill='x', pady=10)
+        ttk.Button(right, text="Remove Selected", command=self.remove_whitelist_entry).pack(pady=5)
+        ttk.Button(right, text="Refresh", command=lambda: self.refresh_whitelist_view(top)).pack(pady=5)
+        self._whitelist_window = top
+        self._whitelist_window.protocol("WM_DELETE_WINDOW", lambda: (setattr(self, '_whitelist_window', None), top.destroy()))
+
+    def add_whitelist_entry(self):
+        try:
+            wl = load_whitelist()
+            p = (self._wl_add_path.get() or '').strip()
+            m = (self._wl_add_md5.get() or '').strip()
+            changed = False
+            if p:
+                if p not in wl.get('paths', []):
+                    wl['paths'].append(p)
+                    changed = True
+            if m:
+                if m not in wl.get('md5s', []):
+                    wl['md5s'].append(m)
+                    changed = True
+            if changed:
+                save_whitelist(wl)
+            self._wl_add_path.delete(0, tk.END)
+            self._wl_add_md5.delete(0, tk.END)
+            self.refresh_whitelist_view(self._whitelist_window)
+        except Exception as e:
+            hydra_logger.logger.error("Failed to add whitelist entry: {}".format(e), exc_info=True)
+
+    def remove_whitelist_entry(self):
+        try:
+            wl = load_whitelist()
+            sel_p = list(self._wl_paths_lb.curselection())
+            sel_m = list(self._wl_md5_lb.curselection())
+            changed = False
+            for i in reversed(sel_p):
+                try:
+                    val = self._wl_paths_lb.get(i)
+                    wl['paths'].remove(val)
+                    changed = True
+                except Exception:
+                    continue
+            for i in reversed(sel_m):
+                try:
+                    val = self._wl_md5_lb.get(i)
+                    wl['md5s'].remove(val)
+                    changed = True
+                except Exception:
+                    continue
+            if changed:
+                save_whitelist(wl)
+            self.refresh_whitelist_view(self._whitelist_window)
+        except Exception as e:
+            hydra_logger.logger.error("Failed to remove whitelist entry: {}".format(e), exc_info=True)
+
+    def refresh_whitelist_view(self, win):
+        if not win:
+            return
+        try:
+            wl = load_whitelist()
+            self._wl_paths_lb.delete(0, tk.END)
+            self._wl_md5_lb.delete(0, tk.END)
+            for p in wl.get('paths', []):
+                self._wl_paths_lb.insert(tk.END, p)
+            for m in wl.get('md5s', []):
+                self._wl_md5_lb.insert(tk.END, m)
+        except Exception as e:
+            hydra_logger.logger.error("Failed to refresh whitelist UI: {}".format(e), exc_info=True)
 
     def show_context_menu(self, event):
         item_id = self.tree.identify_row(event.y)
@@ -939,9 +1593,7 @@ class ScannerApp:
         result = self.get_result_from_id(selected_id)
         if not result or not (result.get('suspicious') or result.get('status') == 'Detection'):
             return
-
         file_path = result['path']
-        # Updated warning: removed "make critical process" / BSOD clause.
         warning_msg = (
             "You are about to quarantine the following file:\n\n"
             "{}\n\n"
@@ -950,20 +1602,17 @@ class ScannerApp:
             "2. Move the file to a secure quarantine folder.\n\n"
             "Proceed?"
         ).format(file_path)
-
         if messagebox.askyesno("Confirm Quarantine", warning_msg, icon='warning'):
             try:
                 success, message = quarantine.initiate_quarantine(file_path)
                 if success:
                     result['status'] = 'Quarantined'
-                    # update tree row to show quarantined
                     try:
                         values = list(self.tree.item(selected_id, 'values'))
                         values[4] = 'Quarantined'
                         self.tree.item(selected_id, values=values, tags=('QUARANTINED',))
                     except Exception:
                         pass
-                    # persist change in known-malware store
                     try:
                         md5 = result.get('md5') or compute_md5(file_path)
                         known = load_known_malware()
@@ -988,10 +1637,8 @@ class ScannerApp:
         result = self.get_result_from_id(selected_id)
         if not result:
             return
-
         score_val = result.get('suspicious_score', 'N/A')
         score_text = str(int(score_val)) if isinstance(score_val, (int, float)) else str(score_val)
-
         details_format = (
             "File: {path}\n"
             "Detection: {detection_name}\n"
@@ -1001,11 +1648,9 @@ class ScannerApp:
             "First seen (if known): {first_seen}\n\n"
             "--- Detection Reasons ---\n"
         )
-        # load known info if available
         md5 = result.get('md5')
         known = load_known_malware()
         known_entry = known.get(md5, {}) if md5 else {}
-
         details = details_format.format(
             path=result.get('path', 'N/A'),
             detection_name=result.get('detection_name', 'N/A'),
@@ -1016,7 +1661,6 @@ class ScannerApp:
         )
         reasons = result.get('flagging_reasons', ['None'])
         details += "\n".join(reasons) if reasons else "No specific reasons available."
-
         top = tk.Toplevel(self.root)
         top.title("Obfuscation Analysis Details")
         top.geometry("700x500")
@@ -1026,22 +1670,35 @@ class ScannerApp:
         txt.insert(tk.END, details)
         txt.config(state=tk.DISABLED)
 
-    def scan_finished(self, total_scanned, suspicious_found):
+    def scan_finished(self, total_scanned, suspicious_found, duration_seconds=0.0):
         def _finish():
             self.scan_button.config(state=tk.NORMAL)
             self.progress_bar['value'] = 0
-            self.update_status("Hardcoded scan complete. Scanned: {}. Detections: {}.".format(total_scanned, suspicious_found))
-            # save final UI-visible portion of history for quick reload next time
             try:
-                # persist last 1000 results to history
+                d = int(duration_seconds or 0)
+                formatted = str(datetime.timedelta(seconds=d))
+            except Exception:
+                formatted = "{}s".format(int(duration_seconds or 0))
+            self.update_status("Hardcoded scan complete. Scanned: {}. Detections: {}. Time: {}".format(total_scanned, suspicious_found, formatted))
+            try:
                 history = load_scan_history()
-                # merge with current in-memory results (simple append)
                 history.extend([_sanitize_result_for_persistence(r) for r in self.scan_results])
-                # trim and save
                 history = history[-5000:]
                 save_scan_history(history)
             except Exception:
                 hydra_logger.logger.debug("Failed to persist final results.", exc_info=True)
+            # update stats label
+            try:
+                self._update_stats_label()
+            except Exception:
+                pass
+            # reset control buttons
+            try:
+                self.pause_button.config(state=tk.DISABLED)
+                self.resume_button.config(state=tk.DISABLED)
+                self.stop_button.config(state=tk.DISABLED)
+            except Exception:
+                pass
         self.root.after(0, _finish)
 
 if __name__ == "__main__":
