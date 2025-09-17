@@ -1246,14 +1246,23 @@ class ScannerApp:
         # --- Options & filters ---
         options_frame = ttk.Frame(top_frame)
         options_frame.pack(fill=tk.X, pady=2)
-        ttk.Checkbutton(options_frame, text="Enable RAPPS Whitelist", variable=self.enable_rapps_var,
-                        command=self.toggle_rapps_whitelist).pack(side=tk.LEFT, padx=5)
-        ttk.Checkbutton(options_frame, text="Enable Installer Adjust (-{})".format(int(INSTALLER_SCORE_DEDUCTION)),
-                        variable=self.enable_inst_adj_var, command=self.toggle_installer_adjustment).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(
+            options_frame, text="Enable RAPPS Whitelist",
+            variable=self.enable_rapps_var, command=self.toggle_rapps_whitelist
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Checkbutton(
+            options_frame,
+            text="Enable Installer Adjust (-{})".format(int(INSTALLER_SCORE_DEDUCTION)),
+            variable=self.enable_inst_adj_var,
+            command=self.toggle_installer_adjustment
+        ).pack(side=tk.LEFT, padx=5)
         self.filter_var = tk.StringVar(value="Detections Only")
-        ttk.Radiobutton(options_frame, text="All", variable=self.filter_var, value="All", command=self.apply_filter).pack(side=tk.LEFT, padx=2)
-        ttk.Radiobutton(options_frame, text="Detections Only", variable=self.filter_var, value="Detections Only", command=self.apply_filter).pack(side=tk.LEFT, padx=2)
-        ttk.Radiobutton(options_frame, text="Clean Only", variable=self.filter_var, value="Clean Only", command=self.apply_filter).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(options_frame, text="All", variable=self.filter_var,
+                        value="All", command=self.apply_filter).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(options_frame, text="Detections Only", variable=self.filter_var,
+                        value="Detections Only", command=self.apply_filter).pack(side=tk.LEFT, padx=2)
+        ttk.Radiobutton(options_frame, text="Clean Only", variable=self.filter_var,
+                        value="Clean Only", command=self.apply_filter).pack(side=tk.LEFT, padx=2)
 
         # --- Search + Whitelist ---
         search_frame = ttk.Frame(top_frame)
@@ -1273,12 +1282,37 @@ class ScannerApp:
         self.tree = ttk.Treeview(tree_frame, columns=columns, show='headings')
         for col, w in zip(columns, [60, 450, 200, 120, 100]):
             self.tree.heading(col, text=col.replace("_", " ").title())
-            self.tree.column(col, width=w, stretch=False if col in ("#", "score", "status") else True,
-                            anchor='center' if col in ("score", "status") else 'w')
+            self.tree.column(
+                col,
+                width=w,
+                stretch=False if col in ("#", "score", "status") else True,
+                anchor='center' if col in ("score", "status") else 'w'
+            )
         self.tree.pack(side=tk.LEFT, expand=True, fill='both')
         scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill='y')
+
+        # >>> NEW: color tags for scan results <<<
+        # These tags control row background/foreground in real time
+        self.tree.tag_configure('MALICIOUS', background='#4A0000', foreground='white')   # red
+        self.tree.tag_configure('CLEAN',     background='#003300', foreground='white')   # green
+        self.tree.tag_configure('ERROR',     background='#333333', foreground='white')   # gray
+        self.tree.tag_configure('QUARANTINED', background='#660066', foreground='white') # purple
+
+        # Bind double-click *after* the tree is defined
+        self.tree.bind('<Double-1>', lambda e: self.show_details())
+
+        # --- Context menu (right-click) ---
+        self.context_menu = tk.Menu(self.root, tearoff=0)
+        self.context_menu.add_command(label="Show Details", command=self.show_details)
+        self.context_menu.add_command(label="Quarantine", command=self.quarantine_selected)
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Copy Path", command=self._context_copy_path)
+        self.context_menu.add_command(label="Add path to whitelist", command=self._context_add_whitelist)
+
+        # Bind right-click on the tree to show the context menu
+        self.tree.bind("<Button-3>", self.show_context_menu)
 
         # --- Bottom frame: status + progress bar ---
         bottom_frame = ttk.Frame(self.root, padding=10)
@@ -1288,10 +1322,13 @@ class ScannerApp:
         self.progress_bar = ttk.Progressbar(bottom_frame, orient='horizontal', mode='determinate')
         self.progress_bar.pack(side=tk.RIGHT, fill=tk.X, expand=True)
 
+        # stats label placed on the right
+        self.stats_label = ttk.Label(bottom_frame, text=self._stats_text(), anchor='e')
+        self.stats_label.pack(side=tk.RIGHT)
+
     def _stats_text(self):
         try:
             s = STATS
-            # show last scan duration if available
             last_dur = s.get('last_scan_duration_seconds', 0.0)
             try:
                 last_fmt = str(datetime.timedelta(seconds=int(last_dur)))
@@ -1307,7 +1344,10 @@ class ScannerApp:
             return "Stats unavailable"
 
     def _update_stats_label(self):
-        self.stats_label.config(text=self._stats_text())
+        try:
+            self.stats_label.config(text=self._stats_text())
+        except Exception:
+            pass
 
     def refresh_stats(self):
         global STATS
@@ -1595,15 +1635,45 @@ class ScannerApp:
             hydra_logger.logger.error("Failed to refresh whitelist UI: {}".format(e), exc_info=True)
 
     def show_context_menu(self, event):
-        item_id = self.tree.identify_row(event.y)
-        if item_id:
-            self.tree.selection_set(item_id)
-            result = self.get_result_from_id(item_id)
-            if result and (result.get('suspicious') or result.get('status') == 'Detection'):
+        """
+        Right-click handler. Selects row under mouse, updates context menu item states,
+        then pops up the menu.
+        """
+        try:
+            row_id = self.tree.identify_row(event.y)
+            if row_id:
                 try:
-                    self.context_menu.tk_popup(event.x_root, event.y_root)
-                finally:
-                    self.context_menu.grab_release()
+                    self.tree.selection_set(row_id)
+                except Exception:
+                    pass
+                result = self.get_result_from_id(row_id)
+            else:
+                sel = list(self.tree.selection())
+                result = self.get_result_from_id(sel[0]) if sel else None
+
+            # Update context menu states
+            try:
+                for i in range((self.context_menu.index("end") or -1) + 1):
+                    try:
+                        label = self.context_menu.entrycget(i, "label")
+                    except Exception:
+                        label = None
+                    if label == "Quarantine":
+                        if result and (result.get('suspicious') or result.get('status') == 'Detection'):
+                            self.context_menu.entryconfig(i, state='normal')
+                        else:
+                            self.context_menu.entryconfig(i, state='disabled')
+                    if label in ("Copy Path", "Add path to whitelist"):
+                        self.context_menu.entryconfig(i, state='normal' if result else 'disabled')
+            except Exception:
+                hydra_logger.logger.debug("Failed to update context menu state.", exc_info=True)
+
+            try:
+                self.context_menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                self.context_menu.grab_release()
+        except Exception as e:
+            hydra_logger.logger.debug("show_context_menu failed: %s", e, exc_info=True)
 
     def get_result_from_id(self, item_id):
         return next((r for r in self.scan_results if r.get('tree_id') == item_id), None)
@@ -1652,10 +1722,50 @@ class ScannerApp:
             except Exception as e:
                 messagebox.showerror("Quarantine Error", "An unexpected error occurred: {}".format(e))
 
-    def show_details(self):
-        if not self.tree.selection():
+    def _context_copy_path(self):
+        sel = list(self.tree.selection())
+        if not sel:
             return
-        selected_id = self.tree.selection()[0]
+        result = self.get_result_from_id(sel[0])
+        if not result:
+            return
+        try:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(result.get('path', ''))
+            messagebox.showinfo("Copied", "Path copied to clipboard.")
+        except Exception:
+            hydra_logger.logger.debug("Failed to copy path to clipboard.", exc_info=True)
+
+    def _context_add_whitelist(self):
+        sel = list(self.tree.selection())
+        if not sel:
+            return
+        result = self.get_result_from_id(sel[0])
+        if not result:
+            return
+        try:
+            wl = load_whitelist()
+            p = result.get('path', '')
+            if p and p not in wl.get('paths', []):
+                wl['paths'].append(p)
+                save_whitelist(wl)
+                messagebox.showinfo("Whitelist", "Path added to whitelist.")
+        except Exception as e:
+            hydra_logger.logger.error("Failed to add to whitelist: {}".format(e), exc_info=True)
+            messagebox.showerror("Whitelist Error", "Could not add path to whitelist.")
+
+    def show_details(self):
+        # Accept either the current selection or the row under the pointer
+        sel = list(self.tree.selection())
+        if not sel:
+            y = self.tree.winfo_pointery() - self.tree.winfo_rooty()
+            item_id = self.tree.identify_row(y)
+            if not item_id:
+                return
+            selected_id = item_id
+        else:
+            selected_id = sel[0]
+
         result = self.get_result_from_id(selected_id)
         if not result:
             return
