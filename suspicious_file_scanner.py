@@ -32,7 +32,7 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import ctypes
-from ctypes import wintypes
+import sqlite3
 import psutil
 
 # --- Compatibility imports for tkinter ---
@@ -120,6 +120,7 @@ def is_rapps_whitelisted(path):
 
 # Default scanner config (can be changed in scanner_config.json)
 _DEFAULT_CONFIG = {
+    "enable_database_detection": True,
     "enable_rapps_whitelist": True,
     # substring (lowercase) to match for RAPPS folder detection; adjust to your actual folder name
     "enable_installer_adjustment": True,
@@ -129,6 +130,168 @@ _DEFAULT_CONFIG = {
     "audit_log_enabled": True,
     "audit_log_file": os.path.join(base_dir, "scanner_audit.log")
 }
+
+def detect_database_file(path, content):
+    """
+    Return (is_db: bool, db_type: str or None, reason: str or None).
+
+    Python 3.5 compatible. Detects:
+      - SQLite files (including fingerprinting Firefox/Chromium tables)
+      - SQL dumps (INSERT/CREATE/VALUES patterns)
+      - CSV/TSV dumps (consistent column counts)
+      - LevelDB-like directories / files (CURRENT, MANIFEST-, *.ldb, *.sst, LOG)
+      - Browser-specific storage locations (IndexedDB, Local Storage, Cache)
+    """
+    try:
+        basename = os.path.basename(path or "") if path else ""
+        parent = os.path.basename(os.path.dirname(path or "")) if path else ""
+        lower_name = basename.lower()
+        lower_parent = parent.lower()
+        path_lower = (path or "").lower()
+
+        # Quick filename/path-based browser hints
+        if CONFIG.get("detect_browser_data", True):
+            # Firefox typical SQLite DB filenames
+            if lower_name in ("cookies.sqlite", "places.sqlite", "webappsstore.sqlite",
+                              "signons.sqlite", "favicons.sqlite", "permission.sqlite"):
+                return True, "firefox-sqlite", "Filename looks like Firefox DB: {0}".format(basename)
+
+            # Chromium-family common names (often without extension)
+            chromelike_names = set(["cookies", "history", "web data", "login data",
+                                    "favicons", "top sites", "network action predictor"])
+            # check both direct name and name normalized without spaces
+            if lower_name in chromelike_names or lower_name.replace(" ", "") in set(n.replace(" ", "") for n in chromelike_names):
+                return True, "chromium-sqlite", "Filename looks like Chromium DB: {0}".format(basename)
+
+            # path segments indicating browser stores
+            browser_segments = [os.sep + "indexeddb" + os.sep,
+                                os.sep + "local storage" + os.sep,
+                                os.sep + "localstorage" + os.sep,
+                                os.sep + "service worker" + os.sep,
+                                os.sep + "cache" + os.sep,
+                                os.sep + "databases" + os.sep]
+            for seg in browser_segments:
+                if seg in path_lower:
+                    return True, "browser-store", "Path contains browser-storage directory name: {0}".format(path)
+
+            # also check for typical profile folder names (profile default, profiles)
+            if "chrome" in path_lower or "chromium" in path_lower or "firefox" in path_lower or "brave" in path_lower or "opera" in path_lower:
+                # don't immediately claim, but it's a hint — continue with other checks
+                pass
+
+        # Read header bytes where possible
+        head = None
+        try:
+            with open(path, "rb") as fh:
+                head = fh.read(16)
+        except Exception:
+            head = None
+
+        # SQLite header detection and optional fingerprinting
+        if head and head.startswith(b"SQLite format 3\x00"):
+            conn = None
+            tables = set()
+            try:
+                # open read-only to avoid any writes; uri param available in 3.5
+                uri = "file:{0}?mode=ro".format(path)
+                conn = sqlite3.connect(uri, uri=True, timeout=1)
+                cur = conn.cursor()
+                cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                rows = cur.fetchall()
+                for r in rows:
+                    try:
+                        tables.add(r[0].lower())
+                    except Exception:
+                        pass
+            except Exception:
+                # if fingerprinting fails, we'll still report sqlite
+                tables = set()
+            finally:
+                try:
+                    if conn:
+                        conn.close()
+                except Exception:
+                    pass
+
+            # Firefox fingerprint
+            ff_tables = set(["moz_places", "moz_cookies", "places", "moz_historyvisits"])
+            if tables.intersection(ff_tables) or lower_name in ("cookies.sqlite", "places.sqlite"):
+                return True, "firefox-sqlite", "SQLite file with Firefox-like tables: {0}".format(", ".join(sorted(tables)) or "(unknown)")
+
+            # Chromium fingerprint
+            chrometables = set(["cookies", "logins", "autofill", "credit_cards", "urls", "visits", "profile_info"])
+            if tables.intersection(chrometables) or lower_name in ("cookies", "history", "login data", "web data"):
+                return True, "chromium-sqlite", "SQLite file with Chromium-like tables: {0}".format(", ".join(sorted(tables)) or "(unknown)")
+
+            # generic sqlite
+            return True, "sqlite", "SQLite header detected"
+
+        # Directory-based LevelDB detection (common for IndexedDB / Local Storage)
+        try:
+            if os.path.isdir(path):
+                names = set(n.lower() for n in os.listdir(path))
+                if "current" in names or any(n.startswith("manifest-") for n in names) or any(n.endswith((".ldb", ".sst")) for n in names) or "log" in names or "logfile" in names:
+                    # if directory path suggests browser storage, classify accordingly
+                    if any((os.sep + s + os.sep) in path_lower for s in ("indexeddb", "local storage", "localstorage", "databases")):
+                        return True, "leveldb-browser", "LevelDB-like directory under browser storage path"
+                    return True, "leveldb", "LevelDB-like directory (CURRENT/MANIFEST/*.ldb)"
+        except Exception:
+            pass
+
+        # Standalone LevelDB file extensions
+        if lower_name.endswith((".ldb", ".sst", ".log")):
+            return True, "leveldb-file", "LevelDB-related filename: {0}".format(basename)
+
+        # Ensure content is string
+        if not isinstance(content, str):
+            try:
+                content = content.decode("utf-8", errors="ignore")
+            except Exception:
+                content = str(content)
+
+        # SQL dump heuristics
+        inserts = len(re.findall(r'\bINSERT\s+INTO\b', content, flags=re.IGNORECASE))
+        creates = len(re.findall(r'\bCREATE\s+TABLE\b', content, flags=re.IGNORECASE))
+        values = len(re.findall(r'\bVALUES\s*\(', content, flags=re.IGNORECASE))
+        lines = [l for l in content.splitlines() if l.strip()]
+        avg_commas = (sum(l.count(',') for l in lines) / max(1, len(lines))) if lines else 0
+        if inserts >= 5 or creates >= 1 or values >= 20 or avg_commas > 5:
+            return True, "sql", "SQL dump tokens (INSERTs/CREATE/VALUES or many commas)"
+
+        # CSV/TSV heuristics (consistent column counts)
+        try:
+            sample = lines[:200]
+            counts = [l.count(',') for l in sample if l.strip()]
+            if len(counts) >= 3:
+                mean = sum(counts) / len(counts)
+                variance = sum((c - mean) ** 2 for c in counts) / len(counts)
+                stdev = math.sqrt(variance)
+                if mean > 2 and stdev < (mean * 0.6 + 1):
+                    return True, "csv", "CSV-like content with consistent column counts"
+        except Exception:
+            pass
+
+        # Fallback: very long lines + DB punctuation
+        try:
+            longest = 0
+            long_lines = 0
+            for l in content.splitlines():
+                ln = len(l)
+                if ln > longest:
+                    longest = ln
+                if ln > 2000:
+                    long_lines += 1
+            if long_lines > 0 and (',' in content or re.search(r'\bINSERT\b|\bVALUES\b', content, flags=re.IGNORECASE)):
+                return True, "dump", "Long-lines + DB punctuation"
+        except Exception:
+            pass
+
+    except Exception as e:
+        # fail closed: when unsure, don't claim it's a DB
+        try:
+            hydra_logger.logger.debug("detect_database_file failed for {0}: {1}".format(path, e), exc_info=True)
+        except Exception:
+            pass
 
 # Attempt to load config, otherwise save defaults
 def load_config():
@@ -368,6 +531,17 @@ def analyze_script_obfuscation(path):
             content = raw.decode('utf-8', errors='ignore')
         except Exception:
             content = str(raw)
+
+        # ---------- database detection to avoid false positives ----------
+        try:
+            if CONFIG.get("enable_database_detection", True):
+                is_db, db_type, db_reason = detect_database_file(path, content)
+                if is_db:
+                    reasons.append("Likely database/dump file ({}): {}".format(db_type or "unknown", db_reason or "heuristic"))
+                    # return clean/low score so DB dumps don't trigger obfuscation heuristics
+                    return 0.0, reasons
+        except Exception as e:
+            hydra_logger.logger.debug("Database detection failed for {}: {}".format(path, e), exc_info=True)
 
         # heuristic: long base64-like blobs
         b64_matches = re.findall(r'[A-Za-z0-9+/]{40,}={0,2}', content)
@@ -1487,14 +1661,20 @@ class ScannerApp:
             tag = 'MALICIOUS'
         score_val = result.get('suspicious_score', 0)
         score_text = str(int(score_val)) if isinstance(score_val, (int, float)) else str(score_val)
+
+        # Normalize path for display (keeps tree consistent)
+        display_path = os.path.normpath(result.get('path', 'N/A')) if result.get('path') else 'N/A'
+
         item_id = self.tree.insert('', 'end', values=(
             len(self.tree.get_children()) + 1,
-            result.get('path', 'N/A'),
+            display_path,
             result.get('detection_name', 'N/A'),
             score_text,
             result.get('status', 'N/A')
         ), tags=(tag,))
         result['tree_id'] = item_id
+        # also store normalized path back in the result so subsequent actions use it
+        result['path'] = display_path
 
     def apply_filter(self):
         self.tree.delete(*self.tree.get_children())
@@ -1730,11 +1910,18 @@ class ScannerApp:
         if not result:
             return
         try:
+            # Normalize to native path format (converts forward slashes to backslashes on Windows)
+            raw = result.get('path', '') or ''
+            norm = os.path.normpath(raw)
+            # If you prefer capital drive letter, uncomment:
+            # if norm and len(norm) >= 2 and norm[1] == ':':
+            #     norm = norm[0].upper() + norm[1:]
             self.root.clipboard_clear()
-            self.root.clipboard_append(result.get('path', ''))
-            messagebox.showinfo("Copied", "Path copied to clipboard.")
+            self.root.clipboard_append(norm)
+            messagebox.showinfo("Copied", "Path copied to clipboard:\n\n{}".format(norm))
         except Exception:
             hydra_logger.logger.debug("Failed to copy path to clipboard.", exc_info=True)
+            messagebox.showerror("Error", "Failed to copy path.")
 
     def _context_add_whitelist(self):
         sel = list(self.tree.selection())
