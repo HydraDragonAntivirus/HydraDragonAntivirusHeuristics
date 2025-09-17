@@ -120,224 +120,202 @@ def is_rapps_whitelisted(path):
 
 # Default scanner config (can be changed in scanner_config.json)
 _DEFAULT_CONFIG = {
-    "enable_database_detection": True,
+    "enable_browser_session_data_detection": True,
+    "detect_browser_data": True,                     # enable browser-specific DB detection (Chromium/Firefox)
+    "database_detection_mode": "suppress_longline",  # "suppress_longline" (recommended) or "skip_all"
+    "database_detection_confidence": 0.65,           # weighted-confidence threshold (0.0 - 1.0)
+
     "enable_rapps_whitelist": True,
-    # substring (lowercase) to match for RAPPS folder detection; adjust to your actual folder name
     "enable_installer_adjustment": True,
-    "installer_score_deduction": 20,  # points to deduct from suspicious score when installer heuristics match
+    "installer_score_deduction": 20,  # points to deduct when installer heuristics match
     "suspicious_threshold": SUSPICIOUS_THRESHOLD,
-    "script_suspicious_threshold": 50,  # threshold for script/text obfuscation scoring
+    "script_suspicious_threshold": 50,
     "audit_log_enabled": True,
     "audit_log_file": os.path.join(base_dir, "scanner_audit.log")
 }
 
-def detect_database_file(path, content):
+def is_legitimate_browser_session_data(content: str, filename: str = "") -> Tuple[bool, Optional[str], Optional[str]]:
     """
-    Conservative DB detection (Python 3.5 compatible).
-    Returns (is_db: bool, db_type: str|None, reason: str|None).
-
-    Uses weighted signals to compute a confidence score. Only returns True
-    when confidence >= CONFIG.get("database_detection_confidence", 0.65).
+    Detect legitimate browser session data to prevent false positive malware detection.
+    Returns (is_browser_data: bool, browser_type: str or None, confidence_reason: str or None).
+    
+    This prevents flagging legitimate browser session files as malware.
     """
     try:
-        # Configurable threshold
-        threshold = float(CONFIG.get("database_detection_confidence", 0.65))
-
-        basename = os.path.basename(path or "") if path else ""
-        lower_name = (basename or "").lower()
-        path_lower = (path or "").lower()
-
-        # Weights for signals (higher = stronger signal)
-        weights = {
-            "sqlite_header": 1.0,
-            "ff_tables": 1.2,
-            "chromium_tables": 1.2,
-            "filename_firefox": 0.5,
-            "filename_chrome": 0.5,
-            "path_browser_seg": 0.35,
-            "leveldb_dir": 1.0,
-            "leveldb_file": 0.7,
-            "sql_tokens": 0.9,
-            "csv_consistent": 0.8,
-            "long_lines_punct": 0.4
-        }
-        total_possible = sum(weights.values())
-        score_sum = 0.0
-        detected_types = []
-
-        # Quick filename/path-based weak hints
-        if CONFIG.get("detect_browser_data", True):
-            if lower_name in ("cookies.sqlite", "places.sqlite", "webappsstore.sqlite",
-                              "signons.sqlite", "favicons.sqlite", "permission.sqlite"):
-                score_sum += weights["filename_firefox"]
-                detected_types.append("filename:firefox")
-            # chromium-like names often have spaces or no extension
-            chromelike = set(["cookies", "history", "web data", "login data", "favicons", "top sites"])
-            if lower_name in chromelike or lower_name.replace(" ", "") in set(n.replace(" ", "") for n in chromelike):
-                score_sum += weights["filename_chrome"]
-                detected_types.append("filename:chromium")
-            # path segments indicating browser stores (weak)
-            for seg in ("indexeddb", "local storage", "localstorage", "service worker", "cache", "databases"):
-                if (os.sep + seg + os.sep) in path_lower:
-                    score_sum += weights["path_browser_seg"]
-                    detected_types.append("path:" + seg)
-                    break
-
-        # Read header bytes (if possible)
-        head = None
-        try:
-            with open(path, "rb") as fh:
-                head = fh.read(16)
-        except Exception:
-            head = None
-
-        # SQLite header (strong)
-        sqlite_tables = set()
-        if head and head.startswith(b"SQLite format 3\x00"):
-            score_sum += weights["sqlite_header"]
-            detected_types.append("sqlite_header")
-            # Try to fingerprint tables (read-only)
-            try:
-                # Prefer URI read-only mode; some older sqlite libs might not accept uri=True -> handled by except
-                try:
-                    conn = sqlite3.connect("file:{0}?mode=ro".format(path), uri=True, timeout=1)
-                except Exception:
-                    conn = sqlite3.connect(path, timeout=1)
-                cur = conn.cursor()
-                cur.execute("SELECT name FROM sqlite_master WHERE type='table';")
-                rows = cur.fetchall()
-                for r in rows:
-                    try:
-                        sqlite_tables.add(r[0].lower())
-                    except Exception:
-                        pass
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            except Exception:
-                # fingerprinting failed; leave sqlite_tables empty
-                sqlite_tables = set()
-
-            # If fingerprint shows firefox tables -> strong signal
-            ff_sig = set(["moz_places", "moz_cookies", "places", "moz_historyvisits"])
-            if sqlite_tables.intersection(ff_sig) or lower_name in ("cookies.sqlite", "places.sqlite"):
-                score_sum += weights["ff_tables"]
-                detected_types.append("sqlite:firefox-tables")
-
-            # Chromium-like tables
-            chrome_sig = set(["cookies", "logins", "autofill", "credit_cards", "urls", "visits", "profile_info"])
-            if sqlite_tables.intersection(chrome_sig) or lower_name in ("cookies", "history", "login data", "web data"):
-                score_sum += weights["chromium_tables"]
-                detected_types.append("sqlite:chromium-tables")
-
-            # If header only (and no fingerprint), we already added sqlite_header weight above.
-
-        # Directory-based LevelDB detection (strong)
-        try:
-            if os.path.isdir(path):
-                names = set(n.lower() for n in os.listdir(path))
-                if ("current" in names or any(n.startswith("manifest-") for n in names) or
-                        any(n.endswith((".ldb", ".sst")) for n in names) or "log" in names or "logfile" in names):
-                    score_sum += weights["leveldb_dir"]
-                    detected_types.append("leveldb_dir")
-                    # extra browser path bump if path shows browser storage segments
-                    if any((os.sep + s + os.sep) in path_lower for s in ("indexeddb", "local storage", "localstorage", "databases")):
-                        # small additional evidence: path looks like browser
-                        score_sum += 0.25
-                        detected_types.append("leveldb:browser-path")
-        except Exception:
-            pass
-
-        # LevelDB-like filename
-        if lower_name.endswith((".ldb", ".sst", ".log")):
-            score_sum += weights["leveldb_file"]
-            detected_types.append("leveldb_file")
-
-        # Ensure content is str
-        if not isinstance(content, str):
-            try:
-                content = content.decode("utf-8", errors="ignore")
-            except Exception:
-                content = str(content)
-
-        # SQL dump heuristics (moderate)
-        inserts = len(re.findall(r'\bINSERT\s+INTO\b', content, flags=re.IGNORECASE))
-        creates = len(re.findall(r'\bCREATE\s+TABLE\b', content, flags=re.IGNORECASE))
-        values = len(re.findall(r'\bVALUES\s*\(', content, flags=re.IGNORECASE))
-        lines = [l for l in content.splitlines() if l.strip()]
-        avg_commas = (sum(l.count(',') for l in lines) / max(1, len(lines))) if lines else 0
-        if inserts >= 5 or creates >= 1 or values >= 20 or avg_commas > 5:
-            score_sum += weights["sql_tokens"]
-            detected_types.append("sql_dump")
-
-        # CSV heuristics (moderate)
-        try:
-            sample = lines[:200]
-            counts = [l.count(',') for l in sample if l.strip()]
-            if len(counts) >= 3:
-                mean = sum(counts) / len(counts)
-                variance = sum((c - mean) ** 2 for c in counts) / len(counts)
-                stdev = math.sqrt(variance)
-                if mean > 2 and stdev < (mean * 0.6 + 1):
-                    score_sum += weights["csv_consistent"]
-                    detected_types.append("csv_like")
-        except Exception:
-            pass
-
-        # Fallback: long lines + DB punctuation (weak)
-        try:
-            longest = 0
-            long_lines = 0
-            for l in content.splitlines():
-                ln = len(l)
-                if ln > longest:
-                    longest = ln
-                if ln > 2000:
-                    long_lines += 1
-            if long_lines > 0 and (',' in content or re.search(r'\bINSERT\b|\bVALUES\b', content, flags=re.IGNORECASE)):
-                score_sum += weights["long_lines_punct"]
-                detected_types.append("longlines_dump")
-        except Exception:
-            pass
-
-        # Compute confidence
-        confidence = float(score_sum) / float(total_possible)
-
-        # Debug: if there were signals but below threshold, log for tuning
-        if score_sum > 0 and confidence < threshold:
-            try:
-                hydra_logger.logger.debug("DB heuristic evidence for %s: types=%s score_sum=%.3f confidence=%.3f threshold=%.3f",
-                                          path, ",".join(detected_types), score_sum, confidence, threshold)
-            except Exception:
-                pass
+        content = content.strip()
+        
+        # Must be JSON-like structure
+        if not (content.startswith('{') or content.startswith('[')):
             return False, None, None
-
-        # If above threshold, choose db_type by priority
-        if confidence >= threshold:
-            # priority: firefox sqlite, chromium sqlite, leveldb, sql, csv, generic sqlite
-            if "sqlite:firefox-tables" in detected_types or lower_name in ("cookies.sqlite", "places.sqlite"):
-                return True, "firefox-sqlite", "Confidence={0:.2f}, evidence={1}".format(confidence, ",".join(detected_types))
-            if "sqlite:chromium-tables" in detected_types or lower_name in ("cookies", "history", "login data", "web data"):
-                return True, "chromium-sqlite", "Confidence={0:.2f}, evidence={1}".format(confidence, ",".join(detected_types))
-            if "leveldb_dir" in detected_types or "leveldb_file" in detected_types:
-                return True, "leveldb", "Confidence={0:.2f}, evidence={1}".format(confidence, ",".join(detected_types))
-            if "sql_dump" in detected_types:
-                return True, "sql", "Confidence={0:.2f}, evidence={1}".format(confidence, ",".join(detected_types))
-            if "csv_like" in detected_types:
-                return True, "csv", "Confidence={0:.2f}, evidence={1}".format(confidence, ",".join(detected_types))
-            if "sqlite_header" in detected_types:
-                return True, "sqlite", "Confidence={0:.2f}, evidence={1}".format(confidence, ",".join(detected_types))
-
-        # default: not a DB
-        return False, None, None
-
-    except Exception as e:
+        
+        # Try to parse JSON
         try:
-            hydra_logger.logger.debug("detect_database_file crashed for %s: %s", path, e, exc_info=True)
-        except Exception:
-            pass
-        return False, None, None
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return False, None, None
+        
+        if not isinstance(data, dict):
+            return False, None, None
+        
+        confidence_reasons = []
+        browser_type = None
+        
+        # Firefox session detection
+        firefox_session_keys = {"windows", "selectedWindow", "_closedWindows", "session", "scratchpads"}
+        if len(firefox_session_keys.intersection(data.keys())) >= 2:
+            browser_type = "firefox"
+            confidence_reasons.append("Firefox session structure detected")
+            
+            # Check for Firefox-specific nested structure
+            if "windows" in data and isinstance(data["windows"], list):
+                for window in data["windows"][:1]:  # Check first window
+                    if isinstance(window, dict) and "tabs" in window:
+                        tabs = window["tabs"]
+                        if isinstance(tabs, list) and tabs:
+                            first_tab = tabs[0]
+                            if isinstance(first_tab, dict) and "entries" in first_tab:
+                                entries = first_tab["entries"]
+                                if isinstance(entries, list) and entries:
+                                    entry = entries[0]
+                                    if isinstance(entry, dict) and "url" in entry and "ID" in entry:
+                                        confidence_reasons.append("Firefox tab/entry structure confirmed")
+            
+            # Check for Firefox session metadata
+            if "session" in data and isinstance(data["session"], dict):
+                session_data = data["session"]
+                if any(key in session_data for key in ["state", "lastUpdate", "startTime"]):
+                    confidence_reasons.append("Firefox session metadata present")
+        
+        # Chrome/Chromium session detection
+        chrome_session_keys = {"version", "sessions", "windows", "window"}
+        if len(chrome_session_keys.intersection(data.keys())) >= 1:
+            if "sessions" in data or ("windows" in data and "version" in data):
+                browser_type = "chromium"
+                confidence_reasons.append("Chrome/Chromium session structure detected")
+        
+        # Generic browser session indicators
+        browser_indicators = []
+        
+        # Check for URL patterns in the data
+        def find_browser_urls(obj, depth=0):
+            if depth > 5:  # Prevent infinite recursion
+                return []
+            
+            urls = []
+            if isinstance(obj, dict):
+                if "url" in obj and isinstance(obj["url"], str):
+                    url = obj["url"]
+                    if url.startswith(("http://", "https://", "ftp://", "file://")):
+                        urls.append(url)
+                
+                for value in obj.values():
+                    urls.extend(find_browser_urls(value, depth + 1))
+                    
+            elif isinstance(obj, list):
+                for item in obj:
+                    urls.extend(find_browser_urls(item, depth + 1))
+            
+            return urls
+        
+        urls = find_browser_urls(data)
+        if len(urls) >= 1:
+            browser_indicators.append(f"Contains {len(urls)} valid URLs")
+            
+            # Check for common browser navigation patterns
+            domains = set()
+            for url in urls:
+                try:
+                    domain = url.split('/')[2].lower()
+                    domains.add(domain)
+                except:
+                    pass
+            
+            # Common legitimate browsing domains
+            common_domains = {
+                'github.com', 'google.com', 'duckduckgo.com', 'stackoverflow.com',
+                'mozilla.org', 'firefox.com', 'microsoft.com', 'apple.com',
+                'youtube.com', 'wikipedia.org', 'reddit.com', 'twitter.com',
+                'facebook.com', 'linkedin.com', 'virustotal.com'
+            }
+            
+            legitimate_domains = domains.intersection(common_domains)
+            if legitimate_domains:
+                browser_indicators.append(f"Contains legitimate domains: {', '.join(list(legitimate_domains)[:3])}")
+        
+        # Check for browser-specific field patterns
+        browser_fields = {
+            "docshellID", "triggeringPrincipal_b64", "structuredCloneState",  # Firefox
+            "referrer", "docIdentifier", "lastAccessed", "hidden",  # Common
+            "cookies", "selectedWindow", "busy", "width", "height", "screenX", "screenY"  # Browser window data
+        }
+        
+        found_fields = set()
+        def find_browser_fields(obj, depth=0):
+            if depth > 3:
+                return
+            
+            if isinstance(obj, dict):
+                for key in obj.keys():
+                    if key in browser_fields:
+                        found_fields.add(key)
+                
+                for value in obj.values():
+                    find_browser_fields(value, depth + 1)
+                    
+            elif isinstance(obj, list):
+                for item in obj:
+                    find_browser_fields(item, depth + 1)
+        
+        find_browser_fields(data)
+        if found_fields:
+            browser_indicators.append(f"Browser-specific fields: {', '.join(list(found_fields)[:3])}")
+        
+        # Check for browser cookies structure
+        def check_cookies(obj):
+            if isinstance(obj, dict):
+                if "cookies" in obj and isinstance(obj["cookies"], list):
+                    cookies = obj["cookies"]
+                    if cookies and isinstance(cookies[0], dict):
+                        cookie = cookies[0]
+                        cookie_fields = {"host", "name", "value", "path", "secure", "httponly"}
+                        if len(cookie_fields.intersection(cookie.keys())) >= 3:
+                            return True
+                
+                for value in obj.values():
+                    if check_cookies(value):
+                        return True
+            elif isinstance(obj, list):
+                for item in obj:
+                    if check_cookies(item):
+                        return True
+            return False
+        
+        if check_cookies(data):
+            browser_indicators.append("Browser cookie structure detected")
+        
+        # Combine all indicators
+        confidence_reasons.extend(browser_indicators)
+        
+        # Decision logic
+        is_browser_data = False
+        final_reason = None
+        
+        if browser_type:
+            is_browser_data = True
+            final_reason = f"{browser_type.title()} browser session data: {'; '.join(confidence_reasons)}"
+        elif len(browser_indicators) >= 2:
+            is_browser_data = True
+            browser_type = "generic_browser"
+            final_reason = f"Generic browser session data: {'; '.join(confidence_reasons)}"
+        elif len(urls) >= 3 and len(found_fields) >= 1:
+            is_browser_data = True
+            browser_type = "browser_session"
+            final_reason = f"Browser session data: {'; '.join(confidence_reasons)}"
+        
+        return is_browser_data, browser_type, final_reason
+        
+    except Exception as e:
+        return False, None, f"Analysis error: {str(e)}"
 
 # Attempt to load config, otherwise save defaults
 def load_config():
@@ -578,13 +556,13 @@ def analyze_script_obfuscation(path):
         except Exception:
             content = str(raw)
 
-        # ---------- database detection to avoid false positives ----------
+        # ---------- browser session data detection to avoid false positives ----------
         try:
-            if CONFIG.get("enable_database_detection", True):
-                is_db, db_type, db_reason = detect_database_file(path, content)
-                if is_db:
-                    reasons.append("Likely database/dump file ({}): {}".format(db_type or "unknown", db_reason or "heuristic"))
-                    # return clean/low score so DB dumps don't trigger obfuscation heuristics
+            if CONFIG.get("enable_browser_session_data_detection", True):
+                is_browser_data, browser_type, final_reason = is_legitimate_browser_session_data(path, content)
+                if is_browser_data:
+                    reasons.append("Likely database/dump file ({}): {}".format(browser_type or "unknown", final_reason or "heuristic"))
+                    # return clean/low score so browser session data dumps don't trigger obfuscation heuristics
                     return 0.0, reasons
         except Exception as e:
             hydra_logger.logger.debug("Database detection failed for {}: {}".format(path, e), exc_info=True)
