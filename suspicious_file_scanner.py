@@ -395,11 +395,33 @@ def analyze_script_obfuscation(path):
             reasons.append("{} suspicious evaluation/exec tokens (+{})".format(eval_tokens, int(add)))
 
         # long lines (single-line obfuscated payloads)
-        long_lines = sum(1 for l in content.splitlines() if len(l) > 300)
+        lines = content.splitlines()
+        long_lines = sum(1 for l in lines if len(l) > 300)
         if long_lines:
             add = min(long_lines * 3, 12)
             score += add
             reasons.append("{} very long lines detected (+{})".format(long_lines, int(add)))
+
+        # --- NEW: strong detection for a single extreme line ---
+        # If there's one very large line (common in packed/one-line obfuscation),
+        # give a substantial score bump so a single extreme line can trigger detection.
+        try:
+            max_len = max((len(l) for l in lines), default=0)
+            if max_len > 5000:
+                # monster line (e.g. >5KB) -> heavy penalty
+                score += 20
+                reasons.append("Contains one EXTREMELY long line of {} characters (+20)".format(max_len))
+            elif max_len > 2000:
+                # large single line -> strong penalty
+                score += 12
+                reasons.append("Contains one very long line of {} characters (+12)".format(max_len))
+            elif max_len > 1000:
+                # moderate single-line penalty
+                score += 6
+                reasons.append("Contains a long line of {} characters (+6)".format(max_len))
+        except Exception:
+            # non-fatal if max calculation fails
+            pass
 
         # concatenation tokens (crude proxy)
         concat_ops = content.count('+') + content.count('.')
