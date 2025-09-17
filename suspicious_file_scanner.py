@@ -134,12 +134,10 @@ _DEFAULT_CONFIG = {
     "audit_log_file": os.path.join(base_dir, "scanner_audit.log")
 }
 
-def is_legitimate_browser_session_data(content: str, filename: str = "") -> Tuple[bool, Optional[str], Optional[str]]:
+def is_legitimate_browser_session_data(content):
     """
     Detect legitimate browser session data to prevent false positive malware detection.
     Returns (is_browser_data: bool, browser_type: str or None, confidence_reason: str or None).
-    
-    This prevents flagging legitimate browser session files as malware.
     """
     try:
         content = content.strip()
@@ -151,7 +149,7 @@ def is_legitimate_browser_session_data(content: str, filename: str = "") -> Tupl
         # Try to parse JSON
         try:
             data = json.loads(content)
-        except json.JSONDecodeError:
+        except ValueError:  # JSONDecodeError is not in Python 3.5
             return False, None, None
         
         if not isinstance(data, dict):
@@ -166,9 +164,8 @@ def is_legitimate_browser_session_data(content: str, filename: str = "") -> Tupl
             browser_type = "firefox"
             confidence_reasons.append("Firefox session structure detected")
             
-            # Check for Firefox-specific nested structure
             if "windows" in data and isinstance(data["windows"], list):
-                for window in data["windows"][:1]:  # Check first window
+                for window in data["windows"][:1]:
                     if isinstance(window, dict) and "tabs" in window:
                         tabs = window["tabs"]
                         if isinstance(tabs, list) and tabs:
@@ -180,7 +177,6 @@ def is_legitimate_browser_session_data(content: str, filename: str = "") -> Tupl
                                     if isinstance(entry, dict) and "url" in entry and "ID" in entry:
                                         confidence_reasons.append("Firefox tab/entry structure confirmed")
             
-            # Check for Firefox session metadata
             if "session" in data and isinstance(data["session"], dict):
                 session_data = data["session"]
                 if any(key in session_data for key in ["state", "lastUpdate", "startTime"]):
@@ -198,7 +194,7 @@ def is_legitimate_browser_session_data(content: str, filename: str = "") -> Tupl
         
         # Check for URL patterns in the data
         def find_browser_urls(obj, depth=0):
-            if depth > 5:  # Prevent infinite recursion
+            if depth > 5:
                 return []
             
             urls = []
@@ -219,9 +215,8 @@ def is_legitimate_browser_session_data(content: str, filename: str = "") -> Tupl
         
         urls = find_browser_urls(data)
         if len(urls) >= 1:
-            browser_indicators.append(f"Contains {len(urls)} valid URLs")
+            browser_indicators.append("Contains {} valid URLs".format(len(urls)))
             
-            # Check for common browser navigation patterns
             domains = set()
             for url in urls:
                 try:
@@ -230,7 +225,6 @@ def is_legitimate_browser_session_data(content: str, filename: str = "") -> Tupl
                 except:
                     pass
             
-            # Common legitimate browsing domains
             common_domains = {
                 'github.com', 'google.com', 'duckduckgo.com', 'stackoverflow.com',
                 'mozilla.org', 'firefox.com', 'microsoft.com', 'apple.com',
@@ -240,13 +234,15 @@ def is_legitimate_browser_session_data(content: str, filename: str = "") -> Tupl
             
             legitimate_domains = domains.intersection(common_domains)
             if legitimate_domains:
-                browser_indicators.append(f"Contains legitimate domains: {', '.join(list(legitimate_domains)[:3])}")
+                browser_indicators.append("Contains legitimate domains: {}".format(
+                    ', '.join(list(legitimate_domains)[:3])
+                ))
         
         # Check for browser-specific field patterns
         browser_fields = {
-            "docshellID", "triggeringPrincipal_b64", "structuredCloneState",  # Firefox
-            "referrer", "docIdentifier", "lastAccessed", "hidden",  # Common
-            "cookies", "selectedWindow", "busy", "width", "height", "screenX", "screenY"  # Browser window data
+            "docshellID", "triggeringPrincipal_b64", "structuredCloneState",
+            "referrer", "docIdentifier", "lastAccessed", "hidden",
+            "cookies", "selectedWindow", "busy", "width", "height", "screenX", "screenY"
         }
         
         found_fields = set()
@@ -268,7 +264,9 @@ def is_legitimate_browser_session_data(content: str, filename: str = "") -> Tupl
         
         find_browser_fields(data)
         if found_fields:
-            browser_indicators.append(f"Browser-specific fields: {', '.join(list(found_fields)[:3])}")
+            browser_indicators.append("Browser-specific fields: {}".format(
+                ', '.join(list(found_fields)[:3])
+            ))
         
         # Check for browser cookies structure
         def check_cookies(obj):
@@ -293,7 +291,6 @@ def is_legitimate_browser_session_data(content: str, filename: str = "") -> Tupl
         if check_cookies(data):
             browser_indicators.append("Browser cookie structure detected")
         
-        # Combine all indicators
         confidence_reasons.extend(browser_indicators)
         
         # Decision logic
@@ -302,20 +299,20 @@ def is_legitimate_browser_session_data(content: str, filename: str = "") -> Tupl
         
         if browser_type:
             is_browser_data = True
-            final_reason = f"{browser_type.title()} browser session data: {'; '.join(confidence_reasons)}"
+            final_reason = "{} browser session data: {}".format(browser_type.title(), '; '.join(confidence_reasons))
         elif len(browser_indicators) >= 2:
             is_browser_data = True
             browser_type = "generic_browser"
-            final_reason = f"Generic browser session data: {'; '.join(confidence_reasons)}"
+            final_reason = "Generic browser session data: {}".format('; '.join(confidence_reasons))
         elif len(urls) >= 3 and len(found_fields) >= 1:
             is_browser_data = True
             browser_type = "browser_session"
-            final_reason = f"Browser session data: {'; '.join(confidence_reasons)}"
+            final_reason = "Browser session data: {}".format('; '.join(confidence_reasons))
         
         return is_browser_data, browser_type, final_reason
         
     except Exception as e:
-        return False, None, f"Analysis error: {str(e)}"
+        return False, None, "Analysis error: {}".format(str(e))
 
 # Attempt to load config, otherwise save defaults
 def load_config():
@@ -559,7 +556,7 @@ def analyze_script_obfuscation(path):
         # ---------- browser session data detection to avoid false positives ----------
         try:
             if CONFIG.get("enable_browser_session_data_detection", True):
-                is_browser_data, browser_type, final_reason = is_legitimate_browser_session_data(path, content)
+                is_browser_data, browser_type, final_reason = is_legitimate_browser_session_data(content)
                 if is_browser_data:
                     reasons.append("Likely database/dump file ({}): {}".format(browser_type or "unknown", final_reason or "heuristic"))
                     # return clean/low score so browser session data dumps don't trigger obfuscation heuristics
