@@ -24,32 +24,34 @@ import time
 import json
 import threading
 import datetime
-import hydra_logger
-import quarantine
 import re
 import string
 import traceback
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
 import ctypes
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Dict, Any, List, Optional
+
 import psutil
+import numpy as np
+import pefile
+import capstone
+
+import hydra_logger
+from hydra_logger import logger
+import quarantine
 
 # --- Compatibility imports for tkinter ---
-try:
-    import tkinter as tk
-    from tkinter import ttk, filedialog, scrolledtext, messagebox
-except ImportError:
-    import Tkinter as tk
-    import ttk
-    import tkFileDialog as filedialog
-    import ScrolledText as scrolledtext
-    import tkMessageBox as messagebox
+import tkinter as tk
+from tkinter import ttk, filedialog, scrolledtext, messagebox
 
-# Import the PE feature extractor helper (kept per requirement)
+# --- Import the PE feature extractor helper (kept per requirement) ---
 try:
     from pe_feature_extractor import get_cached_pe_features
 except ImportError:
-    hydra_logger.logger.error("Could not import PE feature extractor. Make sure pe_feature_extractor.py is available.")
+    hydra_logger.logger.error(
+        "Could not import PE feature extractor. Make sure pe_feature_extractor.py is available."
+    )
     raise
 
 base_dir = os.path.dirname(os.path.abspath(__file__))
