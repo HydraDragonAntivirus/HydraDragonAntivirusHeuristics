@@ -32,7 +32,6 @@ import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import ctypes
-import sqlite3
 import psutil
 
 # --- Compatibility imports for tkinter ---
